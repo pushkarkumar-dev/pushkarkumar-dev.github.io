@@ -13,7 +13,7 @@
   <meta property="og:type" content="website" />
   <meta property="og:title" content="Pushkar — Senior Software Engineer" />
   <meta property="og:description" content="Senior SDE @ ByteDance · ex-Amazon · AI Builder · Educator" />
-  <meta property="og:url" content="https://pushkar1005.github.io" />
+  <meta property="og:url" content="https://pushkarkumar-dev.github.io/" />
   <meta name="twitter:card" content="summary_large_image" />
 
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' fill='%230a0a0a'/%3E%3Ctext x='50' y='66' font-family='Georgia,serif' font-size='58' font-style='italic' text-anchor='middle' fill='%23e8b87a'%3Ep%3C/text%3E%3C/svg%3E" />
@@ -223,10 +223,56 @@
       background: var(--accent-soft);
       color: var(--accent) !important;
     }
-    .nav-toggle { display: none; }
+    .nav-toggle {
+      display: none;
+      flex-direction: column;
+      gap: 5px;
+      padding: 6px;
+      cursor: pointer;
+      background: none;
+      border: none;
+    }
+    .nav-toggle span {
+      display: block;
+      width: 22px;
+      height: 1.5px;
+      background: var(--ink);
+      border-radius: 2px;
+      transition: transform .3s var(--ease), opacity .3s var(--ease);
+    }
+    .nav-toggle.open span:nth-child(1) { transform: translateY(6.5px) rotate(45deg); }
+    .nav-toggle.open span:nth-child(2) { opacity: 0; }
+    .nav-toggle.open span:nth-child(3) { transform: translateY(-6.5px) rotate(-45deg); }
 
     @media (max-width: 720px) {
-      .nav-links a:not(.nav-cta) { display: none; }
+      .nav-toggle { display: flex; }
+      .nav-links {
+        display: none;
+        position: absolute;
+        top: 64px;
+        left: 0; right: 0;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 0;
+        background: rgba(10,10,10,0.96);
+        backdrop-filter: saturate(180%) blur(14px);
+        -webkit-backdrop-filter: saturate(180%) blur(14px);
+        border-bottom: 1px solid var(--line);
+        padding: 12px 0 20px;
+      }
+      .nav-links.open { display: flex; }
+      .nav-links a {
+        padding: 14px var(--pad);
+        font-size: 14px;
+        border-bottom: 1px solid var(--line);
+      }
+      .nav-links a:last-child { border-bottom: none; }
+      .nav-cta {
+        margin: 12px var(--pad) 0;
+        border-radius: var(--r-sm);
+        text-align: center;
+        justify-content: center;
+      }
     }
 
     /* ============================================================
@@ -1079,13 +1125,16 @@
   <header class="nav" id="nav">
     <div class="wrap nav-inner">
       <a href="#top" class="brand">Pushkar<span class="brand-dot"></span></a>
-      <nav class="nav-links" aria-label="Primary">
+      <nav class="nav-links" id="navLinks" aria-label="Primary">
         <a href="#work">work</a>
         <a href="#lab">lab</a>
         <a href="#teaching">teaching</a>
         <a href="#experience">experience</a>
         <a href="#contact" class="nav-cta">get in touch &nbsp;→</a>
       </nav>
+      <button class="nav-toggle" id="navToggle" aria-label="Toggle navigation" aria-expanded="false">
+        <span></span><span></span><span></span>
+      </button>
     </div>
   </header>
 
@@ -1141,7 +1190,7 @@
     <!-- ============================================================
          STATS
     ============================================================ -->
-    <section class="stats reveal" aria-label="At a glance">
+    <section class="stats" aria-label="At a glance">
       <div class="wrap">
         <div class="stats-grid">
           <div class="stat">
@@ -1186,7 +1235,7 @@
                 <div class="case-org">ByteDance</div>
                 <div class="case-org-sub">TikTok Shop · 2024 — Now</div>
               </div>
-              <div class="case-role">Senior SDE · Tech Lead</div>
+              <div class="case-role">Senior SDE</div>
             </div>
             <div class="case-body">
               <h3 class="case-title">Logistics integration platform for TikTok Shop</h3>
@@ -1227,7 +1276,7 @@
                 <div class="case-org">Amazon</div>
                 <div class="case-org-sub">Business Payments · 2022 — 2024</div>
               </div>
-              <div class="case-role">SDE II · Tech Lead</div>
+              <div class="case-role">SDE II</div>
             </div>
             <div class="case-body">
               <h3 class="case-title">Real-time fraud detection for Amazon Business Payments</h3>
@@ -1450,7 +1499,7 @@
           <div class="tl-item reveal">
             <div class="tl-period">2022 — 2024</div>
             <div class="tl-content">
-              <h4>SDE II · Tech Lead <span class="at">at</span> Amazon</h4>
+              <h4>SDE II <span class="at">at</span> Amazon</h4>
               <div class="tl-role">Amazon Business Payments · Seattle</div>
               <p>Led a team of 4 building real-time fraud detection that protects $600M+ in exposure. Owned architecture, schema design, and ML inference integration.</p>
             </div>
@@ -1489,7 +1538,7 @@
     <!-- ============================================================
          SKILLS
     ============================================================ -->
-    <section class="skills">
+    <section class="skills" id="skills">
       <div class="wrap">
         <div class="section-head reveal">
           <span class="section-num">§ 05 / Stack</span>
@@ -1591,7 +1640,7 @@
             <a class="social-link" href="https://www.linkedin.com/in/pushkar1005" target="_blank" rel="noopener">linkedin ↗</a>
             <a class="social-link" href="https://www.youtube.com/@PushkarKumar" target="_blank" rel="noopener">youtube ↗</a>
             <a class="social-link" href="https://github.com/pushkarkumar-dev" target="_blank" rel="noopener">github ↗</a>
-            <a class="social-link" href="https://www.pushkarkumarraijada.com/" target="_blank" rel="noopener">website ↗</a>
+            <a class="social-link" href="https://pushkarkumar-dev.github.io/" target="_blank" rel="noopener">portfolio ↗</a>
           </div>
         </div>
       </div>
@@ -1673,6 +1722,17 @@
     }
 
     // ============================================================
+    // MOBILE NAV TOGGLE
+    // ============================================================
+    const navToggle = document.getElementById('navToggle');
+    const navLinks = document.getElementById('navLinks');
+    navToggle.addEventListener('click', () => {
+      const open = navLinks.classList.toggle('open');
+      navToggle.classList.toggle('open', open);
+      navToggle.setAttribute('aria-expanded', open);
+    });
+
+    // ============================================================
     // SMOOTH SCROLL with offset for nav
     // ============================================================
     document.querySelectorAll('a[href^="#"]').forEach((a) => {
@@ -1682,6 +1742,9 @@
         const target = document.querySelector(id);
         if (!target) return;
         e.preventDefault();
+        navLinks.classList.remove('open');
+        navToggle.classList.remove('open');
+        navToggle.setAttribute('aria-expanded', 'false');
         const top = target.getBoundingClientRect().top + window.scrollY - 70;
         window.scrollTo({ top, behavior: 'smooth' });
       });
