@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Code · Developer Command Reference</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,600;0,700;1,400&family=IBM+Plex+Sans:wght@300;400;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:        #06090f;
+    --bg2:       #0b1018;
+    --bg3:       #0f1620;
+    --border:    #1a2535;
+    --border2:   #243040;
+    --text:      #c9d8e8;
+    --text-dim:  #5a7090;
+    --text-mute: #304050;
+    --green:     #00e87a;
+    --amber:     #f5c518;
+    --red:       #ff5f72;
+    --blue:      #4d9fff;
+    --cyan:      #00d4e0;
+    --purple:    #b57aff;
+    --accent:    #00e87a;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    font-family: 'IBM Plex Mono', monospace;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    line-height: 1.6;
+    overflow-x: hidden;
+  }
+
+  /* ─── NOISE TEXTURE OVERLAY ─── */
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+    pointer-events: none; z-index: 0; opacity: 0.35;
+  }
+
+  /* ─── ANIMATED GRID BG ─── */
+  body::after {
+    content: '';
+    position: fixed; inset: 0;
+    background-image:
+      linear-gradient(rgba(0,232,122,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,232,122,0.03) 1px, transparent 1px);
+    background-size: 48px 48px;
+    pointer-events: none; z-index: 0;
+    animation: gridScroll 30s linear infinite;
+  }
+  @keyframes gridScroll { from { transform: translateY(0); } to { transform: translateY(48px); } }
+
+  /* ─── HEADER ─── */
+  header {
+    position: sticky; top: 0; z-index: 200;
+    background: rgba(6,9,15,0.92);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 24px;
+  }
+  .header-inner {
+    max-width: 1140px; margin: 0 auto;
+    display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  }
+  .logo-row {
+    display: flex; align-items: center; gap: 10px;
+  }
+  .logo-pulse {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 8px var(--green);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1;box-shadow:0 0 8px var(--green);} 50%{opacity:0.5;box-shadow:0 0 16px var(--green);} }
+  .logo-text { font-size: 13px; font-weight: 700; color: #e8f4ff; letter-spacing: 0.08em; }
+  .logo-sep { color: var(--border2); margin: 0 4px; }
+  .logo-sub { font-size: 10px; color: var(--text-dim); letter-spacing: 0.18em; }
+  .back-link {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 10px; color: var(--text-dim); letter-spacing: 0.12em;
+    text-decoration: none; font-family: 'IBM Plex Mono', monospace;
+    padding: 4px 10px; border: 1px solid var(--border);
+    border-radius: 4px; background: var(--bg2);
+    transition: color .15s, border-color .15s;
+    white-space: nowrap;
+  }
+  .back-link:hover { color: var(--green); border-color: rgba(0,232,122,0.35); }
+  .header-meta { font-size: 9px; color: var(--text-mute); letter-spacing: 0.15em; margin-top: 3px; }
+
+  .search-wrap {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 14px;
+    transition: border-color .2s;
+  }
+  .search-wrap:focus-within { border-color: var(--green); }
+  .search-icon { color: var(--blue); font-size: 12px; }
+  #search {
+    background: none; border: none; outline: none;
+    color: var(--text); font-family: inherit; font-size: 11px;
+    width: 180px;
+  }
+  #search::placeholder { color: var(--text-mute); }
+
+  /* ─── LAYOUT ─── */
+  .shell {
+    position: relative; z-index: 1;
+    max-width: 1140px; margin: 0 auto;
+    display: grid; grid-template-columns: 210px 1fr; min-height: calc(100vh - 57px);
+  }
+
+  /* ─── SIDEBAR ─── */
+  nav {
+    border-right: 1px solid var(--border);
+    position: sticky; top: 57px; align-self: flex-start;
+    max-height: calc(100vh - 57px); overflow-y: auto;
+    padding: 16px 0 40px;
+    scrollbar-width: thin; scrollbar-color: var(--border) transparent;
+  }
+  .nav-group-label {
+    font-size: 9px; letter-spacing: 0.2em; color: var(--text-mute);
+    padding: 14px 18px 4px; font-weight: 600;
+  }
+  .nav-btn {
+    display: block; width: 100%; text-align: left;
+    background: none; border: none; border-left: 2px solid transparent;
+    padding: 9px 18px; cursor: pointer; font-family: inherit;
+    transition: all .15s;
+  }
+  .nav-btn:hover { background: rgba(255,255,255,0.02); }
+  .nav-btn.active { background: rgba(0,232,122,0.05); }
+  .nav-btn .nav-level {
+    font-size: 9px; letter-spacing: 0.12em; margin-bottom: 2px; transition: color .15s;
+  }
+  .nav-btn .nav-title {
+    font-size: 11px; color: var(--text-dim); font-weight: 400; line-height: 1.3; transition: color .15s;
+  }
+  .nav-btn.active .nav-title { color: #e8f4ff; font-weight: 600; }
+
+  /* ─── MAIN CONTENT ─── */
+  main { padding: 32px 32px 80px; min-width: 0; }
+
+  /* section intro */
+  .section-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 9px; letter-spacing: 0.18em; font-weight: 600;
+    padding: 3px 10px; border-radius: 20px; margin-bottom: 10px;
+    border: 1px solid;
+  }
+  .section-title {
+    font-size: 22px; font-weight: 700; color: #eaf3ff;
+    letter-spacing: 0.01em; margin-bottom: 5px;
+    font-family: 'IBM Plex Sans', sans-serif;
+  }
+  .section-sub { font-size: 11px; color: var(--text-dim); margin-bottom: 6px; }
+  .divider {
+    height: 1px; margin: 16px 0 22px;
+    background: linear-gradient(90deg, var(--border) 0%, transparent 75%);
+  }
+
+  /* ─── COMMAND CARDS ─── */
+  .cmd-grid { display: flex; flex-direction: column; gap: 8px; }
+  .cmd-card {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 13px 15px;
+    display: grid; grid-template-columns: 1fr auto;
+    gap: 12px; align-items: start;
+    transition: border-color .2s, background .2s;
+    animation: fadeUp .3s ease both;
+  }
+  .cmd-card:hover { border-color: var(--border2); background: var(--bg3); }
+  @keyframes fadeUp { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); } }
+
+  .cmd-tag {
+    display: inline-block; font-size: 9px; letter-spacing: 0.1em;
+    padding: 1px 7px; border-radius: 3px; margin-bottom: 7px;
+    border: 1px solid; font-weight: 600;
+  }
+  .cmd-code-wrap {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 5px; padding: 7px 11px; margin-bottom: 7px;
+    display: flex; align-items: baseline; gap: 6px; overflow-x: auto;
+    scrollbar-width: thin; scrollbar-color: var(--border) transparent;
+  }
+  .cmd-prompt { color: var(--green); font-size: 11px; flex-shrink: 0; opacity: 0.7; }
+  .cmd-code { font-size: 11px; color: #79c0ff; white-space: pre; }
+  .cmd-desc { font-size: 11px; color: #6a8ba8; line-height: 1.65; }
+
+  .copy-btn {
+    background: var(--bg3); border: 1px solid var(--border);
+    border-radius: 5px; color: var(--text-mute); font-family: inherit;
+    font-size: 9px; padding: 4px 10px; cursor: pointer; white-space: nowrap;
+    transition: all .15s; letter-spacing: 0.05em;
+  }
+  .copy-btn:hover { border-color: var(--border2); color: var(--text); }
+  .copy-btn.copied { border-color: rgba(0,232,122,0.4); color: var(--green); background: rgba(0,232,122,0.06); }
+
+  /* ─── SNIPPET BLOCKS ─── */
+  .snippet {
+    margin-top: 24px; border: 1px solid var(--border);
+    border-radius: 8px; overflow: hidden;
+  }
+  .snippet-header {
+    background: var(--bg3); border-bottom: 1px solid var(--border);
+    padding: 8px 14px; font-size: 9px; color: var(--text-dim);
+    letter-spacing: 0.15em; display: flex; align-items: center; gap: 8px;
+  }
+  .snippet-dot { width: 6px; height: 6px; border-radius: 50%; }
+  .snippet pre {
+    background: var(--bg2); padding: 16px 18px; overflow-x: auto;
+    font-size: 11px; line-height: 1.8; color: #a8c0d8;
+    scrollbar-width: thin; scrollbar-color: var(--border) transparent;
+  }
+  .hl-key { color: #79c0ff; }
+  .hl-val { color: #a5d6a7; }
+  .hl-str { color: #f0ad4e; }
+  .hl-cmt { color: #4a6a80; font-style: italic; }
+  .hl-sym { color: #e879f9; }
+
+  /* ─── SEARCH MODE ─── */
+  .search-result-group { margin-bottom: 32px; }
+  .search-group-title {
+    font-size: 10px; letter-spacing: 0.18em; color: var(--text-dim);
+    margin-bottom: 12px; padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  /* ─── FOOTER ─── */
+  footer {
+    position: relative; z-index: 1;
+    border-top: 1px solid var(--border);
+    padding: 12px 24px;
+    display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;
+    background: rgba(6,9,15,0.8);
+  }
+  footer span { font-size: 9px; color: var(--text-mute); letter-spacing: 0.1em; }
+
+  /* ─── MOBILE ─── */
+  @media (max-width: 700px) {
+    .shell { grid-template-columns: 1fr; }
+    nav { position: static; max-height: none; border-right: none; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; padding: 8px; gap: 4px; }
+    .nav-btn { width: auto; border-left: none; border-radius: 6px; border: 1px solid var(--border); padding: 6px 10px; }
+    .nav-btn.active { border-color: var(--accent); background: rgba(0,232,122,0.07); }
+    .nav-group-label { display: none; }
+    .nav-btn .nav-level { display: none; }
+    .nav-btn .nav-title { font-size: 10px; }
+    main { padding: 20px 16px 60px; }
+    #search { width: 130px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-inner">
+    <div>
+      <div class="logo-row">
+        <div class="logo-pulse"></div>
+        <span class="logo-sub">ANTHROPIC</span>
+        <span class="logo-sep">|</span>
+        <span class="logo-text">CLAUDE CODE</span>
+        <span class="logo-sep">|</span>
+        <span class="logo-sub">DEVELOPER REFERENCE</span>
+      </div>
+      <div class="header-meta">UPDATED MAY 2026 &nbsp;·&nbsp; OPUS 4.7 + SONNET 4.6 &nbsp;·&nbsp; BEGINNER → ADVANCED</div>
+    </div>
+    <a href="../index.html" class="back-link">← pushkar.dev</a>
+    <div class="search-wrap">
+      <span class="search-icon">⌕</span>
+      <input id="search" type="text" placeholder="Search commands, flags, tags…" autocomplete="off">
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav id="nav"></nav>
+  <main id="main"></main>
+</div>
+
+<footer>
+  <span>SOURCE: code.claude.com/docs &nbsp;·&nbsp; blakecrosley.com/guides/claude-code</span>
+  <span>run <code style="color:#4d9fff">claude --version</code> to check for weekly updates</span>
+</footer>
+
+<script>
+const TAG_COLORS = {
+  SHELL:   { color: '#4d9fff', bg: 'rgba(77,159,255,0.1)',  border: 'rgba(77,159,255,0.25)' },
+  AUTH:    { color: '#b57aff', bg: 'rgba(181,122,255,0.1)', border: 'rgba(181,122,255,0.25)' },
+  SESSION: { color: '#00e87a', bg: 'rgba(0,232,122,0.08)',  border: 'rgba(0,232,122,0.25)' },
+  SLASH:   { color: '#f5a623', bg: 'rgba(245,166,35,0.1)',  border: 'rgba(245,166,35,0.25)' },
+  CONTEXT: { color: '#f472b6', bg: 'rgba(244,114,182,0.1)', border: 'rgba(244,114,182,0.25)' },
+  MODEL:   { color: '#60a5fa', bg: 'rgba(96,165,250,0.1)',  border: 'rgba(96,165,250,0.25)' },
+  EXPLORE: { color: '#34d399', bg: 'rgba(52,211,153,0.1)',  border: 'rgba(52,211,153,0.25)' },
+  GIT:     { color: '#fbbf24', bg: 'rgba(251,191,36,0.1)',  border: 'rgba(251,191,36,0.25)' },
+  OUTPUT:  { color: '#94a3b8', bg: 'rgba(148,163,184,0.1)', border: 'rgba(148,163,184,0.25)' },
+  CONFIG:  { color: '#e879f9', bg: 'rgba(232,121,249,0.1)', border: 'rgba(232,121,249,0.25)' },
+  FLAG:    { color: '#ff5f72', bg: 'rgba(255,95,114,0.1)',  border: 'rgba(255,95,114,0.25)' },
+  ADMIN:   { color: '#64748b', bg: 'rgba(100,116,139,0.1)', border: 'rgba(100,116,139,0.25)' },
+  MEMORY:  { color: '#a3e635', bg: 'rgba(163,230,53,0.08)', border: 'rgba(163,230,53,0.25)' },
+  PIPE:    { color: '#f5a623', bg: 'rgba(245,166,35,0.1)',  border: 'rgba(245,166,35,0.25)' },
+  CI:      { color: '#34d399', bg: 'rgba(52,211,153,0.1)',  border: 'rgba(52,211,153,0.25)' },
+  MCP:     { color: '#c084fc', bg: 'rgba(192,132,252,0.1)', border: 'rgba(192,132,252,0.25)' },
+  AGENTS:  { color: '#22d3ee', bg: 'rgba(34,211,238,0.1)',  border: 'rgba(34,211,238,0.25)' },
+  SKILL:   { color: '#f59e0b', bg: 'rgba(245,158,11,0.1)',  border: 'rgba(245,158,11,0.25)' },
+  HOOK:    { color: '#ff5f72', bg: 'rgba(255,95,114,0.1)',  border: 'rgba(255,95,114,0.25)' },
+  KB:      { color: '#00d4e0', bg: 'rgba(0,212,224,0.1)',   border: 'rgba(0,212,224,0.25)' },
+  INFO:    { color: '#94a3b8', bg: 'rgba(148,163,184,0.1)', border: 'rgba(148,163,184,0.25)' },
+  UPDATE:  { color: '#00e87a', bg: 'rgba(0,232,122,0.08)',  border: 'rgba(0,232,122,0.25)' },
+  ANALYTICS:{ color:'#38bdf8', bg:'rgba(56,189,248,0.1)',   border:'rgba(56,189,248,0.25)' },
+};
+
+const LEVEL_COLORS = {
+  '🟢 BEGINNER':     '#00e87a',
+  '🟡 INTERMEDIATE': '#f5c518',
+  '🔴 ADVANCED':     '#ff5f72',
+};
+
+const SECTIONS = [
+  {
+    id: 'install', level: '🟢 BEGINNER',
+    title: 'Installation & Auth',
+    sub: 'Get Claude Code running in your terminal',
+    cmds: [
+      { cmd: 'curl -fsSL https://claude.ai/install.sh | sh', desc: 'Install native binary — recommended, fastest startup', tag: 'SHELL' },
+      { cmd: 'brew install --cask claude-code', desc: 'Install via Homebrew on macOS', tag: 'SHELL' },
+      { cmd: 'npm install -g @anthropic-ai/claude-code', desc: 'Install via npm (deprecated — migrate with `claude install`)', tag: 'SHELL' },
+      { cmd: 'claude auth login', desc: 'Sign in via browser — uses Claude.ai Pro / Max subscription', tag: 'AUTH' },
+      { cmd: 'claude auth login --console', desc: 'Sign in via API key from Anthropic Console (pay-as-you-go)', tag: 'AUTH' },
+      { cmd: 'claude auth status', desc: 'Check current login state. Exits 0 if logged in, 1 if not', tag: 'AUTH' },
+      { cmd: 'claude --version', desc: 'Verify installation and check current CLI version', tag: 'INFO' },
+      { cmd: 'claude update', desc: 'Update to the latest version', tag: 'UPDATE' },
+      { cmd: 'claude install stable', desc: 'Pin to a release channel: stable | latest | 2.1.118', tag: 'UPDATE' },
+    ],
+  },
+  {
+    id: 'sessions', level: '🟢 BEGINNER',
+    title: 'Starting & Managing Sessions',
+    sub: 'How to start, resume, and navigate conversations',
+    cmds: [
+      { cmd: 'claude', desc: 'Start an interactive REPL in the current directory. Claude reads the codebase first', tag: 'SESSION' },
+      { cmd: 'claude "explain this project"', desc: 'Start with an initial prompt injected before the REPL opens', tag: 'SESSION' },
+      { cmd: 'claude -c', desc: 'Continue the most recent conversation in this directory', tag: 'SESSION' },
+      { cmd: 'claude -r "auth-refactor" "Finish this PR"', desc: 'Resume a named session by ID or name and inject a prompt immediately', tag: 'SESSION' },
+      { cmd: '/resume', desc: 'Open session picker inside REPL. Alias: /continue', tag: 'SLASH' },
+      { cmd: '/rename', desc: 'Give the current session a meaningful name. Auto-names from context if no arg given', tag: 'SLASH' },
+      { cmd: '/clear', desc: 'Wipe conversation history and free up context window. Aliases: /reset, /new', tag: 'SLASH' },
+      { cmd: '/exit', desc: 'Exit the CLI cleanly. Alias: /quit', tag: 'SLASH' },
+      { cmd: '/help', desc: 'Show all available commands. Type / then letters to filter interactively', tag: 'SLASH' },
+    ],
+  },
+  {
+    id: 'essential', level: '🟡 INTERMEDIATE',
+    title: 'Essential Slash Commands',
+    sub: 'Commands you\'ll reach for every single session',
+    cmds: [
+      { cmd: '/compact [instructions]', desc: 'Compress context into a dense summary. Use at >80% usage: /compact Focus on auth module', tag: 'CONTEXT' },
+      { cmd: '/context', desc: 'Visualize context window usage as a colored grid with optimization suggestions', tag: 'CONTEXT' },
+      { cmd: '/cost', desc: 'Show token usage + spend (API). Use /stats on subscription plans', tag: 'CONTEXT' },
+      { cmd: '/model [model]', desc: 'Switch model mid-session. Use ←/→ arrows to adjust effort level in the picker', tag: 'MODEL' },
+      { cmd: '/effort [low|medium|high|max|auto]', desc: 'Set reasoning depth. max = extended thinking (Opus only). Takes effect immediately', tag: 'MODEL' },
+      { cmd: '/fast [on|off]', desc: 'Toggle fast mode — ~2.5× faster output at 6× base price. Opus 4.6+ only', tag: 'MODEL' },
+      { cmd: '/branch [name]', desc: 'Fork conversation at this point. Explore safely, /resume back to the fork. Alias: /fork', tag: 'EXPLORE' },
+      { cmd: '/diff', desc: 'Interactive diff viewer: uncommitted changes + per-turn diffs side by side', tag: 'GIT' },
+      { cmd: '/copy [N]', desc: 'Copy last response to clipboard. /copy 2 = second-to-last. Press w to write to a file', tag: 'OUTPUT' },
+      { cmd: '/export [filename]', desc: 'Export full conversation as plain text — great for auditing or sharing', tag: 'OUTPUT' },
+    ],
+  },
+  {
+    id: 'permissions', level: '🟡 INTERMEDIATE',
+    title: 'Permissions & Safety',
+    sub: 'Control what Claude can and cannot do',
+    snippet: 'settings',
+    cmds: [
+      { cmd: '/config', desc: 'Open Settings interface — theme, model, output style, permissions. Alias: /settings', tag: 'CONFIG' },
+      { cmd: '/hooks', desc: 'View and manage hook configurations for tool events (PreToolUse, PostToolUse…)', tag: 'CONFIG' },
+      { cmd: '--allowedTools "Bash(git:*)" "Read"', desc: 'Pre-authorize specific tools to skip permission prompts entirely', tag: 'FLAG' },
+      { cmd: '--permission-mode plan', desc: 'Start in plan-only mode — Claude proposes actions but never executes them', tag: 'FLAG' },
+      { cmd: '--allow-dangerously-skip-permissions', desc: 'Add bypassPermissions to Shift+Tab cycle. Use cautiously in trusted repos only', tag: 'FLAG' },
+      { cmd: '--bare', desc: 'Minimal mode: skip hooks, skills, MCP, CLAUDE.md discovery. Ideal for fast scripts/CI', tag: 'FLAG' },
+      { cmd: 'claude auto-mode defaults', desc: 'Print built-in auto-mode classifier rules as JSON. Pipe to file to customize', tag: 'ADMIN' },
+      { cmd: '/doctor', desc: 'Diagnose install + settings. Press f to have Claude auto-fix reported issues', tag: 'ADMIN' },
+    ],
+  },
+  {
+    id: 'context', level: '🟡 INTERMEDIATE',
+    title: 'Context & Memory System',
+    sub: 'Feed Claude the right context at the right time',
+    snippet: 'claudemd',
+    cmds: [
+      { cmd: '/init', desc: 'Generate a CLAUDE.md in project root. Set CLAUDE_CODE_NEW_INIT=1 for interactive flow', tag: 'MEMORY' },
+      { cmd: '/memory', desc: 'Edit CLAUDE.md files, toggle auto-memory, and view auto-memory entries', tag: 'MEMORY' },
+      { cmd: '@src/auth/token.ts Fix the expiry bug', desc: '@-mention files directly — more token-efficient than pasting content into chat', tag: 'CONTEXT' },
+      { cmd: '/add-dir <path>', desc: 'Add additional working directories for file access in current session', tag: 'CONTEXT' },
+      { cmd: '--add-dir ../shared-lib ../apps', desc: 'CLI flag version — add multiple directories before the session starts', tag: 'FLAG' },
+      { cmd: '/btw <question>', desc: 'Ask a side question without adding it to the main conversation thread', tag: 'CONTEXT' },
+      { cmd: '/insights', desc: 'Generate session analytics report: interaction patterns, friction points, areas touched', tag: 'ANALYTICS' },
+    ],
+  },
+  {
+    id: 'pipeline', level: '🔴 ADVANCED',
+    title: 'Headless / Pipeline Mode',
+    sub: 'Integrate Claude Code into scripts, CI, and automation',
+    cmds: [
+      { cmd: 'claude -p "explain this function"', desc: 'Print mode — query once and exit. Perfect for shell scripting and CI steps', tag: 'PIPE' },
+      { cmd: 'cat logs.txt | claude -p "what caused this error?"', desc: 'Pipe any content into Claude — stdin becomes context automatically', tag: 'PIPE' },
+      { cmd: 'claude -c -p "Check for type errors"', desc: 'Continue last session in non-interactive mode — useful in CI pipelines', tag: 'PIPE' },
+      { cmd: 'claude setup-token', desc: 'Generate a long-lived OAuth token for CI/CD pipelines. Requires subscription', tag: 'CI' },
+      { cmd: "--system-prompt 'Always respond in JSON'", desc: 'Replace the default system prompt entirely — use for strict structured output', tag: 'FLAG' },
+      { cmd: "--append-system-prompt 'Always use TypeScript'", desc: 'Append rules to the default prompt without destroying built-in capabilities', tag: 'FLAG' },
+      { cmd: '--append-system-prompt-file ./rules.txt', desc: 'Load system prompt additions from a file — great for team-wide configuration', tag: 'FLAG' },
+    ],
+  },
+  {
+    id: 'mcp', level: '🔴 ADVANCED',
+    title: 'MCP Servers',
+    sub: 'Give Claude Code superpowers via Model Context Protocol',
+    cmds: [
+      { cmd: 'claude mcp add github https://api.githubcopilot.com/mcp/ --transport http', desc: 'Add a remote HTTP MCP server — recommended approach for cloud-hosted tools', tag: 'MCP' },
+      { cmd: 'claude mcp add-json myserver \'{"command":"npx","args":["-y","@server/pkg"]}\'', desc: 'Add server from a JSON config — useful for npm-based MCP packages', tag: 'MCP' },
+      { cmd: 'claude mcp list', desc: 'List all installed MCP servers and their status', tag: 'MCP' },
+      { cmd: 'claude mcp remove <name>', desc: 'Remove a named MCP server from configuration', tag: 'MCP' },
+      { cmd: '/mcp', desc: 'Manage MCP server connections and OAuth authentication inside a session', tag: 'SLASH' },
+      { cmd: 'claude mcp add --scope global slack https://...', desc: '--scope global: applies server to all projects via ~/.claude/settings.json', tag: 'MCP' },
+    ],
+  },
+  {
+    id: 'agents', level: '🔴 ADVANCED',
+    title: 'Subagents & Parallel Work',
+    sub: 'Spawn specialized Claude instances to parallelize complex tasks',
+    cmds: [
+      { cmd: 'claude agents', desc: 'List all configured subagents, grouped by source', tag: 'AGENTS' },
+      { cmd: '/agents', desc: 'Manage agent configurations inside a running session', tag: 'SLASH' },
+      { cmd: '--agents \'{"reviewer":{"description":"Reviews code","prompt":"You are a code reviewer"}}\'', desc: 'Define custom subagents dynamically via inline JSON for the current session', tag: 'FLAG' },
+      { cmd: '--agent my-custom-agent', desc: 'Start the session with a specific named agent persona', tag: 'FLAG' },
+      { cmd: '/batch "migrate src/ from Solid to React"', desc: 'SKILL: Decomposes into 5–30 units, spawns one agent per unit in isolated git worktrees', tag: 'SKILL' },
+      { cmd: '/autofix-pr "only fix lint and type errors"', desc: 'Spawn a cloud session to watch the PR and auto-push fixes when CI fails', tag: 'SKILL' },
+      { cmd: '/loop 5m "check if the deploy finished"', desc: 'SKILL: Run a prompt on a recurring schedule. Omit interval for Claude to self-pace', tag: 'SKILL' },
+    ],
+  },
+  {
+    id: 'hooks', level: '🔴 ADVANCED',
+    title: 'Hooks System',
+    sub: 'Deterministic automation triggered by Claude\'s tool events',
+    snippet: 'hooks',
+    cmds: [
+      { cmd: 'PostToolUse → Edit|Write → npx prettier --write "$FILE_PATH"', desc: 'Auto-format every file Claude edits — most common and useful hook pattern', tag: 'HOOK' },
+      { cmd: 'PreToolUse → Bash → .claude/hooks/validate-bash.sh', desc: 'Intercept and validate shell commands before Claude executes them', tag: 'HOOK' },
+      { cmd: 'PostToolUse → Edit|Write → npm run lint --fix "$FILE_PATH"', desc: 'Auto-lint on every file write — combine with Prettier for full format pipeline', tag: 'HOOK' },
+      { cmd: 'UserPromptSubmit → .claude/hooks/log-prompt.sh', desc: 'Log every prompt to a file for compliance auditing in enterprise environments', tag: 'HOOK' },
+      { cmd: 'hookSpecificOutput.sessionTitle (v2.1.96+)', desc: 'Set session title dynamically from a UserPromptSubmit hook output', tag: 'HOOK' },
+      { cmd: 'hookSpecificOutput.updatedToolOutput (v2.1.121+)', desc: 'Replace tool output for any tool — powerful for custom result post-processing', tag: 'HOOK' },
+    ],
+  },
+  {
+    id: 'keyboard', level: '🟡 INTERMEDIATE',
+    title: 'Keyboard Shortcuts',
+    sub: 'Power-user shortcuts inside the REPL',
+    cmds: [
+      { cmd: 'Esc + Esc', desc: 'Open rewind menu — selective rollback of code-only or conversation-only state', tag: 'KB' },
+      { cmd: 'Alt + P', desc: 'Switch active model while preserving everything you have typed in the input field', tag: 'KB' },
+      { cmd: 'Alt + T', desc: 'Toggle extended thinking (deep reasoning mode) for next turn. Run /terminal-setup first', tag: 'KB' },
+      { cmd: 'Shift + Tab', desc: 'Cycle permission modes: default → plan → auto → bypassPermissions', tag: 'KB' },
+      { cmd: '/keybindings', desc: 'Open or create keybindings.json to fully customize all shortcuts', tag: 'KB' },
+    ],
+  },
+];
+
+// ─── SNIPPETS ───────────────────────────────────────────────────────────────
+
+const SNIPPETS = {
+  hooks: {
+    title: 'HOOKS CONFIG → .claude/settings.json',
+    dotColor: '#ff5f72',
+    code: `{
+  <span class="hl-str">"hooks"</span>: {
+    <span class="hl-str">"PostToolUse"</span>: [{
+      <span class="hl-str">"matcher"</span>: <span class="hl-val">"Edit|Write"</span>,
+      <span class="hl-str">"hooks"</span>: [{
+        <span class="hl-str">"type"</span>: <span class="hl-val">"command"</span>,
+        <span class="hl-str">"command"</span>: <span class="hl-val">"npx prettier --write \\"$FILE_PATH\\""</span>
+      }]
+    }],
+    <span class="hl-str">"PreToolUse"</span>: [{
+      <span class="hl-str">"matcher"</span>: <span class="hl-val">"Bash"</span>,
+      <span class="hl-str">"hooks"</span>: [{
+        <span class="hl-str">"type"</span>: <span class="hl-val">"command"</span>,
+        <span class="hl-str">"command"</span>: <span class="hl-val">".claude/hooks/validate-bash.sh"</span>
+      }]
+    }]
+  }
+}`,
+  },
+  claudemd: {
+    title: 'CLAUDE.md TEMPLATE → keep it under 30 lines',
+    dotColor: '#a3e635',
+    code: `<span class="hl-sym"># Project rules</span>
+
+<span class="hl-key">## Stack</span>
+- Next.js 16, React 19, Tailwind 4
+- Postgres via Prisma, deploys on Vercel
+
+<span class="hl-key">## Conventions</span>
+- Server components by default; client only when needed
+- No inline styles; use Tailwind utility classes
+- Tests live next to the file: <span class="hl-val">foo.ts + foo.test.ts</span>
+
+<span class="hl-key">## Commands</span>
+- <span class="hl-val">npm run dev</span>    — local dev server
+- <span class="hl-val">npm run test</span>   — run tests
+- <span class="hl-val">npm run build</span>  — production build (must pass before merge)
+
+<span class="hl-key">## Don't</span>
+- Don't add new deps without asking
+- Don't touch <span class="hl-str">src/legacy/</span> — it's frozen`,
+  },
+  settings: {
+    title: 'SETTINGS.JSON → .claude/settings.json',
+    dotColor: '#4d9fff',
+    code: `{
+  <span class="hl-str">"model"</span>: <span class="hl-val">"claude-sonnet-4-6"</span>,
+  <span class="hl-str">"permissions"</span>: {
+    <span class="hl-str">"allow"</span>: [<span class="hl-val">"Read"</span>, <span class="hl-val">"Glob"</span>, <span class="hl-val">"Grep"</span>,
+              <span class="hl-val">"Bash(npm run:*)"</span>, <span class="hl-val">"Bash(git:*)"</span>, <span class="hl-val">"Edit(src/**)"</span>],
+    <span class="hl-str">"deny"</span>:  [<span class="hl-val">"Read(.env*)"</span>, <span class="hl-val">"Bash(rm -rf:*)"</span>, <span class="hl-val">"Bash(sudo:*)"</span>],
+    <span class="hl-str">"ask"</span>:   [<span class="hl-val">"WebFetch"</span>, <span class="hl-val">"Bash(docker:*)"</span>],
+    <span class="hl-str">"defaultMode"</span>: <span class="hl-val">"acceptEdits"</span>
+  },
+  <span class="hl-str">"env"</span>: { <span class="hl-str">"NODE_ENV"</span>: <span class="hl-val">"development"</span> },
+  <span class="hl-str">"respectGitignore"</span>: <span class="hl-val">true</span>,
+  <span class="hl-str">"showTurnDuration"</span>: <span class="hl-val">true</span>,
+  <span class="hl-str">"cleanupPeriodDays"</span>: <span class="hl-val">30</span>
+}`,
+  },
+};
+
+// ─── RENDER HELPERS ─────────────────────────────────────────────────────────
+
+function tagStyle(tag) {
+  const t = TAG_COLORS[tag] || TAG_COLORS.INFO;
+  return `color:${t.color};background:${t.bg};border-color:${t.border}`;
+}
+
+function renderCmdCard(cmd, desc, tag) {
+  const t = TAG_COLORS[tag] || TAG_COLORS.INFO;
+  return `
+    <div class="cmd-card">
+      <div>
+        <span class="cmd-tag" style="${tagStyle(tag)}">${tag}</span>
+        <div class="cmd-code-wrap">
+          <span class="cmd-prompt">$</span>
+          <code class="cmd-code">${esc(cmd)}</code>
+        </div>
+        <p class="cmd-desc">${esc(desc)}</p>
+      </div>
+      <button class="copy-btn" onclick="copyCmd(this, ${JSON.stringify(cmd)})">copy</button>
+    </div>`;
+}
+
+function renderSnippet(key) {
+  if (!key || !SNIPPETS[key]) return '';
+  const s = SNIPPETS[key];
+  return `
+    <div class="snippet">
+      <div class="snippet-header">
+        <div class="snippet-dot" style="background:${s.dotColor}"></div>
+        ${s.title}
+      </div>
+      <pre>${s.code}</pre>
+    </div>`;
+}
+
+function renderSection(sec) {
+  const lc = LEVEL_COLORS[sec.level] || '#ffffff';
+  const cards = sec.cmds.map(c => renderCmdCard(c.cmd, c.desc, c.tag)).join('');
+  return `
+    <span class="section-badge" style="color:${lc};background:${lc}18;border-color:${lc}40">
+      ${sec.level}
+    </span>
+    <h2 class="section-title">${sec.title}</h2>
+    <p class="section-sub">${sec.sub}</p>
+    <div class="divider"></div>
+    <div class="cmd-grid">${cards}</div>
+    ${renderSnippet(sec.snippet)}`;
+}
+
+function esc(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ─── NAV ────────────────────────────────────────────────────────────────────
+
+function buildNav(active) {
+  const groups = [
+    { label: 'BEGINNER', ids: ['install','sessions'] },
+    { label: 'INTERMEDIATE', ids: ['essential','permissions','context','keyboard'] },
+    { label: 'ADVANCED', ids: ['pipeline','mcp','agents','hooks'] },
+  ];
+  const nav = document.getElementById('nav');
+  nav.innerHTML = groups.map(g => {
+    const btns = g.ids.map(id => {
+      const sec = SECTIONS.find(s => s.id === id);
+      const lc = LEVEL_COLORS[sec.level] || '#fff';
+      return `<button class="nav-btn${active===id?' active':''}" data-id="${id}" style="border-left-color:${active===id?lc:'transparent'}">
+        <div class="nav-level" style="color:${lc}">${sec.level}</div>
+        <div class="nav-title">${sec.title}</div>
+      </button>`;
+    }).join('');
+    return `<div class="nav-group-label">${g.label}</div>${btns}`;
+  }).join('');
+
+  nav.querySelectorAll('.nav-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      currentSection = btn.dataset.id;
+      renderMain(currentSection);
+      buildNav(currentSection);
+      document.getElementById('search').value = '';
+      searchQuery = '';
+    });
+  });
+}
+
+// ─── MAIN RENDER ────────────────────────────────────────────────────────────
+
+function renderMain(id) {
+  const sec = SECTIONS.find(s => s.id === id);
+  document.getElementById('main').innerHTML = renderSection(sec);
+  document.getElementById('main').scrollTop = 0;
+}
+
+function renderSearch(query) {
+  const q = query.toLowerCase();
+  const results = SECTIONS.map(sec => {
+    const matched = sec.cmds.filter(c =>
+      c.cmd.toLowerCase().includes(q) ||
+      c.desc.toLowerCase().includes(q) ||
+      c.tag.toLowerCase().includes(q)
+    );
+    return matched.length ? { sec, matched } : null;
+  }).filter(Boolean);
+
+  if (!results.length) {
+    document.getElementById('main').innerHTML = `
+      <div style="color:var(--text-mute);font-size:12px;padding:40px 0;text-align:center">
+        No commands matched <strong style="color:var(--text-dim)">"${esc(query)}"</strong>
+      </div>`;
+    return;
+  }
+
+  document.getElementById('main').innerHTML = results.map(({ sec, matched }) => {
+    const lc = LEVEL_COLORS[sec.level] || '#fff';
+    const cards = matched.map(c => renderCmdCard(c.cmd, c.desc, c.tag)).join('');
+    return `<div class="search-result-group">
+      <div class="search-group-title" style="color:${lc}">${sec.level} — ${sec.title}</div>
+      <div class="cmd-grid">${cards}</div>
+    </div>`;
+  }).join('');
+}
+
+// ─── COPY ───────────────────────────────────────────────────────────────────
+
+function copyCmd(btn, text) {
+  navigator.clipboard.writeText(text).catch(() => {});
+  btn.textContent = '✓ copied';
+  btn.classList.add('copied');
+  setTimeout(() => { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 1500);
+}
+window.copyCmd = copyCmd;
+
+// ─── INIT ───────────────────────────────────────────────────────────────────
+
+let currentSection = 'install';
+let searchQuery = '';
+
+buildNav(currentSection);
+renderMain(currentSection);
+
+document.getElementById('search').addEventListener('input', e => {
+  searchQuery = e.target.value.trim();
+  if (searchQuery) {
+    document.getElementById('nav').style.opacity = '0.4';
+    renderSearch(searchQuery);
+  } else {
+    document.getElementById('nav').style.opacity = '1';
+    buildNav(currentSection);
+    renderMain(currentSection);
+  }
+});
+</script>
+</body>
+</html>
