@@ -23,6 +23,11 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT@0,9..144,300..900,0..100;1,9..144,300..900,0..100&family=Geist:wght@300..700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
 
+  <!-- GSAP + ScrollTrigger + Lenis -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/ScrollTrigger.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lenis@1.1.14/dist/lenis.min.js"></script>
+
   <style>
     /* ============================================================
        TOKENS
@@ -62,7 +67,7 @@
        RESET / BASE
     ============================================================ */
     *, *::before, *::after { box-sizing: border-box; }
-    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+    html { -webkit-text-size-adjust: 100%; }
     body {
       margin: 0;
       background: var(--bg);
@@ -320,7 +325,6 @@
       background: rgba(255,255,255,0.02);
       margin-bottom: 36px;
       opacity: 0;
-      animation: rise 1s var(--ease) 0.1s forwards;
     }
     .hero-eyebrow .live-dot {
       width: 6px; height: 6px;
@@ -358,12 +362,6 @@
     .hero h1 .line span {
       display: inline-block;
       transform: translateY(110%);
-      animation: rise-line 1.1s var(--ease) forwards;
-    }
-    .hero h1 .line:nth-child(1) span { animation-delay: 0.25s; }
-    .hero h1 .line:nth-child(2) span { animation-delay: 0.45s; }
-    @keyframes rise-line {
-      to { transform: translateY(0); }
     }
 
     .hero-byline {
@@ -372,7 +370,6 @@
       gap: 14px;
       margin-bottom: 28px;
       opacity: 0;
-      animation: rise 1s var(--ease) 0.7s forwards;
     }
     .avatar {
       width: 80px; height: 80px;
@@ -420,7 +417,6 @@
       margin: 0 0 36px 0;
       line-height: 1.55;
       opacity: 0;
-      animation: rise 1s var(--ease) 0.85s forwards;
     }
     .hero-bio strong { color: var(--ink); font-weight: 500; }
 
@@ -437,7 +433,6 @@
       border-radius: var(--r-sm);
       margin-bottom: 36px;
       opacity: 0;
-      animation: rise 1s var(--ease) 1s forwards;
       max-width: 100%;
     }
     .hero-status .arrow { color: var(--accent); }
@@ -455,7 +450,6 @@
       gap: 14px;
       flex-wrap: wrap;
       opacity: 0;
-      animation: rise 1s var(--ease) 1.15s forwards;
     }
     .btn {
       display: inline-flex;
@@ -489,11 +483,6 @@
       border-color: var(--accent-line);
       background: var(--accent-soft);
       color: var(--accent);
-    }
-
-    @keyframes rise {
-      from { opacity: 0; transform: translateY(20px); }
-      to   { opacity: 1; transform: translateY(0); }
     }
 
     /* ============================================================
@@ -1098,11 +1087,31 @@
     .reveal {
       opacity: 0;
       transform: translateY(24px);
-      transition: opacity .9s var(--ease), transform .9s var(--ease);
     }
-    .reveal.in {
-      opacity: 1;
-      transform: none;
+
+    /* Custom cursor — desktop only */
+    @media (pointer: fine) {
+      body, a, button { cursor: none; }
+      .cursor-ring {
+        position: fixed;
+        top: -18px; left: -18px;
+        width: 36px; height: 36px;
+        border: 1px solid rgba(232,184,122,0.28);
+        border-radius: 50%;
+        pointer-events: none;
+        z-index: 9999;
+        will-change: transform;
+      }
+      .cursor-dot {
+        position: fixed;
+        top: -3px; left: -3px;
+        width: 6px; height: 6px;
+        background: var(--accent);
+        border-radius: 50%;
+        pointer-events: none;
+        z-index: 9999;
+        will-change: transform;
+      }
     }
 
     /* Reduced motion */
@@ -1112,12 +1121,17 @@
         animation-iteration-count: 1 !important;
         transition-duration: 0.01ms !important;
       }
-      .reveal { opacity: 1; transform: none; }
-      .hero h1 .line span { transform: none; }
+      .reveal { opacity: 1 !important; transform: none !important; }
+      .hero-eyebrow, .hero-byline, .hero-bio,
+      .hero-status, .hero-ctas { opacity: 1 !important; }
+      .hero h1 .line span { transform: none !important; }
     }
   </style>
 </head>
 <body>
+
+  <div class="cursor-ring" id="cursorRing" aria-hidden="true"></div>
+  <div class="cursor-dot"  id="cursorDot"  aria-hidden="true"></div>
 
   <!-- ============================================================
        NAV
@@ -1669,37 +1683,30 @@
 
   <script>
     // ============================================================
-    // YEAR
+    // SETUP
     // ============================================================
     document.getElementById('year').textContent = new Date().getFullYear();
+    gsap.registerPlugin(ScrollTrigger);
+
+    const nav       = document.getElementById('nav');
+    const navToggle = document.getElementById('navToggle');
+    const navLinks  = document.getElementById('navLinks');
+    const reduced   = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    // Pre-hide stat elements before first paint (no .reveal class on them)
+    if (!reduced) gsap.set('.stat', { opacity: 0, y: 30 });
 
     // ============================================================
-    // NAV SCROLL
+    // MOBILE NAV TOGGLE
     // ============================================================
-    const nav = document.getElementById('nav');
-    const onScroll = () => {
-      if (window.scrollY > 24) nav.classList.add('scrolled');
-      else nav.classList.remove('scrolled');
-    };
-    window.addEventListener('scroll', onScroll, { passive: true });
-    onScroll();
+    navToggle.addEventListener('click', () => {
+      const open = navLinks.classList.toggle('open');
+      navToggle.classList.toggle('open', open);
+      navToggle.setAttribute('aria-expanded', String(open));
+    });
 
     // ============================================================
-    // SCROLL REVEAL
-    // ============================================================
-    const io = new IntersectionObserver((entries) => {
-      entries.forEach((entry) => {
-        if (entry.isIntersecting) {
-          entry.target.classList.add('in');
-          io.unobserve(entry.target);
-        }
-      });
-    }, { threshold: 0.12, rootMargin: '0px 0px -60px 0px' });
-
-    document.querySelectorAll('.reveal').forEach((el) => io.observe(el));
-
-    // ============================================================
-    // STATUS LINE — cycles through what I'm currently doing
+    // STATUS LINE
     // ============================================================
     const statuses = [
       'currently shipping logistics infra @ TikTok Shop',
@@ -1710,7 +1717,7 @@
     ];
     const statusEl = document.getElementById('statusText');
     let statusIdx = 0;
-    if (statusEl && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    if (statusEl && !reduced) {
       setInterval(() => {
         statusEl.classList.add('fade');
         setTimeout(() => {
@@ -1721,34 +1728,173 @@
       }, 4200);
     }
 
-    // ============================================================
-    // MOBILE NAV TOGGLE
-    // ============================================================
-    const navToggle = document.getElementById('navToggle');
-    const navLinks = document.getElementById('navLinks');
-    navToggle.addEventListener('click', () => {
-      const open = navLinks.classList.toggle('open');
-      navToggle.classList.toggle('open', open);
-      navToggle.setAttribute('aria-expanded', open);
-    });
+    if (reduced) {
+      // ============================================================
+      // REDUCED MOTION FALLBACK
+      // ============================================================
+      window.addEventListener('scroll', () => nav.classList.toggle('scrolled', window.scrollY > 24), { passive: true });
+      nav.classList.toggle('scrolled', window.scrollY > 24);
 
-    // ============================================================
-    // SMOOTH SCROLL with offset for nav
-    // ============================================================
-    document.querySelectorAll('a[href^="#"]').forEach((a) => {
-      a.addEventListener('click', (e) => {
-        const id = a.getAttribute('href');
-        if (id === '#' || id.length < 2) return;
-        const target = document.querySelector(id);
-        if (!target) return;
-        e.preventDefault();
-        navLinks.classList.remove('open');
-        navToggle.classList.remove('open');
-        navToggle.setAttribute('aria-expanded', 'false');
-        const top = target.getBoundingClientRect().top + window.scrollY - 70;
-        window.scrollTo({ top, behavior: 'smooth' });
+      document.querySelectorAll('a[href^="#"]').forEach((a) => {
+        a.addEventListener('click', (e) => {
+          const id = a.getAttribute('href');
+          if (id === '#' || id.length < 2) return;
+          const target = document.querySelector(id);
+          if (!target) return;
+          e.preventDefault();
+          navLinks.classList.remove('open');
+          navToggle.classList.remove('open');
+          navToggle.setAttribute('aria-expanded', 'false');
+          window.scrollTo({ top: target.getBoundingClientRect().top + window.scrollY - 70, behavior: 'smooth' });
+        });
       });
-    });
+
+    } else {
+      // ============================================================
+      // LENIS SMOOTH SCROLL
+      // ============================================================
+      const lenis = new Lenis({ lerp: 0.1, smoothWheel: true });
+
+      (function raf(time) {
+        lenis.raf(time);
+        requestAnimationFrame(raf);
+      })(performance.now());
+
+      lenis.on('scroll', ScrollTrigger.update);
+      gsap.ticker.lagSmoothing(0);
+      lenis.on('scroll', ({ scroll }) => nav.classList.toggle('scrolled', scroll > 24));
+
+      // ============================================================
+      // CUSTOM CURSOR
+      // ============================================================
+      const cursorRing = document.getElementById('cursorRing');
+      const cursorDot  = document.getElementById('cursorDot');
+      if (cursorRing && window.matchMedia('(pointer: fine)').matches) {
+        const xRing = gsap.quickTo(cursorRing, 'x', { duration: 0.5, ease: 'power3.out' });
+        const yRing = gsap.quickTo(cursorRing, 'y', { duration: 0.5, ease: 'power3.out' });
+        const xDot  = gsap.quickTo(cursorDot,  'x', { duration: 0.08, ease: 'none' });
+        const yDot  = gsap.quickTo(cursorDot,  'y', { duration: 0.08, ease: 'none' });
+
+        window.addEventListener('mousemove', (e) => {
+          xRing(e.clientX); yRing(e.clientY);
+          xDot(e.clientX);  yDot(e.clientY);
+        });
+        document.querySelectorAll('a, button').forEach(el => {
+          el.addEventListener('mouseenter', () => {
+            gsap.to(cursorRing, { scale: 1.8, borderColor: 'rgba(232,184,122,0.9)', duration: 0.3 });
+          });
+          el.addEventListener('mouseleave', () => {
+            gsap.to(cursorRing, { scale: 1, borderColor: 'rgba(232,184,122,0.28)', duration: 0.3 });
+          });
+        });
+      }
+
+      // ============================================================
+      // HERO TIMELINE
+      // ============================================================
+      const heroTl = gsap.timeline({ defaults: { ease: 'power3.out' } });
+      heroTl
+        .fromTo('.hero-eyebrow',
+          { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.8 }, 0.2)
+        .fromTo('.hero h1 .line span',
+          { yPercent: 110 }, { yPercent: 0, duration: 1.1, stagger: 0.15, ease: 'power4.out' }, 0.45)
+        .fromTo('.hero-byline',
+          { opacity: 0, y: 16 }, { opacity: 1, y: 0, duration: 0.7 }, 0.9)
+        .fromTo('.hero-bio',
+          { opacity: 0, y: 16 }, { opacity: 1, y: 0, duration: 0.7 }, 1.05)
+        .fromTo('.hero-status',
+          { opacity: 0, y: 16 }, { opacity: 1, y: 0, duration: 0.7 }, 1.2)
+        .fromTo('.hero-ctas',
+          { opacity: 0, y: 16 }, { opacity: 1, y: 0, duration: 0.7 }, 1.35);
+
+      // Hero parallax — content drifts up as you scroll away
+      gsap.to('.hero-inner', {
+        yPercent: 18, ease: 'none',
+        scrollTrigger: { trigger: '.hero', start: 'top top', end: 'bottom top', scrub: true }
+      });
+
+      // ============================================================
+      // SCROLL REVEALS
+      // ============================================================
+
+      // Generic: section heads + standalone reveal elements
+      document.querySelectorAll(
+        '.reveal:not(.case):not(.tl-item):not(.skill-group):not(.teach-card)'
+      ).forEach(el => {
+        gsap.fromTo(el,
+          { opacity: 0, y: 40 },
+          { opacity: 1, y: 0, duration: 1, ease: 'power3.out',
+            scrollTrigger: { trigger: el, start: 'top 88%' } }
+        );
+      });
+
+      // Stats — stagger each number in
+      gsap.fromTo('.stat',
+        { opacity: 0, y: 30 },
+        { opacity: 1, y: 0, stagger: 0.08, duration: 0.8, ease: 'power3.out',
+          scrollTrigger: { trigger: '.stats-grid', start: 'top 90%' } }
+      );
+
+      // Case studies
+      gsap.fromTo('.case',
+        { opacity: 0, y: 60 },
+        { opacity: 1, y: 0, stagger: 0.12, duration: 1, ease: 'power3.out',
+          scrollTrigger: { trigger: '.case-list', start: 'top 85%' } }
+      );
+
+      // Teaching cards
+      gsap.fromTo('.teach-card',
+        { opacity: 0, y: 30 },
+        { opacity: 1, y: 0, stagger: 0.1, duration: 0.8, ease: 'power3.out',
+          scrollTrigger: { trigger: '.teach-grid', start: 'top 85%' } }
+      );
+
+      // Timeline — slides in from the left
+      gsap.fromTo('.tl-item',
+        { opacity: 0, x: -28 },
+        { opacity: 1, x: 0, stagger: 0.1, duration: 0.9, ease: 'power3.out',
+          scrollTrigger: { trigger: '.timeline', start: 'top 80%' } }
+      );
+
+      // Skills grid
+      gsap.fromTo('.skill-group',
+        { opacity: 0, y: 30 },
+        { opacity: 1, y: 0, stagger: 0.08, duration: 0.8, ease: 'power3.out',
+          scrollTrigger: { trigger: '.skills-grid', start: 'top 85%' } }
+      );
+
+      // ============================================================
+      // MAGNETIC BUTTONS
+      // ============================================================
+      document.querySelectorAll('.btn').forEach(btn => {
+        btn.addEventListener('mousemove', (e) => {
+          const r = btn.getBoundingClientRect();
+          const x = (e.clientX - r.left - r.width  / 2) * 0.35;
+          const y = (e.clientY - r.top  - r.height / 2) * 0.35;
+          gsap.to(btn, { x, y, duration: 0.4, ease: 'power2.out' });
+        });
+        btn.addEventListener('mouseleave', () => {
+          gsap.to(btn, { x: 0, y: 0, duration: 0.7, ease: 'elastic.out(1, 0.4)' });
+        });
+      });
+
+      // ============================================================
+      // SMOOTH SCROLL (Lenis-powered anchor links)
+      // ============================================================
+      document.querySelectorAll('a[href^="#"]').forEach((a) => {
+        a.addEventListener('click', (e) => {
+          const id = a.getAttribute('href');
+          if (id === '#' || id.length < 2) return;
+          const target = document.querySelector(id);
+          if (!target) return;
+          e.preventDefault();
+          navLinks.classList.remove('open');
+          navToggle.classList.remove('open');
+          navToggle.setAttribute('aria-expanded', 'false');
+          lenis.scrollTo(target, { offset: -70, duration: 1.5 });
+        });
+      });
+    }
   </script>
 
 </body>
