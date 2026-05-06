@@ -389,6 +389,15 @@
   display: block;
 }
 
+/* Problem summary */
+.dsa-app .problem-summary {
+  margin: 14px 0 0;
+  font-size: 0.85rem;
+  line-height: 1.65;
+  color: var(--ink-2);
+  font-style: italic;
+}
+
 /* ============================================================
    CARD BODY SECTIONS
 ============================================================ */

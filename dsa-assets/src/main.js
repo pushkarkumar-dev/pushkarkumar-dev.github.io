@@ -126,6 +126,8 @@
     var variantsHtml = p.variants.map(function (v) { return '<span class="variant-tag">' + esc(v) + '</span>'; }).join('');
 
     return (
+      (p.summary ? '<p class="problem-summary">' + esc(p.summary) + '</p>' : '') +
+
       '<div class="card-section">' +
         '<div class="section-label">When to use</div>' +
         '<div class="trigger-list">' + triggerHtml + '</div>' +
