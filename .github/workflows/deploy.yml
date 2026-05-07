@@ -42,6 +42,9 @@ jobs:
           mkdir -p _site
           cp -r index.html blog.html dsa.html headshot.jpg blog dsa-assets _site/ 2>/dev/null || true
 
+          # Prevent Jekyll from processing the deployed files
+          touch _site/.nojekyll
+
           # Copy Astro build output into /system-design/ subfolder
           mkdir -p _site/system-design
           cp -r system-design/dist/. _site/system-design/
