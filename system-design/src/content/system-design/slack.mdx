@@ -1,0 +1,591 @@
+---
+title: "Design Slack"
+slug: "slack"
+category: "social"
+difficulty: "senior"
+estimatedReadMinutes: 23
+tags: ["messaging", "channels", "websocket", "fanout", "search", "threading"]
+companyFlavors: ["Slack", "Microsoft Teams", "Discord", "Google Chat"]
+prerequisites: ["whatsapp-messenger", "distributed-unique-id-generator", "web-crawler"]
+relatedQuestions: ["whatsapp-messenger", "discord", "notification-system"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design Slack's workspace messaging: channel fan-out for millions of members, WebSocket fleet management, threaded message model, cross-workspace search, and the engineering choices behind @ notifications at scale."
+javaPackages:
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+  - "org.springframework.boot:spring-boot-starter-websocket:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "org.springframework.data:spring-data-elasticsearch:5.3.0"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="slack" title="Design Slack" />
+
+<Tldr>
+- **Message storage**: Cassandra partitioned by `channel_id`, clustered by `message_id DESC` (Snowflake IDs) gives O(log N) range scans for history; channel membership lives in Redis SETs (`members:{channel_id}`) for O(1) fan-out recipient lookup.
+- **WebSocket fleet**: each client holds one persistent connection to a stateless Gateway Server; routing state lives in Redis (`gw_registry: user_id → server_addr`); messages traverse the fleet via Kafka topics partitioned by `user_id` so each Gateway Server only consumes its own recipients.
+- **Channel fan-out**: channels with ≤1,000 members receive per-member push to each user's Kafka topic; channels with >10K members flip to a pub/sub model — Gateway Servers subscribe to the channel topic and deliver locally to resident WebSocket holders. Inactive users pull on reconnect.
+- **Threading**: replies are stored as regular messages with a non-null `thread_ts` (the parent's Snowflake ID); a Cassandra secondary index on `(channel_id, thread_ts, message_id)` makes thread reads efficient; `reply_count` and `last_reply_user_id` are denormalized on the parent row using lightweight transactions for O(1) thread summary.
+- **Full-text search**: Elasticsearch with one index per workspace; search queries apply a channel-access filter at query time so private channels are never exposed; ILM tiers (hot → warm → cold/frozen) cap Elasticsearch storage while retaining full history on S3-backed snapshots.
+</Tldr>
+
+## The scale of the problem
+
+Slack serves more than 20 million daily active users across hundreds of thousands of workspaces, ranging from 5-person startups to enterprises with 100,000 employees in a single workspace. On a normal business day the platform delivers approximately 5 billion messages — a number that compounds every year as Slack displaces email for internal communication. That raw throughput number, however, understates the actual architectural complexity. Unlike Twitter, where a tweet fans out to followers who are mostly passive readers, every Slack message is delivered to an *active* workspace where every recipient may reply, react, or thread the conversation within seconds. The read-to-write ratio approaches 5:1 rather than the 1000:1 ratio typical of social timelines, which means both the write and read paths must be engineered for high throughput.
+
+The fan-out problem in Slack is structurally different from Twitter's. On Twitter, a celebrity with 10 million followers creates a fan-out of 10 million feed writes — a genuinely hard problem that Twitter solved with a hybrid push/pull model gated on follower count. On Slack, a channel with 10,000 members creates a fan-out of 10,000 WebSocket pushes per message. But that membership list is *known and bounded at send time*: you do not need to look up a social graph, you already have the member set. The challenge is not graph traversal — it is high-throughput Redis SET reads, Kafka message routing, and WebSocket delivery across a horizontally-scaled gateway fleet, all under the 200ms p99 delivery SLA that users expect.
+
+Search compounds the problem further. Slack positions itself as a searchable organizational memory: users expect to find a message from two years ago by keyword. Achieving sub-500ms search latency across a 5B message/day corpus, while enforcing strict per-channel privacy boundaries, requires a carefully tiered Elasticsearch deployment with workspace-level index sharding, index lifecycle management, and query-time access filtering. None of these are afterthoughts — they are first-class design constraints that interact with every other architectural layer.
+
+## Clarifying questions
+
+Eight questions shape every major decision in this design. Do not start drawing boxes until you have clear answers on all of them.
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| Are workspaces fully isolated or can users message across workspaces? | Isolated — cross-workspace messaging (Slack Connect) is a separate product; assume single-workspace fan-out | Determines whether user_id is globally unique or workspace-scoped; simplifies permission checks and data sharding |
+| What is the maximum number of members in a channel? | No hard cap — #general in a large enterprise can have 100K+ members | Gates the fan-out strategy selection; small-channel push and large-channel pub/sub require different code paths and infrastructure |
+| Are DMs (direct messages) architecturally the same as channels? | Yes — DMs are modeled as 2-person (or small-group) channels; no separate DM schema | Simplifies the data model enormously; the same Cassandra schema and fan-out logic handles DMs and public channels |
+| What threading model is required? | Replies are attached to a parent message; up to two levels (thread replies do not have their own threads) | Drives the `thread_ts` schema design and whether recursive threading needs to be supported |
+| How are file attachments handled? | Files are uploaded to a separate object storage service (S3/GCS); messages carry a URL reference, not binary content | Keeps message payloads small (text + metadata only); file deduplication and CDN delivery are out of scope |
+| What is the search scope? | Messages in channels the requesting user has access to; private channel messages are never exposed to non-members | Requires per-query access filter in Elasticsearch; cannot pre-filter at index time because membership changes dynamically |
+| What is the message retention policy? | Indefinite by default; enterprise plans may configure 90-day or 1-year retention | Drives Cassandra TTL configuration and Elasticsearch ILM tiering; affects total storage estimates significantly |
+| How are notifications delivered when the user is offline? | Via a separate push notification service (APNs / FCM); this design owns the routing decision, not the push delivery | Allows us to treat the notification push as a fire-and-forget side effect; WebSocket delivery is the primary SLA, push is the fallback |
+
+## Functional requirements
+
+- Users can send text messages to channels and direct message threads; messages are delivered in real time (sub-200ms, p99) to all online members of the channel via persistent WebSocket connections.
+- Channel membership is managed via join and leave operations; member lists are immediately consistent for fan-out routing, meaning a user who leaves a channel stops receiving new messages within one Kafka consumer cycle.
+- Users can reply to any top-level message, creating a thread; threads surface a reply count and the last replier on the parent message without requiring a full thread scan.
+- Full-text search returns messages matching a keyword query scoped to channels the requesting user can access; results are ranked by relevance and recency.
+- File sharing is supported by uploading a file to object storage and attaching the resulting URL as message metadata; binary content does not flow through the messaging pipeline.
+- When a user is mentioned (`@username`) or a keyword notification is triggered, an event is routed to the push notification service if the user is offline, or delivered as an in-band WebSocket event if they are online.
+
+## Non-functional requirements
+
+- **Scale**: 20M DAU; 5 billion messages per day; peak throughput approximately 3× average.
+- **Delivery latency**: p99 < 200ms from send to delivery for online recipients; p99 < 500ms for search queries.
+- **Availability**: 99.99% for message send and receive paths; WebSocket reconnection must complete within 5 seconds.
+- **Durability**: messages must never be lost after a successful send acknowledgement; Cassandra replication factor ≥ 3 across availability zones.
+- **Retention**: indefinite by default; storage tiering manages cost without deleting messages.
+- **Consistency**: messages within a channel must be delivered in order (guaranteed by Kafka partition ordering per channel); cross-channel ordering is not required.
+
+<Capacity title="Slack Capacity Estimates">
+
+**Message throughput**
+
+Average rate: $\frac{5{,}000{,}000{,}000}{86{,}400} \approx 57{,}870$ messages/second
+
+Peak rate (3× average): $\approx 173{,}600$ msg/s
+
+**Cassandra storage (5-year horizon)**
+
+$$500\ \text{B/msg} \times 5{,}000{,}000{,}000\ \text{msg/day} \times 365\ \text{days} \times 5\ \text{yr} \approx 4.6\ \text{PB}$$
+
+With Cassandra replication factor 3: $\approx 13.8\ \text{PB}$ raw disk.
+
+**WebSocket push fan-out**
+
+Average channel size 100 members: $57{,}870\ \text{msg/s} \times 100 = 5{,}787{,}000$ WebSocket pushes/second at average load; peak $\approx 17.4\text{M}$ pushes/s.
+
+**Elasticsearch index size**
+
+$$500\ \text{B/msg} \times 5{,}000{,}000{,}000\ \text{msg/day} \times 365 \approx 912\ \text{TB/year}$$
+
+With `best_compression` codec (~55% reduction): $\approx 410\ \text{TB/year}$ on hot tier; older data tiered to warm (HDD) and cold (S3-backed frozen).
+
+**Active WebSocket connections**
+
+$20\text{M DAU} \times 60\%\ \text{concurrently active} = 12{,}000{,}000$ persistent connections
+
+At 50K connections per Gateway Server: $\frac{12{,}000{,}000}{50{,}000} = 240$ Gateway Server instances at average load; provision for $3\times$ peak = **720 instances**.
+
+**Kafka throughput**
+
+Per-user topic fan-out at peak: $173{,}600\ \text{msg/s} \times 100\ \text{avg members} = 17{,}360{,}000$ Kafka produce operations/s across the fleet. Partitioned by `user_id` across 4,096 partitions per cluster; multiple Kafka clusters by workspace tier.
+
+</Capacity>
+
+## API design
+
+Slack's API surface splits cleanly into a real-time WebSocket layer (primary delivery path) and a REST layer (message history, search, and fallback send).
+
+**WebSocket events — Client to Server**
+
+```json
+{
+  "type": "message.send",
+  "channel_id": "C012AB3CD",
+  "text": "Hello, world!",
+  "thread_ts": null,
+  "client_msg_id": "7f3a1b2c-4d5e-6f7a-8b9c-0d1e2f3a4b5c"
+}
+```
+
+The `client_msg_id` is a client-generated UUID used for deduplication; the server assigns the authoritative Snowflake `ts` upon persistence.
+
+**WebSocket events — Server to Client (message delivery)**
+
+```json
+{
+  "type": "message",
+  "channel_id": "C012AB3CD",
+  "user_id": "U023BC4DE",
+  "text": "Hello, world!",
+  "ts": "1736928000000001",
+  "thread_ts": null,
+  "reply_count": 0,
+  "reactions": []
+}
+```
+
+**WebSocket events — Server to Client (notification)**
+
+```json
+{
+  "type": "notification",
+  "title": "Alice in #engineering",
+  "body": "Hey @bob, can you review this?",
+  "channel_id": "C012AB3CD",
+  "ts": "1736928000000001",
+  "badge_count": 3
+}
+```
+
+**REST endpoints (fallback and history)**
+
+```text
+POST   /api/chat.postMessage
+       Body: { channel_id, text, thread_ts?, attachments? }
+       Response: { ok: true, ts, channel_id }
+
+GET    /api/conversations.history
+       Query: channel_id, cursor (message_id), limit (max 200)
+       Response: { ok: true, messages: [...], has_more, next_cursor }
+
+GET    /api/conversations.replies
+       Query: channel_id, ts (parent message_id), cursor, limit
+       Response: { ok: true, messages: [...], has_more, next_cursor }
+
+POST   /api/search.messages
+       Body: { query, workspace_id, cursor, limit }
+       Response: { ok: true, messages: [...], total_count, next_cursor }
+```
+
+Pagination for history and replies uses the Snowflake `message_id` as a cursor directly — the Cassandra clustering key makes cursor-based pagination essentially free (seek to the cursor position, read the next N rows).
+
+## Data model
+
+**messages — Cassandra**
+
+```sql
+CREATE TABLE messages (
+  channel_id   TEXT,
+  message_id   BIGINT,
+  workspace_id TEXT,
+  user_id      TEXT,
+  text         TEXT,
+  thread_ts    BIGINT,
+  reply_count  INT,
+  last_reply_user_id TEXT,
+  reactions    TEXT,
+  attachments  TEXT,
+  edited_at    TIMESTAMP,
+  deleted_at   TIMESTAMP,
+  PRIMARY KEY (channel_id, message_id)
+) WITH CLUSTERING ORDER BY (message_id DESC)
+  AND compaction = {'class': 'TimeWindowCompactionStrategy',
+                    'compaction_window_unit': 'DAYS',
+                    'compaction_window_size': 7};
+```
+
+The `thread_ts` column is null for top-level messages and equals the parent's `message_id` for replies. A secondary index `CREATE INDEX ON messages (channel_id, thread_ts, message_id)` makes thread reads efficient without a full partition scan.
+
+**channel_members — Redis**
+
+```text
+Key:    members:{channel_id}
+Type:   SET
+Value:  { user_id_1, user_id_2, ... }
+TTL:    none (managed via join/leave events)
+```
+
+**user_channels — Redis**
+
+```text
+Key:    channels:{user_id}
+Type:   SET
+Value:  { channel_id_1, channel_id_2, ... }
+TTL:    none
+```
+
+**gateway_registry — Redis**
+
+```text
+Key:    gw_registry
+Type:   HASH
+Field:  user_id
+Value:  gateway_server_addr (e.g., "gw-042.internal:9090")
+TTL:    per-field TTL via EXPIREAT on connection open; removed on disconnect
+```
+
+**workspaces and channels — MySQL**
+
+```sql
+CREATE TABLE workspaces (
+  workspace_id VARCHAR(32) PRIMARY KEY,
+  name         VARCHAR(255) NOT NULL,
+  plan         ENUM('free','pro','enterprise') NOT NULL,
+  created_at   DATETIME NOT NULL
+);
+
+CREATE TABLE channels (
+  channel_id   VARCHAR(32) PRIMARY KEY,
+  workspace_id VARCHAR(32) NOT NULL,
+  name         VARCHAR(80) NOT NULL,
+  member_count INT NOT NULL DEFAULT 0,
+  is_private   BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at   DATETIME NOT NULL,
+  INDEX idx_workspace (workspace_id)
+);
+```
+
+MySQL stores workspace and channel metadata that changes infrequently and requires strong consistency for joins. Message data never goes near MySQL.
+
+**search_index — Elasticsearch**
+
+```json
+{
+  "mappings": {
+    "properties": {
+      "message_id":  { "type": "long" },
+      "channel_id":  { "type": "keyword" },
+      "user_id":     { "type": "keyword" },
+      "workspace_id":{ "type": "keyword" },
+      "text":        { "type": "text", "analyzer": "english" },
+      "ts":          { "type": "long" },
+      "thread_ts":   { "type": "long" }
+    }
+  },
+  "settings": {
+    "codec": "best_compression",
+    "number_of_shards": 5,
+    "number_of_replicas": 1
+  }
+}
+```
+
+One index per workspace. The `channel_id` field is a keyword — at query time the search service fetches the user's accessible channel IDs from Redis and injects a `terms` filter. This ensures private channel content is never surfaced to non-members even if the query itself would match.
+
+## Architecture flows
+
+<Mermaid diagram={`flowchart TD
+  Client([Client App]) -->|WebSocket| GW[Gateway Server]
+  GW -->|Produce to channel-messages topic| KafkaCH[Kafka\\nChannel Partition]
+  KafkaCH --> FO[Channel Fan-out Service]
+  FO -->|SMEMBERS members:channel_id| Redis[(Redis\\nMember Sets)]
+  Redis --> FO
+  FO -->|Produce per user_id| KafkaUser[Kafka\\nUser Partitions]
+  KafkaUser --> GW2[Gateway Servers\\n(all shards)]
+  GW2 -->|WebSocket push| Recipients([Online Recipients])
+  FO -->|Async produce| KafkaIdx[Kafka\\nSearch Index Topic]
+  KafkaIdx --> ESWorker[Elasticsearch\\nIndex Worker]
+  ESWorker --> ES[(Elasticsearch)]
+  GW -->|Write message| Cass[(Cassandra\\nMessages)]
+  GW -->|Offline recipients| PushQ[Push Notification\\nQueue]
+  PushQ --> PushSvc[Push Service\\nAPNs / FCM]`} />
+
+<Mermaid diagram={`flowchart LR
+  Client([Client]) -->|GET conversations.history| API[REST API Server]
+  API -->|SELECT WHERE channel_id=? AND message_id < cursor LIMIT 50| Cass[(Cassandra)]
+  Cass --> API
+  API -->|Return paginated messages| Client
+  Client2([Client]) -->|POST search.messages| SearchAPI[Search API]
+  SearchAPI -->|GET channels:user_id| Redis2[(Redis)]
+  Redis2 --> SearchAPI
+  SearchAPI -->|BM25 + channel_id terms filter| ES[(Elasticsearch)]
+  ES --> SearchAPI
+  SearchAPI --> Client2`} />
+
+## Deep dives
+
+### Channel fan-out strategy
+
+The fan-out problem is the heart of Slack's architecture. When a user sends a message to a channel, the system must deliver it to every online member within 200ms. The naive approach — iterate over all members and push directly — works at small scale but becomes a bottleneck as channels grow. The production-grade answer is a threshold-based hybrid.
+
+**Small channels (≤ 1,000 members):** The Channel Fan-out Service reads `SMEMBERS members:{channel_id}` from Redis — a single O(N) operation that returns the full member list in microseconds for N ≤ 1,000. For each `user_id`, the service produces a message to the `user-messages` Kafka topic with `user_id` as the partition key. Each Gateway Server runs a consumer group consuming only the partitions that correspond to its resident users (determined by consistent hashing on `user_id`). The Gateway Server delivers the message to the WebSocket socket if the user is online, or enqueues a push notification event if they are offline.
+
+**Large channels (1,001–10,000 members):** The Redis SMEMBERS call is still fast, but producing 10,000 individual Kafka messages per incoming message generates 10,000× write amplification. At peak (173,600 msg/s), a channel with 5,000 members would require 868 million Kafka produce operations per second — economically and operationally unreasonable. The solution is channel-level pub/sub: the Fan-out Service publishes *one* message to a `channel-broadcast` Kafka topic keyed by `channel_id`. Gateway Servers that have at least one member of that channel subscribed on a live WebSocket have a consumer in that topic's consumer group. Each Gateway Server filters out recipients it does not own and delivers to the rest. A Gateway Server that has zero members from a given channel simply does not subscribe to that partition.
+
+**Very large channels (> 10,000 members, e.g., #general):** Real-time push is operationally impractical for 100K-member channels. The model shifts to pull-on-reconnect: the server publishes the message to Cassandra and to Elasticsearch; when a client's WebSocket reconnects or the client polls for channel history, it fetches the latest messages via `conversations.history`. A "typing indicators" WebSocket event tells online members to refresh, but the full message payload is pulled rather than pushed. This matches what Slack actually does for large public channels in enterprise workspaces.
+
+The threshold values (1K, 10K) are operational dials, not fundamental constants. They should be tunable at runtime via feature flags — as hardware improves and Kafka throughput increases, the thresholds can be raised.
+
+### WebSocket fleet and stateful routing
+
+Gateway Servers are intentionally stateless in their business logic — they hold socket connections but carry no in-memory routing tables beyond what Redis provides. This design allows horizontal scaling with no coordination overhead.
+
+**Connection lifecycle:** When a client opens a WebSocket connection, the Gateway Server registers the mapping `HSET gw_registry {user_id} {server_addr}` in Redis and starts Kafka consumer threads for that user's partition. On disconnect (clean or dirty), the server calls `HDEL gw_registry {user_id}`. The Redis TTL on the hash field acts as a dead man's switch: if the Gateway Server crashes without sending a disconnect notification, the Redis entry expires within 90 seconds (the heartbeat interval × 3), after which the offline notification path takes over.
+
+**Cross-server delivery:** The Fan-out Service produces to the `user-messages` Kafka topic. The consuming Gateway Server checks whether the recipient is locally connected. If yes, deliver directly. If the `gw_registry` lookup shows a different server, the consuming server forwards the message payload via gRPC to the owning Gateway Server. If the user is offline (no registry entry), the message is dropped from WebSocket delivery and a push notification event is published instead.
+
+**Connection draining during deployments:** Gateway Servers that are being decommissioned enter a `DRAINING` state. They stop accepting new WebSocket connections (removed from the load balancer pool) and send a WebSocket close frame with custom code `4000` and a `Retry-After` header pointing to a new server. Clients that receive code `4000` immediately reconnect to the next server returned by DNS. In-flight messages buffered in Kafka are naturally re-consumed by the replacement server once the client reconnects. Draining a single Gateway Server with 50K connections takes approximately 30 seconds at a reconnect rate of ~1,700 connections/second to avoid thundering-herd on load balancers.
+
+**Load balancing:** Clients connect via a DNS name that resolves to a pool of Gateway Servers behind a Network Load Balancer. The NLB is configured for least-connections routing (not round-robin) to avoid hot spots when a wave of clients reconnects simultaneously after a region failover.
+
+### Threading model
+
+Slack's threading model prioritizes two access patterns above all others: (1) reading recent top-level messages in a channel (the main channel view) and (2) reading all replies within a single thread. The data model is optimized for both.
+
+**Schema design:** Every message — top-level and reply — lives in the same Cassandra `messages` table. Thread replies carry `thread_ts = parent_message_id`; top-level messages carry `thread_ts = null`. This means there is no separate "threads" table, no JOIN, and no cross-table consistency concern.
+
+**Thread read query:** To load all replies for a thread, the query is `SELECT * FROM messages WHERE channel_id = ? AND thread_ts = ? ORDER BY message_id ASC`. This requires the secondary index on `(channel_id, thread_ts, message_id)`. In Cassandra, secondary indexes on clustering columns are efficient when the partition key (`channel_id`) is specified — the query targets a single partition and seeks within it.
+
+**Denormalized thread summary:** The parent message row carries `reply_count` (a Cassandra counter column) and `last_reply_user_id` (updated via lightweight transaction). This allows the main channel view to display "3 replies, last reply from Alice" without touching the thread index at all. The counter is incremented on each reply; on thread reply deletion, the counter is decremented. The lightweight transaction (IF EXISTS) ensures that concurrent reply deletions do not race into a negative count.
+
+**Thread notifications:** Only users who have explicitly replied to a thread, or who have clicked "Follow thread," are notified of new replies. This is enforced via a `thread_followers` Redis SET per thread (`SET thread_followers:{parent_message_id}`). When a reply arrives, the Fan-out Service reads this set instead of the full channel member list — typically 2–10 users rather than thousands.
+
+### Cross-workspace search
+
+Elasticsearch is the right choice for full-text search over 5B messages/day, but the operational challenge is scale: 912 TB/year raw before compression. The answer is Index Lifecycle Management (ILM).
+
+**Index architecture:** One Elasticsearch index per workspace. Within a workspace, messages are indexed by the Elasticsearch index worker consuming from the `search-index` Kafka topic. The index worker batches documents in 500-doc bulks with a 100ms flush interval to maximize indexing throughput while keeping latency acceptable.
+
+**ILM tiers:**
+- Hot tier (SSD, 3 replicas): messages from the last 30 days. This is where all search queries execute.
+- Warm tier (HDD, 1 replica): messages 30 days to 1 year old. Read-only; force-merged to 1 segment per shard for query efficiency.
+- Cold tier (S3-backed frozen index): messages older than 1 year. These are searchable but incur a few seconds of thaw latency. Enterprise customers who query old messages accept this trade-off.
+
+**Privacy enforcement at query time:** The search API fetches the user's channel access list from Redis (`SMEMBERS channels:{user_id}`), injects this as a `terms` filter on the `channel_id` field, and executes the compound query: `{ bool: { must: [{ match: { text: query } }], filter: [{ terms: { channel_id: accessible_channels } }] } }`. This filter runs on the Elasticsearch coordinating node before ranking — private channel messages are never in the result set regardless of query content.
+
+**Relevance tuning:** The primary ranking signal is BM25 on the `text` field. A `rank_feature` query applies a log-scale recency boost on the `ts` field (newer messages score higher for identical text matches). For typeahead (search-as-you-type), the `text` field has a `search_as_you_type` mapping that generates edge n-grams automatically, avoiding a separate prefix index.
+
+**Workspace sharding at Elasticsearch cluster level:** A single Elasticsearch cluster handles up to 500 workspaces comfortably. Beyond that, multiple Elasticsearch clusters are deployed, with workspaces assigned to clusters based on their message volume (a large enterprise workspace may get a dedicated cluster). The search API tier maintains a routing table (workspace_id → cluster endpoint) in a configuration service backed by ZooKeeper.
+
+## Java integration
+
+### Part A — ChannelFanoutService.java
+
+```java
+package com.slack.fanout;
+
+import io.lettuce.core.api.sync.RedisCommands;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+import java.util.Set;
+
+@Service
+public class ChannelFanoutService {
+
+    private static final Logger log = LoggerFactory.getLogger(ChannelFanoutService.class);
+    private static final int SMALL_CHANNEL_THRESHOLD = 1_000;
+    private static final int LARGE_CHANNEL_THRESHOLD = 10_000;
+    private static final String USER_MESSAGES_TOPIC   = "user-messages";
+    private static final String CHANNEL_BROADCAST_TOPIC = "channel-broadcast";
+
+    private final RedisCommands<String, String> redis;
+    private final KafkaProducer<String, MessageEvent> kafkaProducer;
+
+    public ChannelFanoutService(RedisCommands<String, String> redis,
+                                KafkaProducer<String, MessageEvent> kafkaProducer) {
+        this.redis = redis;
+        this.kafkaProducer = kafkaProducer;
+    }
+
+    public void fanOutMessage(String channelId, MessageEvent event) {
+        String memberKey = "members:" + channelId;
+        Set<String> memberIds = redis.smembers(memberKey);
+        long memberCount = memberIds.size();
+
+        if (memberCount == 0) {
+            log.warn("Fan-out skipped: no members found for channel {}", channelId);
+            return;
+        }
+
+        if (memberCount <= SMALL_CHANNEL_THRESHOLD) {
+            log.debug("Small channel fan-out: {} members in channel {}", memberCount, channelId);
+            for (String userId : memberIds) {
+                kafkaProducer.send(new ProducerRecord<>(USER_MESSAGES_TOPIC, userId, event));
+            }
+        } else if (memberCount <= LARGE_CHANNEL_THRESHOLD) {
+            log.debug("Large channel fan-out (pub/sub): {} members in channel {}", memberCount, channelId);
+            handleLargeChannelPubSub(channelId, event);
+        } else {
+            log.info("Very large channel ({}): using pull-on-reconnect for channel {}", memberCount, channelId);
+            handleVeryLargeChannel(channelId, event);
+        }
+    }
+
+    private void handleLargeChannelPubSub(String channelId, MessageEvent event) {
+        kafkaProducer.send(new ProducerRecord<>(CHANNEL_BROADCAST_TOPIC, channelId, event));
+    }
+
+    private void handleVeryLargeChannel(String channelId, MessageEvent event) {
+        kafkaProducer.send(new ProducerRecord<>(CHANNEL_BROADCAST_TOPIC, channelId, event));
+        log.info("Very large channel {}: clients will pull on next poll/reconnect", channelId);
+    }
+}
+```
+
+### Part B — MessageController.java
+
+```java
+package com.slack.api;
+
+import com.slack.fanout.ChannelFanoutService;
+import com.slack.model.MessageEvent;
+import com.slack.model.SlackApiResponse;
+import com.slack.snowflake.SnowflakeIdGenerator;
+import com.slack.store.MessageStore;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api")
+public class MessageController {
+
+    private final MessageStore messageStore;
+    private final ChannelFanoutService fanoutService;
+    private final SnowflakeIdGenerator idGenerator;
+
+    public MessageController(MessageStore messageStore,
+                             ChannelFanoutService fanoutService,
+                             SnowflakeIdGenerator idGenerator) {
+        this.messageStore = messageStore;
+        this.fanoutService = fanoutService;
+        this.idGenerator = idGenerator;
+    }
+
+    @PostMapping("/chat.postMessage")
+    public ResponseEntity<SlackApiResponse> postMessage(@RequestBody Map<String, Object> body) {
+        String channelId = (String) body.get("channel_id");
+        String text = (String) body.get("text");
+        String userId = (String) body.get("user_id");
+        Long threadTs = body.containsKey("thread_ts") ? Long.valueOf(body.get("thread_ts").toString()) : null;
+
+        long messageId = idGenerator.nextId();
+        MessageEvent event = new MessageEvent(messageId, channelId, userId, text, threadTs);
+        messageStore.persist(event);
+        fanoutService.fanOutMessage(channelId, event);
+
+        return ResponseEntity.ok(new SlackApiResponse(true, messageId, channelId));
+    }
+
+    @GetMapping("/conversations.history")
+    public ResponseEntity<SlackApiResponse> getHistory(
+            @RequestParam String channel_id,
+            @RequestParam(required = false) Long cursor,
+            @RequestParam(defaultValue = "50") int limit) {
+        List<MessageEvent> messages = messageStore.getHistory(channel_id, cursor, limit + 1);
+        boolean hasMore = messages.size() > limit;
+        if (hasMore) messages = messages.subList(0, limit);
+        Long nextCursor = hasMore ? messages.get(messages.size() - 1).messageId() : null;
+        return ResponseEntity.ok(new SlackApiResponse(true, messages, hasMore, nextCursor));
+    }
+
+    @GetMapping("/conversations.replies")
+    public ResponseEntity<SlackApiResponse> getReplies(
+            @RequestParam String channel_id,
+            @RequestParam Long ts,
+            @RequestParam(required = false) Long cursor,
+            @RequestParam(defaultValue = "50") int limit) {
+        List<MessageEvent> replies = messageStore.getReplies(channel_id, ts, cursor, limit + 1);
+        boolean hasMore = replies.size() > limit;
+        if (hasMore) replies = replies.subList(0, limit);
+        Long nextCursor = hasMore ? replies.get(replies.size() - 1).messageId() : null;
+        return ResponseEntity.ok(new SlackApiResponse(true, replies, hasMore, nextCursor));
+    }
+}
+```
+
+<TradeoffTable
+  columns={["Approach", "Fan-out Cost", "Delivery Latency", "Large Channel Support", "Complexity"]}
+  rows={[
+    ["Per-user Kafka topic (push all)", "O(N) produces per message, N = channel members", "~50–100ms (Kafka + WebSocket)", "Breaks down at N > 10K; unbounded write amplification", "Low — simple iteration; easy to reason about"],
+    ["Channel pub/sub (Gateway subscriptions)", "O(1) produce per message to channel topic", "~80–150ms (broadcast + local filter)", "Scales to 100K+ members; Gateway Servers self-select relevant messages", "Medium — Gateways must track channel subscriptions; partition assignment coordination"],
+    ["Hybrid threshold (≤1K push, >1K pub/sub)", "O(N) for small channels; O(1) for large channels", "~50–100ms small; ~80–150ms large", "Best of both worlds; threshold is a runtime-tunable dial", "Medium-high — two code paths, threshold management, dual Kafka topic configuration"],
+    ["Pull-on-reconnect for inactive users", "O(0) at send time; read cost at poll time", "Next poll interval (1s–30s)", "Perfect for very large channels or low-priority users; degrades real-time feel", "Low for the send path; requires client-side polling logic and cursor management"],
+  ]}
+/>
+
+<Pitfall>
+**Pitfall: Using a relational database for message history at scale**
+
+A common first instinct is to model messages in MySQL or PostgreSQL: `SELECT * FROM messages WHERE channel_id = ? ORDER BY created_at DESC LIMIT 50`. This works for thousands of messages. At billions of rows it becomes a disaster. A composite index on `(channel_id, created_at)` helps, but as the table grows past a few hundred million rows, PostgreSQL's B-tree index pages become multi-level deep, range scans become expensive, VACUUM cannot keep up with the write rate, and replication lag accumulates during autovacuum. Sharding by `channel_id` helps but introduces cross-shard fan-out for search and complicates schema migrations. Cassandra is the right tool because its data model maps directly onto the access pattern: the partition key (`channel_id`) routes to the correct node set, and the clustering key (`message_id DESC`) stores messages pre-sorted for the most common read — "give me the 50 most recent messages in this channel." There are no secondary indexes needed for the main read path, no B-tree traversal, and write throughput scales linearly with node count.
+</Pitfall>
+
+<Pitfall>
+**Pitfall: Pushing notifications for every message in large channels**
+
+A `#general` channel in a 100K-member enterprise workspace receives 5 messages per minute during business hours. Naively pushing an APNs/FCM notification for each message produces $100{,}000 \times 5 = 500{,}000$ push notification API calls per minute from a single channel. Most of these notifications are noise — the user glances at their phone, sees "Alice posted in #general," and dismisses it. The real damage is battery drain, quota exhaustion (FCM imposes per-app-per-device daily limits), and notification fatigue that trains users to ignore all notifications. The correct model has three layers: (1) **notification preferences** — users opt in to notifications for channels they care about; by default, large channels generate no push notifications. (2) **batching** — if a user has 5 unread mentions, deliver one notification with a badge count, not 5 individual pushes. (3) **rate limiting** — the notification service applies a per-user, per-channel rate limit (e.g., at most 1 push per channel per 60 seconds for non-mention messages) with exponential backoff for repeated low-priority messages.
+</Pitfall>
+
+<Curveball>
+**"Slack wants to allow exporting an entire workspace's message history for GDPR data export. How do you export 10 TB of Cassandra data for a single workspace efficiently?"**
+
+This is an operational problem masquerading as a systems design question. The naive approach — `SELECT * FROM messages WHERE workspace_id = ?` — fails immediately because Cassandra does not partition by `workspace_id`; it partitions by `channel_id`. A full-table scan across a multi-petabyte cluster for one workspace's data would take hours and saturate cluster I/O.
+
+The correct approach uses Cassandra's token-aware range scan with a pre-computed channel list. At export request time, the system fetches all `channel_id`s for the workspace from MySQL (fast, bounded query). It then issues one Cassandra token-range scan per channel, using the DataStax Spark Cassandra Connector or the native driver's pagination API. These scans execute concurrently across all replica nodes. Each channel's messages are streamed to S3 in Parquet format using Snappy compression.
+
+For a 10 TB workspace, with 10,000 channels averaging 1 GB each, running 100 concurrent scans at 100 MB/s per scan, the full export completes in roughly 17 minutes. The Parquet files on S3 can then be processed by an Athena query to produce a user-readable CSV, filtered to only that user's messages for a personal GDPR export (Article 20 portability request). Elasticsearch snapshots provide the search index's copy of the same data as a consistency check.
+
+Rate-limiting export jobs at the Cassandra level (token-range concurrency limit) is essential to prevent the export job from saturating cluster read I/O and degrading production latency.
+</Curveball>
+
+<Curveball>
+**"A user sends a message that violates workspace policy — an admin wants to delete it from all clients immediately and prevent it from appearing in search. Walk through the deletion cascade."**
+
+This requires a consistent multi-system deletion, which is hard because Cassandra, Kafka, Elasticsearch, and client-side caches are all eventually consistent systems.
+
+Step 1 — Authoritative tombstone: Write a tombstone to Cassandra by setting `deleted_at = NOW()` on the target `(channel_id, message_id)` row. This is a lightweight transaction (`IF deleted_at = NULL`) to prevent double-deletion races. The message's text is replaced with `"[This message was deleted by an admin]"` or null, depending on workspace retention policy.
+
+Step 2 — Real-time client eviction: Publish a `message.deleted` event to the `channel-broadcast` Kafka topic. The Fan-out Service delivers this event to all online clients in the channel. Client-side code removes the message from the local in-memory timeline on receipt.
+
+Step 3 — Search index deletion: The Elasticsearch index worker consumes from a `message-deletes` Kafka topic (written to during step 1) and issues a `DELETE /workspace-idx/_doc/{message_id}` request. This removes the document from search results within the Elasticsearch refresh interval (1 second by default). For immediate effect, a `/_refresh` API call can be issued on the index, though this carries a latency cost and should be rate-limited.
+
+Step 4 — CDN and cache invalidation: If the message contained attachments served via CDN, the file storage service issues CDN cache invalidations for the attachment URLs. Redis caches holding recent channel history (if any) are invalidated via a channel-scoped cache key version bump.
+
+The trickiest part is that Kafka messages are immutable — you cannot delete a `message.send` event already in Kafka. Consumers (including the Elasticsearch indexer) that are replaying from an older offset might re-index the deleted message. The safeguard is the index worker checking `deleted_at` in Cassandra for every message it indexes (a lightweight read-before-write), or maintaining a deleted-message Bloom filter in Redis to fast-path skip known deletions during replay.
+</Curveball>
+
+<Curveball>
+**"Design Slack's 'Huddle' feature — ephemeral voice/video channels where any member can join. How does this differ from the text messaging architecture?"**
+
+Huddles share Slack's identity layer (user authentication, workspace membership, channel association) but differ architecturally in every layer below it.
+
+**Media transport:** Text messages flow through Kafka and WebSocket — a store-and-forward pipeline optimized for durability. Voice/video requires sub-100ms end-to-end latency with no buffering, which means WebRTC data channels with DTLS-SRTP encryption. Slack's Huddle architecture uses a Selective Forwarding Unit (SFU) — a server that receives each participant's audio/video stream and selectively forwards it to other participants based on who is speaking (active speaker detection via VAD). The SFU is stateful and cannot be horizontally scaled by simply adding instances the way Gateway Servers can; instead, multiple SFU regions are deployed and participants are assigned to the nearest regional SFU.
+
+**Signaling vs. media:** WebSocket (through the existing Gateway fleet) handles signaling — join/leave events, active speaker notifications, mute state, screen-share start. The actual media (RTP packets) flows through the SFU cluster, never through Kafka or Cassandra. This separation means the text messaging infrastructure handles Huddle at near-zero marginal load (a handful of signaling events per minute per participant).
+
+**Ephemerality:** Huddles are not recorded by default (recording is an enterprise feature with explicit consent). This eliminates the most complex durability problem: there is no equivalent of Cassandra message persistence. State is held in memory in the SFU for the lifetime of the Huddle session. When the last participant leaves, all in-memory state is discarded. This ephemeral model is a stark contrast to the indefinite message retention in the text layer.
+
+**Capacity:** At 20M DAU, if 1% are in a Huddle simultaneously, that is 200K concurrent Huddle participants. Each participant's audio stream at Opus 32kbps generates 4 KB/s. An SFU forwarding 10-person Huddles processes 10 × 4 KB/s inbound and 9 × 4 KB/s × 10 outbound = ~360 KB/s per session. 200K / 10 persons per Huddle = 20K concurrent sessions × 360 KB/s = ~7.2 GB/s aggregate SFU throughput. This requires dedicated SFU infrastructure entirely separate from the text gateway fleet.
+</Curveball>
+
+## Further reading
+
+- **Slack Engineering Blog — "Scaling Slack's Job Queue"**: covers the Kafka migration from a Redis-backed job queue, including partition strategy decisions that inform the fan-out architecture described here.
+- **Slack Engineering Blog — "Distributing Slack's Traffic"**: details the Layer-7 load balancing and WebSocket session affinity strategies used to route 12 million concurrent connections without a centralized session broker.
+- **"How Slack Works" (Slack Engineering Blog)**: the canonical primary source for Slack's WebSocket gateway architecture, including the connection registration model and the draining protocol used during deployments.
+- **Apache Cassandra Documentation — Data Modeling for Time-Series**: essential reading for understanding why `TimeWindowCompactionStrategy` outperforms `LeveledCompactionStrategy` for append-heavy, time-ordered workloads like message history.
+
+<RelatedQuestions items={[
+  { slug: "whatsapp-messenger", title: "Design WhatsApp Messenger", difficulty: "senior" },
+  { slug: "discord", title: "Design Discord", difficulty: "senior" },
+  { slug: "notification-system", title: "Design a Notification System", difficulty: "mid" },
+]} />

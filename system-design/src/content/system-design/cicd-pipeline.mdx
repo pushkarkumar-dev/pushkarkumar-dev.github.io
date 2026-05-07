@@ -1,0 +1,541 @@
+---
+title: "Design a CI/CD Pipeline at Scale"
+slug: "cicd-pipeline"
+category: "infra"
+difficulty: "senior"
+estimatedReadMinutes: 20
+tags: ["ci-cd", "dag-scheduling", "artifact-dedup", "sandbox-isolation", "build-cache", "canary", "feature-flags"]
+companyFlavors: ["GitHub Actions", "GitLab CI", "Jenkins", "Bazel", "BuildKite", "CircleCI"]
+prerequisites: ["distributed-job-scheduler"]
+relatedQuestions: ["distributed-job-scheduler", "distributed-logging-system", "api-gateway"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Design a CI/CD platform that runs 10,000 builds per day, scales worker capacity elastically, caches build artifacts to avoid redundant work, and provides safe progressive delivery — covering DAG scheduling, sandbox isolation, build cache deduplication, and canary deployment automation."
+javaPackages: ["org.springframework.boot:spring-boot-starter:3.3.0", "org.springframework.kafka:spring-kafka:3.2.0", "software.amazon.awssdk:s3:2.25.0"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="cicd-pipeline" title="Design a CI/CD Pipeline at Scale" />
+
+<Tldr>
+- Build graph as a DAG: identify independent steps (lint, test, build, docker push) and run them in parallel — a monorepo build can finish in 5 minutes instead of 30 by parallelizing across 10 workers
+- Build cache keyed on content hash (not timestamp): `hash(source files + dependencies + build config)` — if the hash matches a cached artifact, skip the build step entirely. Google's RBE achieves ~70% cache hit rates in large monorepos.
+- Sandbox isolation: each build step runs in an ephemeral container (Docker + seccomp profiles). No shared state between builds. Prevents cache poisoning and supply chain attacks.
+- Artifact deduplication: store build artifacts in a CAS (Content-Addressable Store) keyed by content hash — identical artifacts from different builds are stored once. Docker layer deduplication works the same way.
+- Progressive delivery: canary (5% → 100% with auto-rollback), feature flags (decouple deployment from release), blue-green (instant cutover). Choose based on your rollback speed requirement, not convention.
+</Tldr>
+
+## Why CI/CD at scale is different
+
+A CI/CD system for a team of 10 engineers is a solved problem: push to GitHub, wait 5 minutes for tests to pass, merge. The moment you scale that to 5,000 engineers in a monorepo with shared libraries — where a single commit to a core utility can trigger recompilation of 300 downstream services — the naive model collapses completely. At 1,000 commits per day, each triggering a full test suite that takes 30 minutes without optimization, you have 500 hours of build work queued per day. With a worker pool sized for average rather than peak load, engineers routinely wait 2–3 hours for feedback on a one-line change. That feedback latency is not a performance annoyance; it is a productivity multiplier that compounds across the entire engineering organization.
+
+Three properties separate a CI/CD system that scales from one that does not. The first is build graph intelligence: rather than treating each commit as "run everything," the system must parse the dependency graph, determine which targets are actually affected by the changed files, and run only those tests and build steps. The second is aggressive caching: most steps in most builds produce the same output as the previous run because the relevant inputs did not change. A system that detects this and serves cached artifacts avoids the majority of computational work. The third is elastic worker capacity: build load is highly bursty — a morning push wave, a pre-merge crunch, a Friday afternoon scramble before a long weekend. Static worker pools are either over-provisioned (expensive) or under-provisioned (queued). Elastic scaling with fast worker startup is the operational requirement.
+
+At the staff level, the interview is not asking you to describe what CI/CD does. It is asking you to reason about the scheduling, caching, isolation, and delivery machinery that makes a CI/CD platform behave correctly and efficiently at 10× and 100× the naive scale. The difference between a senior answer and a staff answer is whether you can drive to the specific failure modes — cache poisoning, flaky test amplification, artifact storage explosion, canary rollback races — and design defensively against each of them.
+
+## Clarifying questions
+
+| Question | Ideal answer | Why it matters |
+|---|---|---|
+| Monorepo or polyrepo? | Monorepo with shared libraries across 50+ services | Monorepo requires affected-target analysis; polyrepo makes every repo independent with its own pipeline |
+| Expected number of builds per day? | 10,000 builds/day at peak, growing 2× per year | Drives worker fleet sizing, storage provisioning, and cache tier design |
+| Average build duration without optimization? | 30 minutes full suite; target < 10 minutes with caching and parallelism | Determines the ROI of caching and parallelism investment |
+| Test parallelism requirements? | Shard test suites across up to 20 workers per build | Requires a test sharding strategy and result aggregation layer |
+| Artifact storage (Docker images, binaries, packages)? | Docker images to ECR, JARs to Nexus/Artifactory, raw binaries to S3 | Drives the artifact registry integration and deduplication strategy |
+| Deployment targets (Kubernetes, VMs, serverless)? | Kubernetes clusters in 3 regions | Helm chart rendering, image promotion, and regional canary rollout are in scope |
+| Progressive delivery requirements? | Canary with automatic rollback based on error rate and latency | Auto-rollback requires integration with the metrics system; manual approval gates are also needed for regulated environments |
+| Compliance requirements (audit logs, artifact signing)? | SOC 2 — every deployment must be traceable to a commit and an approver | Audit log must be tamper-evident; artifacts must be signed with Sigstore or GPG |
+
+## Functional requirements
+
+- Trigger a pipeline run on git push or pull request open/sync events via webhook
+- Parse the pipeline YAML into a DAG of named steps with explicit dependencies
+- Run independent steps in parallel across a pool of ephemeral worker containers
+- Cache build artifacts using a content-addressed store; skip steps whose inputs have not changed
+- Shard test suites across multiple workers and aggregate pass/fail results
+- Store build artifacts (Docker images, JARs, binaries) in a registry with deduplication
+- Stream build logs in real time and persist them for 90 days
+- Deploy to Kubernetes environments using Helm; support manual approval gates
+- Execute canary deployments with configurable traffic weights and automatic rollback on metric regression
+- Emit an immutable audit log entry for every deployment, including commit SHA, deployer identity, and approval chain
+
+## Non-functional requirements
+
+- **Scale**: 10,000 builds/day; peak 17 builds/minute during morning push wave
+- **Build latency**: < 10 minutes end-to-end for a typical backend service with cache populated
+- **Feedback speed**: < 2 minutes to report affected-test results on a PR (incremental testing, not full suite)
+- **Worker startup**: < 30 seconds from trigger to first step executing (pre-warmed node pool)
+- **Pipeline availability**: 99.9% uptime for the scheduling and dispatch plane; build workers are ephemeral and individually expendable
+- **Audit**: every deployment produces a tamper-evident log entry within 5 seconds of completion
+- **Storage durability**: 99.999999999% (eleven nines) for build artifacts — losing an artifact that a production binary was built from is a compliance incident
+
+## Capacity estimation
+
+<Capacity title="Back-of-envelope: 10K builds/day, peak throughput, artifact storage">
+
+**Peak build throughput**
+
+Assuming builds are concentrated in a 10-hour working day:
+
+$$
+\text{avg builds/min} = \frac{10{,}000}{10 \times 60} \approx 17 \text{ builds/min}
+$$
+
+Peak (morning push wave at 2× average):
+
+$$
+\text{peak builds/min} = 17 \times 2 = 34 \text{ builds/min}
+$$
+
+**Concurrent worker requirement**
+
+Each build uses an average of 4 parallel workers for 8 minutes:
+
+$$
+\text{concurrent workers} = 34 \text{ builds/min} \times 4 \text{ workers/build} \times \frac{8 \text{ min}}{1} = 1{,}088 \text{ worker-slots at peak}
+$$
+
+With a pre-warmed pool of 200 workers and elastic autoscaling, target < 30 seconds to provision additional Kubernetes Jobs. A 200-worker base handles normal load; autoscaling adds up to 900 more during peak windows.
+
+**Artifact storage**
+
+Raw artifact volume before deduplication:
+
+$$
+\text{raw storage/day} = 10{,}000 \text{ builds} \times 500 \text{ MB/build} = 5 \text{ TB/day}
+$$
+
+With a 70% CAS deduplication rate (Docker layers and unchanged library JARs are shared across builds):
+
+$$
+\text{net new storage/day} = 5 \text{ TB} \times (1 - 0.70) = 1.5 \text{ TB/day}
+$$
+
+At 90-day retention: $1.5 \text{ TB} \times 90 = 135 \text{ TB}$ — manageable on S3 with lifecycle policies promoting cold objects to Glacier after 30 days.
+
+**Build log storage**
+
+$$
+\text{logs/day} = 10{,}000 \text{ builds} \times 10 \text{ MB/build} = 100 \text{ GB/day}
+$$
+
+At 90-day retention: 9 TB. Store compressed (gzip ~4× ratio) in S3: ~2.25 TB hot storage.
+
+</Capacity>
+
+## API design
+
+```
+POST   /pipelines/trigger
+Body:  { repoId: "backend-service", commitSha: "a3f9...", branch: "main",
+         event: "push", triggeredBy: "webhook" }
+Response 202: { runId: "run_01HX...", status: "QUEUED", estimatedStartSec: 15 }
+
+GET    /pipelines/{runId}/status
+Response 200: {
+  runId: "run_01HX...", status: "RUNNING", commitSha: "a3f9...",
+  steps: [
+    { stepId: "s_01", name: "lint", status: "SUCCEEDED", cacheHit: true, durationMs: 120 },
+    { stepId: "s_02", name: "test", status: "RUNNING", cacheHit: false, startedAt: "..." },
+    { stepId: "s_03", name: "build", status: "PENDING" }
+  ]
+}
+
+GET    /pipelines/{runId}/logs/{stepId}
+Params: follow=true (streaming), offset=0 (byte offset for resumption)
+Response 200: text/event-stream — each event is a log line with timestamp
+
+POST   /pipelines/{runId}/approve
+Body:  { stepId: "s_04", approver: "alice@company.com", comment: "LGTM" }
+Response 200: { status: "APPROVED", unblocked: ["deploy-canary"] }
+
+POST   /deployments
+Body:  { runId: "run_01HX...", environment: "production",
+         strategy: "canary", initialWeight: 5, metricWindow: 600 }
+Response 202: { deployId: "dep_01HY...", status: "CANARY_IN_PROGRESS" }
+```
+
+The `follow=true` log streaming endpoint is backed by S3 for completed runs and by a Kafka topic consumer for in-progress steps — this allows log tailing without polling and with seamless transition to S3-backed serving once the step finishes.
+
+## Data model
+
+**`pipeline_run` table (Postgres)**
+
+```sql
+CREATE TABLE pipeline_run (
+  run_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  repo_id       TEXT NOT NULL,
+  commit_sha    TEXT NOT NULL,
+  branch        TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'QUEUED',
+  triggered_by  TEXT NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at  TIMESTAMPTZ,
+  CONSTRAINT status_check CHECK (status IN ('QUEUED','RUNNING','SUCCEEDED','FAILED','CANCELLED'))
+);
+
+CREATE INDEX idx_run_repo_branch ON pipeline_run (repo_id, branch, created_at DESC);
+```
+
+**`pipeline_step` table (Postgres)**
+
+```sql
+CREATE TABLE pipeline_step (
+  step_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  run_id       UUID NOT NULL REFERENCES pipeline_run(run_id),
+  name         TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'PENDING',
+  started_at   TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
+  worker_id    TEXT,
+  exit_code    INT,
+  cache_hit    BOOLEAN NOT NULL DEFAULT false,
+  cache_key    TEXT
+);
+```
+
+**`artifact` table — CAS model (Postgres + S3)**
+
+```sql
+CREATE TABLE artifact (
+  content_hash TEXT PRIMARY KEY,
+  size_bytes   BIGINT NOT NULL,
+  stored_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  s3_key       TEXT NOT NULL
+);
+
+CREATE TABLE artifact_ref (
+  content_hash TEXT NOT NULL REFERENCES artifact(content_hash),
+  run_id       UUID NOT NULL REFERENCES pipeline_run(run_id),
+  step_id      UUID NOT NULL REFERENCES pipeline_step(step_id),
+  artifact_name TEXT NOT NULL,
+  PRIMARY KEY (content_hash, run_id, step_id)
+);
+```
+
+The CAS model stores each unique artifact exactly once regardless of how many builds produce it. The `artifact_ref` table provides the many-to-many mapping between builds and artifacts — a garbage-collection sweep can safely delete an artifact only when its `artifact_ref` count drops to zero.
+
+**`deployment` table (Postgres)**
+
+```sql
+CREATE TABLE deployment (
+  deploy_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  run_id          UUID NOT NULL REFERENCES pipeline_run(run_id),
+  environment     TEXT NOT NULL,
+  strategy        TEXT NOT NULL,
+  canary_weight   INT NOT NULL DEFAULT 0,
+  status          TEXT NOT NULL DEFAULT 'IN_PROGRESS',
+  rolled_back_at  TIMESTAMPTZ,
+  approved_by     TEXT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+## High-level architecture
+
+<Mermaid caption="CI/CD pipeline at scale: webhook triggers DAG scheduling, ephemeral workers execute steps with cache lookup, artifacts flow to registry, deployment service executes progressive delivery to Kubernetes" diagram={`graph TB
+  Git[GitHub / GitLab] --> Webhook[Webhook Handler]
+  Webhook --> Scheduler[DAG Scheduler]
+  Scheduler --> Queue[Worker Queue\nKafka]
+  Queue --> Workers[Ephemeral Workers\nKubernetes Jobs]
+  Workers --> Cache[Build Cache\nS3 CAS]
+  Workers --> Logs[Log Store\nS3]
+  Workers --> Artifacts[Artifact Registry\nDocker + S3]
+  Artifacts --> Deploy[Deployment Service\nHelm / kubectl]
+  Deploy --> K8s[Kubernetes Clusters]`} />
+
+The webhook handler validates the HMAC signature on the incoming push event, resolves the affected targets in the monorepo dependency graph, and creates a `pipeline_run` record. The DAG scheduler parses the pipeline YAML, builds the dependency graph, and publishes step tasks to the Kafka `build-steps` topic in topological order — batches of independent steps are published together so workers can claim and execute them in parallel. Workers are Kubernetes Jobs launched from a pre-warmed node pool; each worker claims a step task, checks the build cache, executes the step in an isolated container, publishes logs to S3 and the `build-logs` Kafka topic, and reports the result back to the scheduler. The deployment service watches for `pipeline_run` records that reach `SUCCEEDED` status and have a deployment definition, then executes the deployment strategy via Helm.
+
+## Deep dives
+
+### DAG scheduling and step parallelism
+
+The pipeline YAML defines a DAG: each step declares a `needs:` list of upstream steps. The scheduler parses this into an adjacency list, runs a topological sort, and groups nodes into batches — a batch is a maximal set of steps with no intra-batch dependencies. Batch 0 runs first, batch 1 runs after all of batch 0 completes, and so on. Within a batch, all steps are dispatched to workers simultaneously.
+
+The scheduler assigns steps to workers using a priority queue ordered by estimated remaining time. Steps with the longest estimated duration are dispatched first — this minimizes total makespan (the time from first step start to last step complete) by ensuring the critical path starts as early as possible. Estimated duration is derived from the p90 of historical execution times for that step, stored in a lightweight metrics table.
+
+Worker pool management is handled by the Kubernetes cluster autoscaler. The scheduler maintains a pre-warmed pool of 200 nodes with the build agent image pre-pulled; new nodes beyond the base pool provision in about 90 seconds (Kubernetes node registration + image pull). To achieve the 30-second startup SLA, the pre-warmed pool handles the first wave of a burst, and node provisioning for the next wave begins immediately when the autoscaler detects pending pods. This is the same pattern AWS CodeBuild uses with its reserved concurrent builds.
+
+For affected-target analysis in a monorepo, the system computes the set of changed files from the git diff, then traverses the reverse dependency graph to find all build targets that transitively depend on the changed files. Only those targets are included in the DAG for this run. A change to a leaf utility used only by one service triggers one service pipeline, not 50. This analysis runs in the webhook handler using a pre-computed reverse dependency index (rebuilt on every commit to the build graph configuration).
+
+### Build cache with CAS
+
+The cache key for a build step is a deterministic hash of all its inputs:
+
+```
+cache_key = SHA-256(
+  sorted(source_file_sha256s) +
+  sorted(dependency_content_hashes) +
+  build_tool_version +
+  build_flags +
+  os_package_versions +
+  environment_variable_whitelist
+)
+```
+
+Before executing a step, the worker computes this cache key and issues a `HEAD` request to S3 at `s3://build-artifacts-cas/{cache_key}`. A 200 response means the artifact exists; the worker downloads it, skips execution, and marks the step as `cacheHit: true`. A 404 means a cache miss; the worker executes the step, uploads the output artifact to S3 at that key, and records the mapping in the `artifact` table.
+
+Cache invalidation is automatic and correct: if any input changes, the hash changes, and the cache key changes. There is no separate invalidation mechanism. The only subtle failure mode is non-hermetic builds — steps that read from the network, the filesystem clock, or non-deterministic environment variables produce different outputs for the same inputs, causing spurious cache misses or, worse, cache hits that serve incorrect artifacts. Enforcing hermeticity is an operational discipline requirement: build steps must declare all inputs explicitly, and the sandbox must block unauthorized filesystem and network access.
+
+For distributed build execution at the individual-action level — analogous to Bazel's Remote Build Execution — each build action (compile this `.java` file, link this binary) is individually cached. The cache hit rate for individual actions is much higher than for whole-step caching because most files in a large codebase do not change on any given commit. Google reports 70–90% action-level cache hit rates on large monorepos using Bazel RBE.
+
+### Sandbox isolation
+
+Each build step runs in an ephemeral Docker container launched from a minimal base image. The container is created at step start, receives only the inputs declared in the step definition, and is destroyed immediately after the step completes — passing only the declared outputs back to the worker agent. No state persists between steps except through explicit artifact hand-offs.
+
+The seccomp profile blocks `ptrace` (prevents one build process from inspecting another), restricts network egress to declared dependency endpoints only (blocks exfiltrating secrets to external hosts), and denies raw socket creation. The container runs as a non-root user with a read-only root filesystem; only the declared workspace directory is writable.
+
+This isolation prevents a compromised dependency from accessing the secrets or artifacts of other concurrent builds — the blast radius of a supply chain attack is limited to the single step's declared inputs and outputs. When a step needs to pull from a private package registry, the worker agent injects short-lived credentials (AWS IAM, GCP Workload Identity) scoped to that step's execution window, rather than providing long-lived credentials in the build environment.
+
+Build secrets (API keys, signing certificates) are injected as environment variables from a secrets manager (Vault or AWS Secrets Manager) at step execution time. They are never written to disk, never captured in logs (the log scrubber strips anything matching known secret patterns), and never included in the cache key computation — secrets are execution-time inputs, not build-time inputs.
+
+### Progressive delivery
+
+**Canary deployment** is the default strategy for customer-facing services. The deployment service issues a Helm upgrade that sets `canaryWeight=5`, routing 5% of production traffic to the new version. The canary runs for 10 minutes while the deployment service polls the metrics system for three signals: HTTP error rate (p999 of the new version vs. the stable version), p99 latency, and a business metric (e.g., checkout completion rate for an e-commerce service). If any metric regresses beyond a configured threshold (e.g., error rate increases by more than 0.5 percentage points), the deployment service triggers an automatic rollback — a Helm upgrade back to the previous release — and marks the deployment as `ROLLED_BACK`. If all metrics are healthy after 10 minutes, the service progresses the canary weight to 25%, then 50%, then 100% at 5-minute intervals.
+
+**Feature flags** decouple deployment from release. Code ships to 100% of servers on every deploy, but new functionality is gated behind a flag that defaults to off. The flag is graduated through cohorts: internal employees → closed beta users → 10% of users → 100%. This allows rolling back a feature in milliseconds (flip the flag) without a code deploy. The CI/CD pipeline's job is to deploy the code; the flag system's job is to control the release. Combining both gives you a two-axis rollout model: deployment risk (canary handles this) and feature risk (flag graduation handles this) are managed independently.
+
+**Blue-green deployment** maintains two identical production environments. The deployment service provisions the new version (green) alongside the existing version (blue), runs smoke tests against green while blue serves 100% of traffic, then executes an instant cutover by updating the load balancer routing rule. Rollback is equally instant: switch the load balancer back to blue. The tradeoff is cost — running two full production environments doubles the infrastructure bill during the switchover window — so blue-green is reserved for database schema migrations, stateful service upgrades, and high-stakes deploys where sub-second rollback is mandatory.
+
+## Java integration
+
+### Part A — Artifact cache with S3 CAS
+
+```java
+package dev.pushkar.cicd;
+
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.*;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.core.sync.ResponseTransformer;
+import org.springframework.stereotype.Component;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.util.HexFormat;
+import java.util.Map;
+
+@Component
+public class ArtifactCache {
+    private static final String BUCKET = "build-artifacts-cas";
+    private final S3Client s3;
+
+    public ArtifactCache(S3Client s3) {
+        this.s3 = s3;
+    }
+
+    public boolean exists(String contentHash) {
+        try {
+            s3.headObject(r -> r.bucket(BUCKET).key(contentHash));
+            return true;
+        } catch (NoSuchKeyException e) {
+            return false;
+        }
+    }
+
+    public void store(String contentHash, Path artifact) {
+        s3.putObject(
+            r -> r.bucket(BUCKET).key(contentHash)
+                  .metadata(Map.of("content-hash", contentHash)),
+            RequestBody.fromFile(artifact)
+        );
+    }
+
+    public Path fetch(String contentHash, Path destination) {
+        s3.getObject(
+            r -> r.bucket(BUCKET).key(contentHash),
+            ResponseTransformer.toFile(destination)
+        );
+        return destination;
+    }
+
+    public static String hash(Path... inputs) throws Exception {
+        var md = MessageDigest.getInstance("SHA-256");
+        for (Path input : inputs) {
+            md.update(Files.readAllBytes(input));
+        }
+        return HexFormat.of().formatHex(md.digest());
+    }
+}
+```
+
+### Part B — Pipeline trigger and DAG step dispatcher
+
+```java
+package dev.pushkar.cicd;
+
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.http.ResponseEntity;
+import java.util.List;
+
+@RestController
+@RequestMapping("/pipelines")
+public class PipelineController {
+    private final PipelineScheduler scheduler;
+
+    public PipelineController(PipelineScheduler scheduler) {
+        this.scheduler = scheduler;
+    }
+
+    @PostMapping("/trigger")
+    public ResponseEntity<PipelineRun> trigger(@RequestBody GitWebhookEvent event) {
+        PipelineRun run = scheduler.createRun(event.commitSha(), event.branch());
+        scheduler.schedule(run);
+        return ResponseEntity.accepted().body(run);
+    }
+
+    @GetMapping("/{runId}/status")
+    public PipelineRun status(@PathVariable String runId) {
+        return scheduler.getStatus(runId);
+    }
+}
+
+@Service
+public class PipelineScheduler {
+    private final KafkaTemplate<String, StepTask> kafka;
+    private final ArtifactCache cache;
+
+    public PipelineScheduler(KafkaTemplate<String, StepTask> kafka, ArtifactCache cache) {
+        this.kafka = kafka;
+        this.cache = cache;
+    }
+
+    @Async
+    public void schedule(PipelineRun run) {
+        DagGraph dag = DagParser.parse(run.pipelineConfig());
+        // topologicalBatches() returns levels of the DAG — each batch
+        // contains steps with no intra-batch dependency.
+        for (List<StepDef> parallelBatch : dag.topologicalBatches()) {
+            parallelBatch.parallelStream().forEach(step -> {
+                String cacheKey = computeCacheKey(step);
+                if (cache.exists(cacheKey)) {
+                    run.markStepCacheHit(step.name(), cacheKey);
+                } else {
+                    kafka.send("build-steps", new StepTask(run.id(), step, cacheKey));
+                }
+            });
+            // Block until every step in this batch reaches a terminal state
+            // before releasing the next batch to workers.
+            run.awaitBatchCompletion(parallelBatch);
+        }
+    }
+
+    private String computeCacheKey(StepDef step) {
+        try {
+            return ArtifactCache.hash(step.inputPaths().toArray(new java.nio.file.Path[0]));
+        } catch (Exception e) {
+            throw new RuntimeException("Cache key computation failed for step: " + step.name(), e);
+        }
+    }
+}
+```
+
+### Sample pipeline YAML
+
+```yaml
+pipeline:
+  name: backend-service
+  on: [push, pull_request]
+  jobs:
+    lint:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+        - run: ./gradlew checkstyleMain
+
+    test:
+      needs: lint
+      runs-on: ubuntu-latest
+      steps:
+        - run: ./gradlew test --parallel
+
+    build:
+      needs: test
+      steps:
+        - run: ./gradlew bootJar
+        - uses: docker/build-push-action@v5
+
+    deploy-canary:
+      needs: build
+      environment: production
+      steps:
+        - run: helm upgrade --set canaryWeight=5 myapp ./chart
+```
+
+The `needs:` field maps directly to the DAG edge list parsed by `DagParser`. Steps without `needs:` are roots of the DAG and form the first parallel batch. The `environment: production` annotation triggers an approval gate check before the step is dispatched to a worker — the scheduler polls for an `approved` record in the `pipeline_step` table before publishing the step task to Kafka.
+
+<TradeoffTable title="Deployment strategy comparison">
+
+| Strategy | Rollback time | Risk | Downtime | Best for |
+|---|---|---|---|---|
+| In-place (rolling) | Minutes | Medium | Zero (rolling) | Stateless services |
+| Blue-green | Seconds | Low | Zero | High-stakes deploys |
+| Canary | Minutes | Very low | Zero | Customer-facing features |
+| Feature flag | Instant | Very low | Zero | Long-lived experimentation |
+| Recreate | Seconds | High | Yes (brief) | Dev/staging only |
+
+</TradeoffTable>
+
+<Pitfall title="Build cache poisoning from incomplete cache keys">
+
+If the cache key does not include the build tool version or system-level dependencies, a builder upgrade can cause incorrect cache hits — the cache serves an old artifact for new code, or serves an artifact compiled with the old tool version for a build that expects the new tool's output format. A classic example: upgrading the JDK from 21 to 21.0.3 without invalidating cached `.class` files. The bytecode differs subtly, but the cache still serves the old version because the cache key only hashes source files. The fix is to include OS package checksums, build tool versions, and any environment variables that affect compilation in the cache key. This slightly increases cache misses on toolchain upgrades — which is the correct behavior: you want cache misses when the toolchain changes, because the cached artifact is no longer valid.
+
+</Pitfall>
+
+<Pitfall title="Flaky tests blocking deploys and eroding trust">
+
+If a test fails non-deterministically 5% of the time, and a team with 100 PRs/day uses that test as a required CI check, the team will experience 5 blocked deploys per day due to infrastructure noise rather than real bugs. Engineers learn to re-trigger pipelines on failure rather than investigating — which means real failures also get dismissed. The fix is a two-part system: track a flakiness score for every test (failure rate over a 30-day rolling window, across all runs where the test did not fail in the majority of parallel shards), and quarantine tests with a flakiness score above a threshold (e.g., >2%). Quarantined tests still run and still emit results, but they no longer block the pipeline. A separate flakiness queue alerts the owning team to fix or delete them. This preserves CI signal quality without letting infrastructure noise freeze the deploy pipeline.
+
+</Pitfall>
+
+<Curveball question="A malicious dependency is injected into your npm registry and runs arbitrary code during builds. Your builds have network access and S3 write permissions during execution. What is the blast radius, and how do you prevent this class of supply chain attack?">
+
+The blast radius without mitigations is significant: the injected code runs as the build worker's identity, which has S3 write permissions for the artifact store. It can exfiltrate build secrets injected as environment variables, overwrite cached artifacts with trojaned versions (poisoning the cache for all future consumers of those artifacts), and use the worker's network access to reach internal services. The combination of cache write access and network egress is the critical escalation path.
+
+Mitigations operate at three layers. First, network egress policy: build steps should only be permitted to reach declared dependency registries. A network policy enforced at the Kubernetes pod level (or via iptables in the container) blocks all other egress. Second, artifact signing: every artifact stored in the CAS is signed with a key held outside the build environment (Sigstore cosign, or a KMS-backed GPG key). Before a downstream step consumes an artifact, it verifies the signature. A trojan artifact without a valid signature is rejected. Third, dependency pinning and verification: all package manager lockfiles must pin exact content hashes (not just versions), and the build sandbox verifies each downloaded package against its pinned hash before allowing it to be used. A dependency with a mismatched hash causes the step to fail immediately rather than execute the malicious code. The combination — network egress restriction, artifact signing, and hash-pinned dependency verification — reduces the blast radius to the single compromised build and prevents cache poisoning from propagating to subsequent builds.
+
+</Curveball>
+
+<Curveball question="Your build cache hit rate is 90% on the first run after a commit, but drops to 40% on re-runs of the same commit. What is causing this, and how do you fix it?">
+
+A 90% hit rate on the first run but 40% on re-runs of an identical commit is a strong signal of non-hermetic builds. The cache key is deterministic (same inputs → same key), so re-runs should produce the same cache keys and the same hit rate. If they do not, the cache key computation is including something that changes between runs even when the source files do not.
+
+The most common culprits are: a timestamp embedded in the build environment (e.g., `BUILD_TIMESTAMP` environment variable included in the cache key or baked into a generated file); a random token in the dependency resolution process (some package managers include a random seed in their lockfile for reproducibility mechanisms, which is ironic); or an undeclared filesystem dependency — the build step reads a file that is not listed in its declared inputs, and that file changes between runs. A subtler cause is cache key computation that hashes the dependency's version string rather than the dependency's actual content — if the registry resolves a floating version (`^1.2.0`) to a different patch release between runs, the content changes without the version string changing.
+
+The fix is structured in two steps. First, audit the cache key computation to ensure it includes only declared, deterministic inputs. Add the actual content hash of each dependency (not its version string) to the key. Strip all timestamp, random, and machine-identity variables from the build environment. Second, use build reproducibility tooling — Bazel's `--sandbox_base` and `--action_env` restrictions, or Maven's `reproducible-build-maven-plugin` — to enforce that the build outputs are byte-for-byte identical across runs. If the output is reproducible, the cache hit rate on re-runs will converge to the first-run rate.
+
+</Curveball>
+
+<Curveball question="1,000 engineers push code at the same time on a Friday afternoon before a long weekend. Your Kubernetes worker pool autoscales, but provisioning a new node takes 3 minutes. The build queue grows to 500 pending runs. What is your capacity strategy?">
+
+The 3-minute node provisioning time is the core constraint. At a standard workload of 17 builds/minute, a 3-minute provisioning delay means 51 builds arrive before a single new node is ready. With 1,000 simultaneous pushes you have roughly 500 net-new pipeline runs all arriving within a 2-minute window — a 30× spike over normal.
+
+The strategy operates at four time horizons. In the first 30 seconds, the pre-warmed pool absorbs the initial burst. Keep a pre-warmed pool sized for 3× normal peak — roughly 200 idle workers with the build agent container image pre-pulled and the workspace volumes pre-mounted. These workers can start a build step within 10 seconds. In the first 3 minutes, the autoscaler triggers immediately on the queue depth metric (pending `build-steps` Kafka consumer lag). Because node provisioning takes 3 minutes, you must trigger autoscaling before the queue builds up — use a predictive signal: if the queue depth doubles in 60 seconds, preemptively provision for 5× the current queue depth rather than the current queue depth. In the 3- to 10-minute window, the new nodes come online and drain the queue. Priority queuing ensures that high-priority builds (main branch, release branches, on-call engineer patches) are processed ahead of developer feature branch builds. In the 10+ minute window, once the burst is processed, the autoscaler begins scaling back down, with a 10-minute scale-in delay to prevent thrashing.
+
+The longer-term fix is to negotiate with the cloud provider for a dedicated node pool with pre-provisioned instances on warm standby — AWS EC2 has Warm Pools for Auto Scaling Groups that keep instances in a stopped state, reducing launch time from 3 minutes to under 30 seconds. The cost of keeping 500 warm instances idle is bounded and predictable; the cost of engineers waiting 2 hours for build feedback is unbounded and damages productivity.
+
+</Curveball>
+
+<RelatedQuestions items={[
+  { slug: "distributed-job-scheduler", title: "Design a Distributed Job Scheduler", difficulty: "senior" },
+  { slug: "distributed-logging-system", title: "Design a Distributed Logging System", difficulty: "senior" },
+  { slug: "api-gateway", title: "Design an API Gateway / Service Mesh", difficulty: "senior" },
+]} />
+
+## Further reading
+
+- [Bazel Remote Build Execution documentation](https://bazel.build/remote/rbe) — Reference architecture for distributing individual build actions across a compute cluster, with per-action caching that achieves 70–90% hit rates in large monorepos. The caching model described in this article is directly inspired by Bazel's content-addressed action cache.
+- [Borg, Omega, and Kubernetes (Google Research, 2016)](https://research.google/pubs/borg-omega-and-kubernetes/) — Google's retrospective on 15 years of container scheduling systems. The job scheduling and bin-packing concepts are directly applicable to the ephemeral worker fleet management described in the DAG scheduling deep dive.
+- [GitHub Actions documentation — expressions and workflow syntax](https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions) — GitHub's treatment of dependency declarations, matrix builds, and reusable workflows is the closest production implementation to the pipeline YAML model described in this article.
+- [Accelerate: The Science of Lean Software and DevOps (Forsgren, Humble, Kim)](https://itrevolution.com/accelerate-book/) — The empirical research behind the four DORA metrics (deployment frequency, lead time for changes, change failure rate, time to restore service). Designing a CI/CD system without understanding these metrics is designing without a north star — this book is the north star.

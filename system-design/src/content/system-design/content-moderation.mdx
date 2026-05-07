@@ -1,0 +1,533 @@
+---
+title: "Design a Content Moderation System"
+slug: "content-moderation"
+category: "ai"
+difficulty: "senior"
+estimatedReadMinutes: 22
+tags: ["ML", "human-in-the-loop", "perceptual-hash", "NSFW", "appeal", "kafka", "multi-modal"]
+companyFlavors: ["Facebook", "YouTube", "Twitter", "TikTok", "Reddit"]
+relatedQuestions: ["ml-inference-pipeline", "youtube-design", "fraud-detection"]
+publishedAt: "2025-01-07"
+updatedAt: "2025-01-07"
+summary: "Design a multi-layer content moderation pipeline combining pre-upload hash matching, real-time ML classifiers for text/image/video, async human review queues, and an appeals management system."
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+
+<Bookmark slug="content-moderation" title="Design a Content Moderation System" />
+
+<Tldr>
+- Three-layer pipeline: synchronous hash-matching (&lt; 5ms, known bad content) → real-time ML classifier (&lt; 500ms, novel content) → async human review queue (minutes to hours, uncertain cases)
+- Perceptual hashing (pHash / PhotoDNA) matches near-duplicate images and videos even after resizing, compression, or minor cropping — exact hash matching (MD5) would miss these transformations entirely
+- ML classifiers are multi-modal: separate models for text (BERT-based multi-label), image (two-stage: fast NSFW binary → fine-grained category), and video (frame sampling plus temporal model)
+- Human review is expensive and psychologically costly — minimize via high-confidence auto-action thresholds, route efficiently by violation type to specialized queues with appropriate SLAs
+- False positives (over-removal) harm creators; false negatives (under-removal) harm victims — both rates are KPIs tracked separately, with different tolerances calibrated per violation category
+</Tldr>
+
+Content moderation is one of the most consequential system design problems in tech. Get the false positive rate wrong and you silence legitimate speech, demonetize creators, and expose the platform to political backlash. Get the false negative rate wrong and CSAM, terrorist recruitment content, and coordinated harassment campaigns proliferate on your platform. The design must work at a scale that makes comprehensive human review impossible — YouTube receives 500 hours of video per minute — while meeting legal requirements (GDPR takedown in 72 hours, CSAM reporting obligations) that have no technical escape hatch.
+
+The interesting design tension here is not purely a machine learning problem. It is a sociotechnical systems problem: you are building infrastructure that mediates human speech at planetary scale, with legal liability, psychological harm to reviewers, asymmetric error costs per violation category, and adversarial actors who actively probe your detection logic to evade it. A senior-level answer handles all of these dimensions simultaneously.
+
+## Clarifying Questions
+
+Before diving into any architecture, establish the problem boundaries with your interviewer. These questions determine the entire shape of the design:
+
+| Question | Why It Matters |
+|---|---|
+| What content types are in scope — text, image, video, audio, or all four? | Video moderation is 10x more compute-intensive than image; audio adds speech-to-text complexity; each modality requires a separate ML stack |
+| What is the violation taxonomy — NSFW, hate speech, CSAM, spam, misinformation, or a subset? | CSAM requires legally mandated reporting pipelines (NCMEC CyberTipline) and specialized reviewer training; misinformation requires external fact-checker integrations |
+| What actions can the system take — warn, remove, age-restrict, demonetize, suspend, or permanent ban? | The action spectrum determines the severity of false positive impact on creators and the severity of false negative impact on victims |
+| How does jurisdictional variation affect scope — content legal in the US may be illegal in Germany? | Geo-restriction requires regional content rules evaluated at serving time, not at upload time |
+| What does the human review team look like — in-house, outsourced, or a hybrid? | In-house teams allow tighter feedback loops for model retraining; outsourced teams require detailed labeling guidelines and quality assurance tooling |
+| Do creators have an appeals process for contesting moderation decisions? | Appeals add a separate queue, a separate reviewer pool, and anchor-bias mitigations |
+| Is moderation synchronous (block before upload) or asynchronous (scan after content goes live)? | Synchronous moderation adds latency to every upload; asynchronous means some content is briefly live before removal |
+| Is moderation proactive (scan all content) or reactive (respond to user reports)? | Proactive scanning at YouTube scale requires significant ML infrastructure; reactive-only systems miss content that users do not report |
+
+For this design, assume: all four content types in scope; full violation taxonomy including CSAM; full action spectrum; jurisdictional variation required; in-house review team with specialist queues; creator appeals supported; asynchronous post-upload ML with synchronous pre-upload hash check; proactive scanning of all content.
+
+## Functional Requirements
+
+**Pre-upload scanning:**
+- Block known-bad content before it is written to storage, using perceptual hash lookup against a known-bad hash database
+- Pre-upload check must complete synchronously in under 5ms — it is on the upload critical path
+- Return a clear rejection reason to the client when content is blocked at upload time
+
+**Post-upload classification:**
+- Asynchronously classify all newly uploaded content using multi-modal ML models
+- Text classification: multi-label probabilities for hate speech, harassment, spam, and misinformation
+- Image classification: two-stage NSFW binary classifier followed by fine-grained violation category
+- Video classification: frame sampling at 1fps with per-frame image classifier plus temporal context model
+- Audio classification: speech-to-text transcription piped into the text classifier
+
+**Human review queue:**
+- Route uncertain ML decisions to a prioritized human review queue segmented by violation type
+- Show reviewers full context: content, uploader history, account signals, ML score breakdown
+- Support two-reviewer agreement for high-stakes decisions (CSAM) to require consensus before action
+
+**Actions and enforcement:**
+- Supported actions: WARN, REMOVE, AGE_RESTRICT, DEMONETIZE, SUSPEND, PERMANENT_BAN
+- Actions are logged with actor (ML or human), reason, timestamp, and confidence for the full 7-year audit retention period
+- Geographic content restriction: block content in specific jurisdictions without global removal
+
+**Creator appeals:**
+- Allow creators to contest any moderation decision with a free-text reason
+- Route appeals to a separate reviewer pool to eliminate anchor bias from the original reviewer
+- Track overturn rate per violation type and per reviewer for quality assurance
+
+**Audit logging:**
+- Retain all moderation actions for 7 years for legal and regulatory compliance
+- Log every signal (hash match, ML score, human decision) that contributed to each action taken
+
+## Non-Functional Requirements
+
+- **Upload volume:** 500 hours of video uploaded per minute at YouTube scale; 100 million photos per day; 500 million text posts per day
+- **Pre-upload hash check latency:** under 5ms synchronously on the upload path — any higher and it meaningfully degrades upload UX
+- **Image ML classification latency:** under 500ms end-to-end from upload to decision (asynchronous, not on upload path)
+- **Video ML classification latency:** under 30 seconds from upload to initial decision (full video processing may take longer for long-form content)
+- **Human review SLA:** CSAM within 1 hour (legal requirement in many jurisdictions), terrorism within 4 hours, hate speech within 24 hours
+- **Geographic compliance:** content blocked in specific regions within 15 minutes of a geo-restriction decision
+- **Availability:** 99.9% uptime on the classification pipeline; pre-upload scanner at 99.99% (upload blocker on failure)
+- **Audit retention:** 7-year immutable log of all moderation actions and contributing signals
+
+## Capacity Estimation
+
+<Capacity title="Content Moderation Scale">
+
+**Daily volume:**
+
+$$\text{Photos: } 100\text{M/day} \div 86{,}400\text{s} = 1{,}157 \text{ images/sec}$$
+
+$$\text{Video: } 500 \text{ hr/min} \times 60 = 30{,}000 \text{ video-seconds/min uploaded}$$
+
+$$\text{Frame sampling at 1fps: } 30{,}000 \text{ frames/min} \times 1{,}000 \text{ videos} = 500{,}000 \text{ frames/min} \approx 8{,}333 \text{ frames/sec}$$
+
+$$\text{Text: } 500\text{M/day} \div 86{,}400 = 5{,}787 \text{ posts/sec}$$
+
+**GPU capacity for image classification (batched at 16 images, 200ms per batch):**
+
+$$\text{GPU-equivalents} = \left\lceil \frac{1{,}157}{16} \right\rceil \times 200\text{ms} \approx 73 \text{ batches/sec} \rightarrow 15 \text{ GPU-equivalents sustained}$$
+
+**Human reviewer capacity:**
+
+$$\text{reviewers needed} = \frac{\text{flagged rate} \times \text{daily volume}}{\text{items/hr per reviewer} \times \text{hours/day}}$$
+
+With 1% of 100M images flagged = 1M items/day; reviewers processing 200 items/hr over an 8hr shift handle 1,600 items/reviewer/day:
+
+$$\text{reviewers} = \frac{1{,}000{,}000}{1{,}600} = 625 \text{ full-time reviewers}$$
+
+**Bloom filter size for pHash index:**
+
+Storing 10B known-bad hashes at 0.001% false positive rate requires approximately $10^{10} \times 20 \text{ bits} \approx 25\text{ GB}$ — fits in a large Redis instance or distributed across a cluster.
+
+**Kafka throughput (moderation-action topic):**
+
+$$5{,}787 \text{ text} + 1{,}157 \text{ image} + 8{,}333 \text{ video frames} \approx 15{,}277 \text{ events/sec} \rightarrow \text{well within Kafka's millions/sec capacity}$$
+</Capacity>
+
+## API Design
+
+```text
+Pre-upload scan (synchronous, < 5ms SLA):
+POST /api/v1/content/scan
+  body: { contentType, perceptualHash, size, uploaderId }
+  → { allowed: bool, reason?: str }
+
+Post-upload classification (async):
+POST /api/v1/content/{contentId}/classify
+  body: { contentType, storageUri, uploaderId }
+  → { jobId }
+
+GET /api/v1/content/{contentId}/classify/{jobId}
+  → { status: PENDING|COMPLETE, action?: str, confidence?: float }
+
+Review queue (internal, reviewer-facing):
+GET /api/v1/review/queue?violationType=HATE_SPEECH&limit=10
+  → { items: [{ contentId, mlScore, context, uploaderId, uploaderHistory }] }
+
+POST /api/v1/review/{itemId}/decision
+  body: { action: APPROVE|REMOVE|ESCALATE, reason, reviewerId }
+  → { actionId }
+
+Appeals (creator-facing):
+POST /api/v1/appeals
+  body: { contentId, creatorId, reason }
+  → { appealId, status: PENDING }
+
+GET /api/v1/appeals/{appealId}/status
+  → { appealId, status: PENDING|UPHELD|DENIED, decision?, updatedAt }
+
+Geo-restriction (internal):
+POST /api/v1/content/{contentId}/restrict
+  body: { countryCodes: ["DE", "AT"], reason, actionId }
+  → { restrictionId }
+```
+
+## Data Model
+
+```sql
+CREATE TABLE content_items (
+    content_id      UUID PRIMARY KEY,
+    uploader_id     UUID NOT NULL,
+    content_type    VARCHAR(20) NOT NULL,
+    storage_uri     VARCHAR(1000),
+    perceptual_hash VARCHAR(64),
+    status          VARCHAR(20) NOT NULL,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE moderation_signals (
+    content_id      UUID NOT NULL,
+    signal_type     VARCHAR(50) NOT NULL,
+    score           FLOAT,
+    action_taken    VARCHAR(20),
+    metadata        JSONB,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE review_queue (
+    item_id         UUID PRIMARY KEY,
+    content_id      UUID NOT NULL,
+    violation_type  VARCHAR(50) NOT NULL,
+    priority        INT NOT NULL,
+    ml_score        FLOAT NOT NULL,
+    assigned_to     UUID,
+    status          VARCHAR(20) DEFAULT 'PENDING',
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE moderation_actions (
+    action_id       UUID PRIMARY KEY,
+    content_id      UUID NOT NULL,
+    action          VARCHAR(20) NOT NULL,
+    actor_type      VARCHAR(10) NOT NULL,
+    actor_id        UUID,
+    reason          VARCHAR(200),
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE appeals (
+    appeal_id       UUID PRIMARY KEY,
+    content_id      UUID NOT NULL,
+    creator_id      UUID NOT NULL,
+    reason          TEXT,
+    status          VARCHAR(20) DEFAULT 'PENDING',
+    reviewer_id     UUID,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    resolved_at     TIMESTAMPTZ
+);
+
+CREATE TABLE geo_restrictions (
+    restriction_id  UUID PRIMARY KEY,
+    content_id      UUID NOT NULL,
+    country_codes   TEXT[] NOT NULL,
+    action_id       UUID NOT NULL,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+Key indexing decisions: `content_items(uploader_id)` for account-level action lookups; `review_queue(violation_type, priority, status)` for queue dispatch; `moderation_actions(content_id)` for audit trail retrieval; `appeals(creator_id, status)` for creator dashboard queries. The `moderation_signals` table is append-only and partitioned by month for 7-year retention without hot partition issues.
+
+## Architecture Overview
+
+<Mermaid diagram={`flowchart TD
+    A[Upload Request] --> B[Pre-upload Scanner]
+    B --> C{Bloom Filter\npHash Lookup}
+    C -->|Match found| D[BLOCK — return 403]
+    C -->|No match| E[Allow Upload\nWrite to Object Store]
+    E --> F[Publish content-uploaded\nKafka Event]
+    F --> G[ML Pipeline Coordinator]
+    G --> H[Text Classifier\nBERT multi-label]
+    G --> I[Image Classifier\nResNet-50 + ViT]
+    G --> J[Video Frame Sampler\n1fps + 3D CNN]
+    H --> K[Score Aggregator]
+    I --> K
+    J --> K
+    K --> L{Confidence\nRouting}
+    L -->|HIGH confidence\nviolation| M[Auto-Remove\nKafka moderation-action]
+    L -->|MEDIUM confidence| N[Human Review Queue\nRedis sorted set]
+    L -->|LOW score| O[ALLOW\nContent goes live]
+    N --> P[Reviewer Dashboard]
+    P --> Q{Reviewer\nDecision}
+    Q -->|APPROVE| O
+    Q -->|REMOVE| M
+    Q -->|ESCALATE| R[Senior Reviewer\nor 2nd Opinion]
+    M --> S[Moderation Action Log\nPostgres append-only]
+    O --> S
+    S --> T[Creator Notification]
+    T --> U[Appeals Queue\nif creator contests]
+    U --> V[Separate Reviewer Pool\nno anchor bias]
+    V --> W[RESTORE or DENY]
+`} />
+
+The architecture has three independent latency domains. The pre-upload scanner runs synchronously on the upload path and must return in under 5ms — it does nothing but a Bloom filter lookup against a Redis cluster holding perceptual hashes of known-bad content. The ML pipeline runs fully asynchronously triggered by a Kafka event, allowing long-running video processing without blocking the uploader. The human review queue is a persistent Redis sorted set that decouples reviewer throughput from ML throughput.
+
+## Deep Dive 1: Perceptual Hashing
+
+Exact hash matching (MD5, SHA-256) is a losing strategy against sophisticated bad actors. Adding a single pixel, resizing to a different resolution, re-encoding as JPEG at a different quality level, or adding a thin border all produce a completely different exact hash. This means a trivial image transformation defeats your entire known-bad hash database. Perceptual hashing is designed specifically to survive these transformations.
+
+**pHash (perceptual hash):** Resize the image to 32x32 pixels, convert to grayscale, apply a 2D Discrete Cosine Transform (DCT), take the top-left 8x8 block of DCT coefficients (which capture low-frequency energy and ignore high-frequency noise), compare each coefficient to the median of the block, and produce a 64-bit hash where each bit represents whether the coefficient is above or below the median. Two images that are perceptually similar will have similar low-frequency DCT content and therefore will produce hashes within a small Hamming distance of each other. A Hamming distance threshold of 10 (out of 64 bits) catches most transformations including moderate cropping, JPEG re-encoding, and small watermarks while keeping false positive rates low.
+
+**PhotoDNA (Microsoft):** The industry-standard algorithm for CSAM detection. It produces a more robust fingerprint than pHash, surviving more aggressive transformations including significant cropping, color adjustments, and format conversion. The hash format is designed to be shared with the National Center for Missing and Exploited Children (NCMEC) so platforms can match against the authoritative CSAM hash database without ever sharing or storing the original content. Platforms operating in the US have legal obligations to report known CSAM to NCMEC using this mechanism.
+
+**Video perceptual hashing:** Sample a frame every 2 seconds, compute pHash for each sampled frame, and produce a sequence of per-frame hashes. A video matches a known-bad video if N consecutive frames (typically 5) have Hamming distance below threshold against the corresponding frames in the known-bad sequence. This handles re-encoding, different bitrates, and minor trimming at the start or end.
+
+**Implementation at scale:** Store all known-bad pHashes in a Redis Bloom filter tuned to a 0.001% false positive rate. The Bloom filter is the O(1) first-pass check — it definitively answers "not in the set" for the vast majority of content, allowing the pre-upload scanner to return in under 1ms. The Bloom filter is backed by the full pHash index (stored in a Redis sorted set or a dedicated approximate nearest-neighbor store) for secondary lookups when the Bloom filter returns a positive. For the Hamming distance nearest-neighbor lookup (finding hashes within distance 10 of a query hash), use Locality Sensitive Hashing (LSH) — partition the 64-bit hash into 8 bands of 8 bits each, bucket by band, and look up candidates only in the matching buckets.
+
+## Deep Dive 2: ML Classification Pipeline
+
+Content moderation is fundamentally a multi-modal classification problem. A piece of content that is harmful may be harmful because of its text alone, its image alone, or the combination of image and text together (a meme where the image is innocent but the caption is hateful). Handling this correctly requires separate models per modality that are later fused.
+
+**Text classifier:** Fine-tune a BERT-base or RoBERTa model with a multi-label classification head. Multi-label is critical because a single post can simultaneously be spam, contain hate speech, and include misinformation. The model outputs independent probabilities for each violation category rather than a single mutually exclusive label. Input features include the raw text, account age, account violation history (encoded as a feature vector), and whether the account has been previously flagged. Train on human-labeled data augmented with hard negatives (near-miss examples that reviewers initially disagreed on). Use language-specific fine-tuned variants for major languages rather than a single multilingual model — language-specific models consistently outperform multilingual BERT on borderline cases.
+
+**Image classifier (two-stage):** Stage 1 is a fast ResNet-50 binary NSFW classifier that runs on every image in approximately 10ms. If the image is classified as safe with high confidence, skip Stage 2. If the image is flagged as potentially unsafe, route to Stage 2: a Vision Transformer (ViT-Large) fine-grained classifier that produces per-category probabilities: explicit nudity, suggestive content, graphic violence, gore, terrorism-related imagery, hate symbols, and so on. The two-stage design avoids running the expensive ViT on the approximately 95% of content that is clearly safe. CSAM detection uses a completely separate model with restricted training data access — only authorized personnel with appropriate background checks can access CSAM training data, and the model is isolated in a separate compute environment with access logging.
+
+**Video classifier:** Sample frames at 1fps from the uploaded video. Run each sampled frame through the image classifier pipeline. Aggregate per-frame scores using a temporal model: a 3D convolutional neural network (3D CNN) or a Transformer operating over the sequence of frame embeddings captures temporal context that per-frame classifiers miss. A single frame showing a punch looks the same as a single frame showing a hug at certain moments — the temporal model disambiguates. For audio: run speech-to-text transcription (Whisper or similar) and pipe the transcript into the text classifier. Combine text, audio transcript, and visual signals with a late-fusion layer that learns which modality to weight more heavily for each violation category.
+
+**Confidence thresholds per violation category:** This is the most important tuning decision in the entire pipeline, and it is not a single number. Each violation category has a different cost asymmetry between false positives and false negatives, and the threshold must reflect that asymmetry.
+
+| Violation Category | Auto-Remove Threshold | Route-to-Review Threshold | Rationale |
+|---|---|---|---|
+| CSAM | 0.70 | 0.40 | Catastrophic false negative cost; legal reporting obligation; accept higher false positive rate |
+| Terrorism / violent extremism | 0.75 | 0.45 | High false negative cost; legal obligations in EU under DSA |
+| Hate speech | 0.90 | 0.60 | Context-dependent; educational content is a common false positive |
+| Graphic violence | 0.85 | 0.55 | Journalism and documentaries require context review |
+| NSFW (adult content) | 0.95 | 0.50 | Route most to age-gating review rather than outright removal |
+| Spam | 0.90 | 0.70 | Optimize for precision; false positives destroy creator trust |
+
+## Deep Dive 3: Human Review Queue
+
+At 1% flagged rate on 100M daily images, the human review queue receives 1 million items per day. At 200 items per hour per reviewer over an 8-hour shift, 625 full-time reviewers are required. This is the second-largest operating cost in the system after compute infrastructure, and it carries serious human costs that the system design must account for.
+
+**Queue architecture:** Use a Redis sorted set per violation type. The sort key is a priority-weighted timestamp: `score = base_timestamp - (priority_boost × 3600)`. A P1 CSAM item with a timestamp of T gets sorted earlier than a P4 NSFW item uploaded at the same time. This ensures CSAM items drain first regardless of arrival order within a violation type. Each violation type has an independent sorted set to allow independent SLA tracking and queue depth monitoring. Queue consumers are reviewer workstations running a polling pull model (not push) — reviewers request the next item when they are ready, which prevents overwhelm and ensures items are not held in-flight when a reviewer takes a break.
+
+**Reviewer specialization:** Route CSAM and child safety items exclusively to reviewers who have completed specialized training and psychological support programs, never to generalist reviewers. Terrorism and violent extremism items route to a separate trained queue. Hate speech and NSFW route to generalist reviewers. This specialization serves two purposes: it protects reviewers by limiting their exposure to the most harmful content, and it improves accuracy by ensuring difficult borderline cases are evaluated by reviewers familiar with the violation category.
+
+**Two-reviewer agreement for high-stakes decisions:** For CSAM, any REMOVE decision requires two independent reviewers to agree before the action is taken. Show item A to reviewer 1 and reviewer 2 without revealing each other's decisions. If both say REMOVE, execute the action and file the NCMEC CyberTipline report. If they disagree, escalate to a senior reviewer or legal team. This adds latency but provides an important error-correction layer for decisions with legal consequences.
+
+**Reviewer wellbeing tooling:** The system must include mandatory break reminders after processing a configurable number of violent or CSAM items, grayscale display mode for violent imagery to reduce emotional impact, access to psychological support resources surfaced within the tool, and audit logging of reviewer exposure to protect against reviewer burnout lawsuits. These are not optional features — they are legal and ethical obligations for any platform running a content moderation program at scale.
+
+**Queue monitoring:** Alert when any violation type's queue depth implies a missed SLA. If CSAM queue has 500 items and current throughput is 200/hr, alert when remaining time to drain exceeds 2 hours (buffer before the 1-hour SLA would be missed). Auto-route overflow items to on-call senior reviewers.
+
+## Deep Dive 4: Appeals Management
+
+Appeals are the system's error-correction mechanism and its most important source of model improvement signal. A creator who was incorrectly flagged for hate speech on a clearly educational video represents both a trust problem (they will tell others about the false positive) and a training data opportunity (the reviewed item is a high-confidence label).
+
+**Bias mitigation in appeal routing:** Never route an appeal to the same reviewer who made the original decision. The original reviewer has anchor bias from their first evaluation and is statistically unlikely to overturn their own decision even when shown new context. Route appeals to a separate pool of senior reviewers. Show them the appeal reason provided by the creator before showing the content — this is deliberate; real-world context (the creator says "this is from my documentary about the Holocaust") should inform the review.
+
+**Overturn rate as a diagnostic signal:** If 10,000 appeals are filed per day and 3% are overturned, the aggregate overturn rate looks acceptable. But the signal is in the breakdown. A specific reviewer overturn rate of 20% versus the 3% average is a significant outlier indicating over-aggressive enforcement — that reviewer needs calibration or retraining. A specific violation category (e.g., hate speech on educational content) with a 15% overturn rate indicates that the ML model is under-performing for that content subtype — the overturned items become a high-quality retraining dataset. A specific uploader cohort (e.g., news organizations) with a high overturn rate indicates that account-level context is not being used correctly at classification time.
+
+**Appeal SLAs:** Appeals are lower priority than initial moderation (the content is already removed; the creator is frustrated but the harm is not escalating). Route appeals with a 72-hour SLA for standard violations. CSAM appeals (a creator contesting a CSAM removal) require legal review before any reinstatement — route to legal counsel, not reviewers.
+
+**Creator communication:** Send a notification when an appeal is received, when review begins, and when a decision is made. If the decision is RESTORE: reinstate the content, restore any lost monetization for the period it was removed (where technically feasible), and send an explicit apology communication. Transparency here is a trust-building investment.
+
+## Python Implementation: ModerationPipeline
+
+```python
+import io
+import logging
+from dataclasses import dataclass
+from typing import Optional
+from PIL import Image
+import imagehash
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class ModerationResult:
+    content_id: str
+    action: str
+    signals: list
+    confidence: float
+
+class ModerationPipeline:
+    def __init__(self, hash_index, ml_classifier, review_queue, redis_client):
+        self.hashes = hash_index
+        self.classifier = ml_classifier
+        self.queue = review_queue
+        self.redis = redis_client
+
+    def process_image(self, content_id: str, image_bytes: bytes,
+                      uploader_id: str) -> ModerationResult:
+        signals = []
+
+        phash_val = self._compute_phash(image_bytes)
+        hash_match = self.hashes.lookup(phash_val, max_hamming=8)
+        if hash_match:
+            signals.append({"type": "HASH_MATCH", "match_id": hash_match["id"]})
+            self._log_action(content_id, "REMOVE", signals)
+            return ModerationResult(content_id, "REMOVE", signals, 1.0)
+
+        scores = self.classifier.classify_image(image_bytes)
+        signals.append({"type": "ML_CLASSIFIER", "scores": scores})
+
+        if not scores:
+            return ModerationResult(content_id, "ALLOW", signals, 0.0)
+
+        top_category = max(scores, key=scores.get)
+        top_score = scores[top_category]
+
+        thresholds = self._get_thresholds(top_category)
+        if top_score >= thresholds["remove"]:
+            self._log_action(content_id, "REMOVE", signals)
+            return ModerationResult(content_id, "REMOVE", signals, top_score)
+        elif top_score >= thresholds["review"]:
+            priority = 1 if top_category == "csam" else 3
+            self.queue.enqueue(content_id, top_category, top_score, priority)
+            return ModerationResult(content_id, "REVIEW", signals, top_score)
+        else:
+            return ModerationResult(content_id, "ALLOW", signals, top_score)
+
+    def _compute_phash(self, image_bytes: bytes) -> str:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB").resize((64, 64))
+        return str(imagehash.phash(img))
+
+    def _get_thresholds(self, category: str) -> dict:
+        defaults = {"remove": 0.95, "review": 0.50}
+        overrides = {
+            "csam": {"remove": 0.70, "review": 0.40},
+            "spam": {"remove": 0.90, "review": 0.70},
+        }
+        return overrides.get(category, defaults)
+
+    def _log_action(self, content_id: str, action: str, signals: list):
+        self.redis.setex(f"content:{content_id}:action", 86400, action)
+        logger.info("content_id=%s action=%s", content_id, action)
+```
+
+## Python Implementation: AppealProcessor
+
+```python
+import uuid
+import logging
+from datetime import datetime
+from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class Appeal:
+    appeal_id: str
+    content_id: str
+    creator_id: str
+    reason: str
+    status: str
+    created_at: datetime
+
+class AppealProcessor:
+    def __init__(self, db_session, review_queue, notification_service):
+        self.db = db_session
+        self.queue = review_queue
+        self.notify = notification_service
+
+    def submit_appeal(self, content_id: str, creator_id: str, reason: str) -> Appeal:
+        existing = self.db.execute(
+            "SELECT * FROM appeals WHERE content_id=%s AND creator_id=%s AND status='PENDING'",
+            (content_id, creator_id)
+        ).fetchone()
+        if existing:
+            return Appeal(**existing)
+
+        appeal_id = str(uuid.uuid4())
+        self.db.execute(
+            "INSERT INTO appeals VALUES (%s,%s,%s,%s,'PENDING',%s)",
+            (appeal_id, content_id, creator_id, reason, datetime.utcnow())
+        )
+        self.db.commit()
+        self.queue.enqueue_appeal(appeal_id, content_id, priority=4)
+        return Appeal(appeal_id, content_id, creator_id, reason, "PENDING", datetime.utcnow())
+
+    def resolve_appeal(self, appeal_id: str, decision: str, reviewer_id: str):
+        new_status = "UPHELD" if decision == "RESTORE" else "DENIED"
+        self.db.execute(
+            "UPDATE appeals SET status=%s WHERE appeal_id=%s", (new_status, appeal_id)
+        )
+        if decision == "RESTORE":
+            content_id = self.db.execute(
+                "SELECT content_id FROM appeals WHERE appeal_id=%s", (appeal_id,)
+            ).scalar()
+            self.db.execute(
+                "UPDATE content_items SET status='ACTIVE' WHERE content_id=%s", (content_id,)
+            )
+        self.db.commit()
+        creator_id = self.db.execute(
+            "SELECT creator_id FROM appeals WHERE appeal_id=%s", (appeal_id,)
+        ).scalar()
+        self.notify.send_appeal_decision(creator_id, appeal_id, decision)
+        logger.info("Appeal %s resolved: %s by %s", appeal_id, decision, reviewer_id)
+```
+
+## Moderation Strategy Trade-offs
+
+<TradeoffTable title="Moderation Strategy Trade-offs">
+
+| Strategy | Latency Impact | Coverage | False Positive Risk | Cost | Best For |
+|---|---|---|---|---|---|
+| Proactive scan before going live | High — adds to upload path | Complete — all content evaluated | Higher — no post-publish context | Very high — compute on 100% of content | CSAM, terrorism where any exposure is unacceptable |
+| Reactive report-based only | None on upload | Incomplete — only reported content | Lower — human reports provide context | Low — only review reported items | Low-harm categories on small platforms |
+| Hash-only matching | Very low — O(1) lookup | Narrow — known-bad content only | Very low — exact or near-exact matches | Very low — Redis lookup | Known-bad content (CSAM PhotoDNA) as first filter |
+| ML plus human hybrid | Medium — async, no upload impact | Broad — novel and known-bad content | Medium — tunable per violation category | High — GPU inference plus reviewer labor | Full-scale platforms; all violation categories |
+
+</TradeoffTable>
+
+<Pitfall title="Setting a single confidence threshold across all violation categories">
+
+A threshold of 0.80 for hate speech may be a reasonable operating point — 20% of borderline hate speech cases going to human review rather than auto-removal is acceptable given the context-dependence of the category. But applying that same threshold to CSAM means 20% of CSAM escapes the auto-remove path and enters a slower human review queue. In the time it takes a reviewer to process it, the content has been live on the platform, potentially viewed and downloaded by bad actors, and you have a potential NCMEC reporting failure. This is legally and ethically catastrophic.
+
+Each violation category must have its own threshold pair (auto-remove and route-to-review) calibrated specifically to that category's false-negative and false-positive cost ratio. CSAM and terrorism use low thresholds to maximize recall at the expense of precision — you accept more false positives routed to human review because the false negative cost is catastrophic. Spam and adult content use high thresholds to maximize precision — a false positive that removes a creator's legitimate content is a significant trust and revenue event, and spam that slips through for an extra few hours causes modest incremental harm.
+
+</Pitfall>
+
+<Pitfall title="Relying only on exact hash matching (MD5 or SHA) to detect known-bad content">
+
+Exact hash matching is trivially defeated by any transformation of the source file. Re-encoding a JPEG at a different quality setting, resizing by a single pixel, adding a one-pixel border, rotating by 0.5 degrees, or converting to a different color profile all produce a completely different MD5 or SHA-256 hash while leaving the image perceptually identical to the original. Bad actors distributing CSAM and terrorist content have known this for over a decade and routinely apply these transformations before uploading.
+
+Perceptual hashing (pHash, PhotoDNA) is specifically engineered to produce similar hashes for perceptually similar images regardless of these transformations. The Hamming distance between the pHash of an original and the pHash of a JPEG-recompressed, slightly-resized version will typically be less than 5 bits out of 64. A hash-only system without perceptual matching — no matter how large its known-bad database — will miss the vast majority of re-encoded CSAM and terrorist content currently circulating on platforms. This is not a theoretical concern; it is the documented attack pattern.
+
+</Pitfall>
+
+<Curveball title="Content legal in the United States but illegal in Germany (Nazi symbols). How do you handle this?">
+
+Geographic content restriction means the content itself remains stored and associated with an ACTIVE global status, but its visibility is suppressed for viewers in specific jurisdictions at serving time. The content item gets a geo_restrictions record with `country_codes = ["DE", "AT"]` for Nazi symbols. Every content serving request checks the viewer's geolocation (derived from their IP address using a MaxMind or similar database, checked client-side or at the CDN edge) against the active restriction list for that content. If the viewer is in a restricted jurisdiction, the CDN returns a 451 Unavailable For Legal Reasons response rather than the content.
+
+This design deliberately separates the global moderation decision from the jurisdictional restriction decision. The alternative — globally removing content that is only illegal in one jurisdiction — over-removes legitimate speech for users in other countries and is politically and legally contentious. Store the jurisdiction metadata on the moderation action record, not on the content item itself, so that evolving jurisdiction laws can add or remove restrictions without touching the content record.
+
+Geographic restriction is explicitly best-effort. VPN users can trivially evade IP-based geolocation. This is a known limitation that platforms document in their Terms of Service rather than attempting to solve technically — IP geolocation is the legally expected standard of care for geo-restriction, not a guarantee of enforcement against determined evaders.
+
+</Curveball>
+
+<Curveball title="How do you moderate a live video stream in real-time?">
+
+Live video moderation is fundamentally different from pre-recorded content moderation because the content does not exist in full at classification time. The transcode pipeline intercepts every 2-second HLS or DASH segment as it is produced. A lightweight frame classifier (targeting under 500ms end-to-end) runs on sampled frames from each 2-second segment. The stream is deliberately delayed by 2 seconds at the CDN delivery layer — viewers see content 2 seconds after it is produced, which is within the UX tolerance for live video and provides a 2-second action window before content is delivered to any viewer.
+
+Confidence thresholds for live streams must be more conservative than for pre-recorded content. With pre-recorded content, a false positive means you incorrectly flag content that was never seen live. With a live stream, the content has potentially been seen by millions of viewers in the 2-second buffer window already. This asymmetry justifies lower thresholds (more aggressive removal) for live content.
+
+Account history adjusts the live delay buffer and thresholds: new streamers with no history get a 10-second buffer and the most conservative thresholds. Established streamers with a long low-violation history and large audiences get a 2-second buffer and standard thresholds. If a violation is detected: immediately terminate the stream, apply the account action (suspend stream privileges), and retroactively remove the VOD recording. Send the streamer a notification with the specific timestamp of the detected violation so they understand what triggered the action.
+
+</Curveball>
+
+<Curveball title="You have 10,000 appeals per day but only 3% are overturned. How do you improve the system without manually reviewing all 10,000?">
+
+The 3% overturn rate is not noise — it is the highest-quality labeled training data your system produces, because it represents cases where a human expert with full context overrode the original ML decision or human reviewer decision. The question is not how to handle 10,000 appeals more efficiently. The question is what the 3% is telling you about systematic failures in your pipeline.
+
+Cluster the overturned appeals by four dimensions: violation type, uploader cohort, original reviewer ID, and model version. Within each cluster, compute the cluster-specific overturn rate and compare it to the 3% baseline. Any cluster with a significantly elevated overturn rate is a signal of a systematic error. A reviewer whose overturn rate is 20% compared to the 3% average is flagging content too aggressively — this is a calibration issue addressable through targeted reviewer feedback or retraining on their specific decision history. A violation sub-type (say, hate speech applied to content that is educational history) with a 15% overturn rate indicates that the educational context classifier is underperforming for that sub-type — the overturned items from that cluster become a focused retraining dataset. A specific uploader cohort (news organizations, verified accounts) with elevated overturn rates indicates that account-level context signals are not being surfaced to reviewers or incorporated into the ML model with sufficient weight.
+
+The output of this analysis is targeted interventions: reviewer calibration sessions, focused model retraining on high-overturn clusters, and adjustments to context surfacing in the reviewer UI — all of which reduce future false positives without requiring you to manually re-review all 10,000 appeals.
+
+</Curveball>
+
+## Further Reading
+
+The academic and industry literature on content moderation at scale is substantial and worth engaging with seriously if you work in this domain. Meta AI has published detailed technical blog posts on their automated content moderation systems, covering how they combine hash-matching, multi-modal ML classifiers, and human review at the scale of billions of daily content interactions. Microsoft's PhotoDNA technology documentation explains the perceptual hashing algorithm designed for CSAM detection and provides context on how the hash-sharing ecosystem with NCMEC works in practice. YouTube's research team has published papers on their machine learning approach to content moderation, including how they handle the cold-start problem for novel violation patterns that the existing training data does not cover. The broader Trust and Safety Engineering field has coalesced around shared tooling and practices — the Trust and Safety Professional Association (TSPA) publishes guidelines that are worth reading even from a pure systems engineering perspective, because they document operational requirements that the technical system must support. NCMEC's CyberTipline reporting obligations are US federal law (under PROTECT Our Children Act and CIPA) — any platform hosting user content in the United States must understand these obligations and design their CSAM detection pipeline to meet the reporting requirements. Finally, the EU's Digital Services Act (DSA) has established new compliance requirements for Very Large Online Platforms (VLOPs) with over 45 million EU users: mandatory risk assessments, independent audits, transparency reporting on content removal decisions, and researcher data access — all of which have concrete technical system design implications that go well beyond the core moderation pipeline covered in this article.
+
+<RelatedQuestions items={[
+  { slug: "ml-inference-pipeline", title: "Design an ML Model Serving Infrastructure", difficulty: "staff" },
+  { slug: "youtube-design", title: "Design YouTube", difficulty: "senior" },
+  { slug: "fraud-detection", title: "Design a Real-Time Fraud Detection System", difficulty: "staff" },
+]} />

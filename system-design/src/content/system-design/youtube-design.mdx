@@ -1,0 +1,842 @@
+---
+title: "Design YouTube"
+slug: "youtube-design"
+category: "media"
+difficulty: "staff"
+estimatedReadMinutes: 28
+tags: ["video-streaming", "transcoding", "adaptive-bitrate", "cdn", "hls", "dash", "recommendations"]
+companyFlavors: ["YouTube", "Netflix", "TikTok", "Vimeo", "Twitch"]
+prerequisites: ["cdn-design", "photo-storage-haystack", "s3-object-storage"]
+relatedQuestions: ["netflix", "tiktok-reels", "twitch-live-streaming"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design YouTube end-to-end: video ingestion and transcoding pipeline, adaptive bitrate streaming with HLS/DASH, global CDN delivery, the watch-next recommendation system, and the engineering trade-offs behind serving 1 billion hours of video daily."
+javaPackages:
+  - "software.amazon.awssdk:s3:2.25.0"
+  - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="youtube-design" title="Design YouTube" />
+
+<Tldr>
+- **Upload pipeline**: raw video is chunked and uploaded directly to S3 via pre-signed resumable URLs; a Kafka `video-uploaded` event triggers a transcoding orchestrator that fans out parallel FFmpeg jobs to produce HLS and DASH manifests at five resolutions (144p to 1080p/4K); finished segments are pushed to the CDN origin before the video is marked ready.
+- **Adaptive bitrate streaming (ABR)**: the client player downloads a master manifest (`.m3u8` or `.mpd`), then fetches 6-second segments; a throughput estimator (BOLA or SQUAD) switches quality levels at segment boundaries so quality degrades gracefully under bandwidth pressure rather than buffering.
+- **CDN hierarchy**: three tiers — edge PoP, regional cache, S3 origin; the top 1% of videos account for roughly 99% of traffic and are always hot at the edge; long-tail videos are fetched from origin on first request, cached regionally for 7 days; viral spikes are handled by proactive pre-warm pushed to the top-50 edge PoPs.
+- **Metadata and recommendations**: video metadata lives in Cloud Spanner for global consistency; watch-next is a two-stage pipeline — two-tower neural retrieval narrows a corpus of 800M videos to 500 candidates, a ranking DNN scores them on predicted watch time and CTR; 70% of all watch time is recommendation-driven.
+- **View count**: deliberately eventually consistent — each view fires a Redis `INCR` (O(1), atomic); a background worker batch-writes accumulated counts to MySQL every five minutes; the displayed count is rounded above 10K ("1.2M views"), eliminating false precision expectations.
+</Tldr>
+
+## The scale of the problem
+
+YouTube is the largest video platform on Earth by virtually every measure: 2 billion logged-in users visit every month, creators upload 500 hours of video every single minute, and users collectively watch 1 billion hours of video every day. To make those numbers concrete — if every person on Earth watched YouTube simultaneously, each would need to sustain roughly 770 hours of content per day. The platform is not just large; it is categorically different in engineering character from any text-based or image-based social network.
+
+The first difference is file size. A single 1080p 60fps video at H.264 encoding runs 3–5 GB per hour. A 4K HDR video at the same duration can reach 20–30 GB in the raw form creators upload. Images are kilobytes; text is bytes; video is gigabytes. The storage footprint and the upload infrastructure must be designed around this from the start. You cannot accept a 10 GB file through an API gateway the way you might accept a 5 MB image — the chunked resumable upload protocol exists specifically because raw TCP connections at that scale are brittle, creators' connections drop, and retry-from-scratch would be intolerable.
+
+The second difference is transcoding cost. A photo can be resized in milliseconds with ImageMagick. Transcoding a two-hour 4K video at six quality levels with three codecs takes compute hours on GPU or CPU clusters. YouTube's transcoding farm is one of the largest FFmpeg deployments in the world. The fundamental insight every interviewer is testing: transcoding must be fully decoupled from the upload response. Return a job ID immediately; let the pipeline finish asynchronously; the creator sees a "processing" state until segments are ready.
+
+The third difference is delivery semantics. Serving an image means returning a blob. Serving a video means sustaining a stateful byte-range stream for the next hour while the viewer's network fluctuates between 50 Mbps and 1 Mbps. Adaptive bitrate streaming with HLS or DASH solves this at the protocol level, but only if the CDN cache-hit ratio stays above 99% for popular content — because a cache miss under load sends a tsunami of origin-fetch requests to S3 that no object-store cluster can absorb. The majority of the engineering challenge in YouTube's architecture lives in the CDN and transcoding pipeline, not in the metadata database.
+
+## Clarifying questions
+
+Lock down these eight questions in the first five minutes of the interview. Every affirmative or negative shifts at least one major design decision.
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| What is the maximum video length for an upload? | 12 hours for verified creators; 15 minutes for unverified | Gates the maximum file size S3 object, resumable upload chunk count, and worst-case transcoding job duration |
+| What is the maximum raw file size? | 256 GB per upload | Determines chunk size strategy (256 MB chunks), pre-signed URL expiry window, and transcoding worker memory footprint |
+| Which output resolutions must be supported? | 144p, 240p, 360p, 480p, 720p, 1080p, and 4K (2160p) for eligible videos | Determines the number of parallel transcoding jobs per video and total storage multiplication factor |
+| Is live streaming in scope? | Out of scope — live streaming is a separate ingest pipeline (RTMP/SRT → HLS chunker → origin push) | Live streaming has fundamentally different latency requirements, no transcoding-before-publish pipeline, and different CDN cache strategy (never-expiring sliding window) |
+| Is watch-next recommendation in scope? | Yes, but at a high level — describe the two-stage retrieval + ranking architecture | Recommendation system is 70% of watch time; examiners expect at minimum the candidate generation / ranking split and the signals used |
+| Are comments in scope? | Yes, storage and threading model only — real-time delivery is out of scope | Comments require a hierarchical data model (parent_comment_id) and pagination; real-time comment streaming (like live chat) is a separate WebSocket problem |
+| Is copyright detection (Content ID) in scope? | Out of scope — assume a separate fingerprinting service consumes the same Kafka `video-ready` event | Content ID fingerprinting involves audio and video hash matching against a 100M+ reference database; it is a distinct system |
+| Is geographic availability global? | Yes — design for global delivery | Drives CDN PoP placement, multi-region S3 replication strategy, and metadata global consistency requirements |
+
+## Functional requirements
+
+- Authenticated creators can upload video files of any common container format (MP4, MOV, AVI, MKV, WebM); uploads are chunked and sent directly to object storage via resumable pre-signed URLs.
+- The platform transcodes uploaded video asynchronously into multiple resolutions (144p through 4K) and codecs (H.264, VP9, AV1), generating HLS and DASH manifest files for each video.
+- Authenticated and anonymous viewers can stream any public video with adaptive bitrate delivery; the player seamlessly switches quality levels based on available bandwidth.
+- Viewers can search for videos by title, description, and tags; search results are ranked by relevance and engagement signals.
+- The platform tracks view counts, watch duration, likes, and dislikes; view counts are displayed on video pages and are eventually consistent.
+- Authenticated viewers see a personalized watch-next recommendation panel driven by their watch history and the current video's content signals.
+
+## Non-functional requirements
+
+- **Scale**: 2 billion monthly active users; 500 hours of video uploaded per minute; 1 billion hours of video watched per day.
+- **Playback start latency**: p99 time-to-first-byte (TTFB) for video segment delivery under 200ms at edge; end-to-end playback start (including manifest fetch and first-segment decode) under 2 seconds.
+- **Upload success rate**: greater than 99.5% of upload sessions complete without requiring a full restart; resumable upload protocol allows retry from last confirmed chunk.
+- **Availability**: 99.99% for video playback (four nines); 99.9% for upload API (three nines acceptable since uploads can be retried).
+- **Durability**: 11 nines for video segments stored in object storage; metadata replicated across at least three availability zones within a region.
+- **Storage retention**: videos retained indefinitely unless deleted by creator or removed by policy enforcement; raw upload files may be discarded after transcoding succeeds (configurable per policy).
+- **Consistency**: view counts are eventually consistent within 5 minutes; video metadata (title, description edits) are eventually consistent within 30 seconds across regions.
+
+<Capacity title="YouTube Capacity Estimates">
+
+**Upload ingestion rate**
+
+$$
+500 \text{ hr/min} \times 60 \text{ min/hr} = 30{,}000 \text{ video-hours ingested per hour}
+$$
+
+At an average encoded bitrate of approximately 3 GB per hour of raw 1080p source:
+
+$$
+30{,}000 \text{ hr/hr} \times 3 \text{ GB/hr} = 90 \text{ TB/hr raw upload} \approx 25 \text{ GB/s sustained ingest bandwidth}
+$$
+
+**Transcoding compute**
+
+Each uploaded video-hour generates seven output resolutions. FFmpeg on a single CPU core transcodes H.264 at roughly 50× real-time for 360p, falling to 5× real-time for 4K H.264 and 2× for AV1. Weighted across the resolution ladder:
+
+$$
+30{,}000 \text{ hr/hr} \times 7 \text{ resolutions} \div 20\text{× average transcode factor} \approx 10{,}500 \text{ CPU-core-hours of compute per hour}
+$$
+
+This requires a farm of approximately 3,000 dedicated transcoding cores running at 100% utilization continuously — in practice, GPU-accelerated NVENC handles H.264/H.265 at 10–30× speedup over CPU, so the actual footprint is closer to a few hundred GPU workers.
+
+**Storage at scale (5-year cumulative)**
+
+$$
+30{,}000 \frac{\text{hr}}{\text{hr}} \times 24 \frac{\text{hr}}{\text{day}} \times 365 \frac{\text{day}}{\text{yr}} \times 5 \text{ yr} \times 3 \frac{\text{GB}}{\text{hr}} \times 7 \text{ variants} \approx 8.2 \text{ exabytes}
+$$
+
+This is consistent with publicly reported estimates of YouTube's storage footprint distributed across Google's Colossus / GCS infrastructure.
+
+**Streaming bandwidth**
+
+$$
+\frac{1 \text{ billion hours/day}}{86{,}400 \text{ s/day}} \times 3{,}600 \frac{\text{s}}{\text{hr}} \approx 41.7 \text{ million concurrent streams}
+$$
+
+At an average adaptive bitrate of 2 Mbps:
+
+$$
+41.7 \times 10^6 \times 2 \text{ Mbps} = 83 \text{ Pbps CDN egress (theoretical)}
+$$
+
+In practice, a 99%+ CDN cache-hit ratio means the origin (S3) sees only 1–2% of this as cache-miss origin-fetch traffic, or roughly $830 \text{ Tbps}$ to $1.7 \text{ Pbps}$ of origin load — still enormous, which is why multi-region S3 replication and origin shielding are non-negotiable.
+
+**Metadata storage**
+
+$$
+800 \text{ million videos} \times 5 \text{ KB metadata/video} = 4 \text{ TB}
+$$
+
+Metadata storage is not the hard problem. The challenge is write throughput: 500 uploads per minute plus view-count increments at 41.7 million concurrent streams means roughly 40–50 million write events per second against the view-count layer, which is why Redis absorbs those writes rather than MySQL.
+
+</Capacity>
+
+## API design
+
+### Upload flow
+
+**Initiate upload**
+
+```text
+POST /upload/initiate
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "title": "How to build a distributed system",
+  "description": "...",
+  "privacy": "public",
+  "category": "education",
+  "file_size_bytes": 4831838208,
+  "file_name": "distributed-systems-lecture.mp4"
+}
+
+Response 200:
+{
+  "upload_id": "up_7Xk2mN9qPwRv",
+  "upload_url": "https://storage.googleapis.com/yt-raw/up_7Xk2mN9qPwRv?X-Goog-Signature=...",
+  "chunk_size_bytes": 268435456,
+  "expires_at": "2025-01-16T10:00:00Z"
+}
+```
+
+The `upload_url` is a GCS/S3 resumable upload session URL. The client splits the file into 256 MB chunks and PUTs them sequentially; on network failure it resumes from the last confirmed chunk using a `Content-Range` header.
+
+**Complete upload**
+
+```text
+POST /upload/complete
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "upload_id": "up_7Xk2mN9qPwRv"
+}
+
+Response 202:
+{
+  "video_id": "dQw4w9WgXcQ",
+  "status": "processing",
+  "estimated_ready_at": "2025-01-15T09:45:00Z"
+}
+```
+
+The `202 Accepted` response is the key design decision: never `200 OK`, never block on transcoding. The pipeline is asynchronous.
+
+### Playback flow
+
+**Watch page metadata**
+
+```text
+GET /watch?v=dQw4w9WgXcQ
+Authorization: Bearer <token>  (optional for public videos)
+
+Response 200:
+{
+  "video_id": "dQw4w9WgXcQ",
+  "title": "...",
+  "channel": { "id": "UCuAXFkgsw1L7xaCfnd5JJOw", "name": "..." },
+  "duration_sec": 212,
+  "view_count": 1200000,
+  "like_count": 87000,
+  "manifest_url": "https://cdn.youtube.com/manifest/dQw4w9WgXcQ.m3u8?token=<signed>",
+  "thumbnail_url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg"
+}
+```
+
+**HLS master manifest**
+
+```text
+GET /manifest/dQw4w9WgXcQ.m3u8
+(served from CDN, signed URL)
+```
+
+**Individual segment**
+
+```text
+GET /segment/dQw4w9WgXcQ/720p/segment_042.ts
+(served from CDN edge — this is the hot path, >99% cache-hit target)
+```
+
+### Metadata and engagement APIs
+
+**Record a view**
+
+```text
+POST /api/v1/videos/{video_id}/view
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "session_id": "sess_a1b2c3",
+  "watch_duration_sec": 147,
+  "quality_played": "720p"
+}
+
+Response 204 No Content
+```
+
+The server-side handler validates that `watch_duration_sec >= 30` (30-second minimum to count as a view), then fires `INCR views:{video_id}` in Redis and publishes a `view-event` to Kafka for analytics ingestion. It never touches the MySQL `view_count` column on the hot path.
+
+**Watch-next recommendations**
+
+```text
+GET /api/v1/recommendations?video_id=dQw4w9WgXcQ&count=20
+Authorization: Bearer <token>
+
+Response 200:
+{
+  "recommendations": [
+    { "video_id": "abc123", "title": "...", "channel": "...", "thumbnail_url": "...", "duration_sec": 483, "view_count_approx": 450000 },
+    ...
+  ],
+  "source": "cached",
+  "cache_age_sec": 312
+}
+```
+
+The `source` field is useful for client-side debugging: `cached` means the Redis key `recs:{video_id}` was hit; `realtime` means the recommendation service was called synchronously (happens for very new videos with no precomputed candidates).
+
+## Data model
+
+### Core relational schema
+
+```sql
+CREATE TABLE videos (
+  video_id        VARCHAR(11)  NOT NULL,
+  channel_id      VARCHAR(24)  NOT NULL,
+  title           VARCHAR(100) NOT NULL,
+  description     TEXT,
+  status          ENUM('pending','processing','ready','failed') NOT NULL DEFAULT 'pending',
+  duration_sec    INT          UNSIGNED,
+  view_count      BIGINT       UNSIGNED NOT NULL DEFAULT 0,
+  like_count      BIGINT       UNSIGNED NOT NULL DEFAULT 0,
+  created_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  thumbnail_key   VARCHAR(255),
+  is_age_restricted BOOLEAN    NOT NULL DEFAULT FALSE,
+  privacy         ENUM('public','unlisted','private') NOT NULL DEFAULT 'public',
+  PRIMARY KEY (video_id),
+  INDEX idx_channel_created (channel_id, created_at DESC),
+  INDEX idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE video_variants (
+  id              BIGINT       UNSIGNED NOT NULL AUTO_INCREMENT,
+  video_id        VARCHAR(11)  NOT NULL,
+  resolution_p    SMALLINT     UNSIGNED NOT NULL,
+  codec           ENUM('h264','vp9','av1') NOT NULL DEFAULT 'h264',
+  bitrate_kbps    INT          UNSIGNED NOT NULL,
+  manifest_key    VARCHAR(512) NOT NULL,
+  segment_count   INT          UNSIGNED,
+  processing_status ENUM('queued','encoding','segmenting','uploading','ready','failed') NOT NULL DEFAULT 'queued',
+  created_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  completed_at    DATETIME(3),
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_video_resolution_codec (video_id, resolution_p, codec),
+  INDEX idx_video_status (video_id, processing_status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE channels (
+  channel_id      VARCHAR(24)  NOT NULL,
+  owner_user_id   BIGINT       UNSIGNED NOT NULL,
+  name            VARCHAR(100) NOT NULL,
+  subscriber_count BIGINT      UNSIGNED NOT NULL DEFAULT 0,
+  avatar_key      VARCHAR(255),
+  created_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (channel_id),
+  UNIQUE KEY uq_owner (owner_user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### View event stream (Kafka → BigQuery)
+
+```yaml
+topic: view-events
+partitions: 128
+retention: 7d
+schema:
+  video_id:           string
+  user_id:            string (nullable for anonymous)
+  session_id:         string
+  watch_duration_sec: int32
+  quality_played:     string
+  client_ip_hash:     string
+  country_code:       string
+  timestamp:          int64 (epoch millis)
+```
+
+Events flow from Kafka into BigQuery via a Dataflow streaming job for analytics, and into a Flink job that maintains real-time engagement signals (watch-through rate per video over the last 24 hours) fed back into the recommendation ranking model.
+
+### Redis key schema
+
+```text
+views:{video_id}           → INCR counter (batched to MySQL every 5 min)
+recs:{video_id}            → JSON list of VideoSummary, TTL 3600s
+upload:session:{upload_id} → Hash {video_id, raw_s3_key, status, chunk_count}, TTL 86400s
+transcode:pending:{video_id} → Set of resolution strings still processing
+```
+
+## Architecture diagrams
+
+<Mermaid diagram={`flowchart TD
+  A[Creator Browser / App] -->|chunked PUT via pre-signed URL| B[S3 Raw Bucket]
+  A -->|POST /upload/complete| C[Upload API]
+  C -->|publish video-uploaded event| D[Kafka: video-uploaded]
+  D --> E[Transcoding Orchestrator]
+  E -->|fan out one job per resolution| F[Kafka: transcoding-jobs]
+  F --> G[FFmpeg Worker Pool]
+  G -->|1 download raw from S3| B
+  G -->|2 encode + segment| G
+  G -->|3 upload .ts segments + .m3u8 manifest| H[S3 CDN Origin Bucket]
+  G -->|publish transcoding-completed event| I[Kafka: transcoding-completed]
+  I --> E
+  E -->|all variants ready: update status=ready| J[(MySQL: videos)]
+  E -->|update variant status| K[(MySQL: video_variants)]
+  H -->|origin fetch on cache miss| L[CDN Regional Cache]
+  L -->|cache miss| M[CDN Edge PoP]
+  M -->|cache hit: serve segment| N[Viewer Player]
+  N -->|GET manifest + segments| M`} />
+
+<Mermaid diagram={`flowchart LR
+  V[Viewer] -->|GET segment| E[Edge PoP]
+  E -->|cache HIT| V
+  E -->|cache MISS| R[Regional PoP]
+  R -->|cache HIT: fill edge + serve| E
+  R -->|cache MISS| O[S3 Origin]
+  O -->|fill regional + edge + serve| R
+  O -.->|pre-warm push for viral videos| E`} />
+
+## Deep dives
+
+### Video transcoding pipeline
+
+The transcoding pipeline is the heart of YouTube's upload experience and the most compute-intensive subsystem in the entire architecture. Every design decision here cascades into cost, latency, and quality.
+
+**Raw ingest and storage**
+
+The creator's client splits the raw file into 256 MB chunks. Each chunk is PUT directly to S3 using the resumable upload session URL returned by `/upload/initiate`. The upload API server is not in the data path — it simply generates the pre-signed URL and records the upload session. This is critical: you never want a multi-gigabyte video payload flowing through your application servers. S3 can absorb this ingest at any scale; your API fleet cannot.
+
+When the final chunk is confirmed, the client calls `/upload/complete`. The API server publishes a `VideoUploadedEvent` to the `video-uploaded` Kafka topic containing the raw S3 key and video metadata. The HTTP response returns `202 Accepted` with the `video_id` and a `status: processing` body.
+
+**Transcoding orchestrator**
+
+The orchestrator is a Kafka consumer group subscribed to `video-uploaded`. On receiving an event, it creates one `TranscodingJob` per target resolution/codec combination and publishes them to the `transcoding-jobs` topic. Crucially, lower resolutions (144p, 360p) are enqueued first and assigned higher Kafka partition priority so that a watchable version of the video is available as quickly as possible — typically within 2–5 minutes for a 10-minute video at 360p.
+
+**FFmpeg workers**
+
+Each FFmpeg worker is a stateless process that:
+
+1. Downloads the raw file from S3 (streaming, not full download — uses byte-range reads if the encoder supports it, or streams directly to stdin via a named pipe).
+2. Encodes to the target resolution and codec. For H.264 at 720p the FFmpeg command is approximately:
+
+```bash
+ffmpeg -i input.mp4 \
+  -vf scale=-2:720 \
+  -c:v libx264 -preset fast -crf 23 -maxrate 2500k -bufsize 5000k \
+  -c:a aac -b:a 128k \
+  -hls_time 6 -hls_playlist_type vod \
+  -hls_segment_filename "segment_%05d.ts" \
+  playlist.m3u8
+```
+
+3. Generates 6-second `.ts` segments and a `.m3u8` variant playlist.
+4. Uploads all segments and the manifest to the S3 CDN origin bucket under the key prefix `videos/{video_id}/{resolution}p/`.
+5. Publishes a `TranscodingCompletedEvent` to Kafka.
+
+**Codec strategy and cost**
+
+YouTube encodes at three codec tiers. H.264 (AVC) is the baseline — every device on Earth supports it in hardware. VP9 produces 25–35% smaller files at the same perceptual quality and is used on Chrome and Android where decode support is universal. AV1 achieves 50% smaller files versus H.264 but is compute-intensive to encode (10–50× slower than VP9) and is therefore reserved for 4K content and modern devices. The encoding priority is:
+
+```text
+H.264 → VP9 → AV1 (encode in this order; serve the best codec the client supports via ACCEPT header or user-agent detection)
+```
+
+**Segment immutability and re-encoding**
+
+Once a segment is written to S3, it never changes. This property is load-bearing: CDN caches can set TTL to one year for segments (`Cache-Control: public, max-age=31536000, immutable`). The manifest file, however, may be updated when new quality tiers are added post-upload, so its TTL is shorter (5 minutes). Never cache manifests aggressively.
+
+### Adaptive bitrate streaming with HLS
+
+HLS (HTTP Live Streaming, RFC 8216) is the dominant streaming protocol for on-demand video delivery. Understanding its internals is required for a staff-level design review.
+
+**Master manifest structure**
+
+The master manifest lists each available quality variant with its bandwidth and resolution:
+
+```text
+#EXTM3U
+#EXT-X-VERSION:3
+
+#EXT-X-STREAM-INF:BANDWIDTH=150000,RESOLUTION=256x144
+/segment/dQw4w9WgXcQ/144p/playlist.m3u8
+
+#EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=426x240
+/segment/dQw4w9WgXcQ/240p/playlist.m3u8
+
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+/segment/dQw4w9WgXcQ/360p/playlist.m3u8
+
+#EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=854x480
+/segment/dQw4w9WgXcQ/480p/playlist.m3u8
+
+#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720
+/segment/dQw4w9WgXcQ/720p/playlist.m3u8
+
+#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080
+/segment/dQw4w9WgXcQ/1080p/playlist.m3u8
+```
+
+**Variant playlist (per-quality)**
+
+Each variant playlist lists the individual segments:
+
+```text
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:0
+
+#EXTINF:6.000,
+segment_00000.ts
+#EXTINF:6.000,
+segment_00001.ts
+#EXTINF:5.983,
+segment_00002.ts
+#EXT-X-ENDLIST
+```
+
+**ABR algorithm**
+
+The client maintains a 15–30 second segment buffer. After each segment download, the bandwidth estimator computes throughput as:
+
+$$
+\hat{B} = \frac{\text{segment size (bits)}}{\text{download time (s)}}
+$$
+
+The BOLA (Buffer Occupancy-Based Lyapunov Algorithm) ABR algorithm used in modern players makes the quality selection decision based on both bandwidth estimate and current buffer level, not bandwidth alone. This prevents the classic oscillation problem where a player repeatedly upgrades quality (draining the buffer) then downgrades quality (re-filling), producing a flickering quality experience.
+
+Quality upgrade rule: if $\hat{B} > 1.5 \times \text{current\_bitrate}$ for two consecutive segments and buffer level is above 10 seconds, select the next higher quality tier.
+
+Quality downgrade rule: if $\hat{B} < 0.9 \times \text{current\_bitrate}$ for one segment, immediately select the next lower quality tier to prevent buffer starvation.
+
+Switches occur only at segment boundaries (every 6 seconds), never mid-segment. This gives the player a 6-second reaction window to respond to network changes.
+
+**DASH vs HLS**
+
+DASH (Dynamic Adaptive Streaming over HTTP) is the ISO standard equivalent of HLS. The manifest format is XML-based (`.mpd` — Media Presentation Description) versus HLS's text-based `.m3u8`. YouTube supports both: HLS for iOS/Safari (Apple mandates HLS), DASH for Android and web (Chrome uses DASH). The CDN serves whichever the client requests; the underlying `.ts` or `.m4s` segments may or may not be shared depending on the muxing format. YouTube's infrastructure generates both manifest types from the same encoded video data.
+
+### CDN architecture and cache efficiency
+
+The CDN is the single most important infrastructure layer for YouTube's playback latency. Every design decision should be evaluated against one question: does this keep the cache-hit ratio above 99% for popular content?
+
+**Three-tier cache hierarchy**
+
+The first tier is the edge PoP — hundreds of locations globally, typically co-located with ISPs and internet exchange points. Edge PoPs hold a subset of the total video library biased toward locally popular content. The second tier is regional PoPs — tens of larger caches that back the edge tier for their geographic region. The third tier is the S3 origin, the source of truth for all video segments.
+
+Cache keys for video segments follow the pattern `{video_id}/{resolution}/{segment_n}.ts`. Because segments are immutable, the cache-hit ratio for a warm segment approaches 100% — there is no invalidation, no staleness, no conditional GET overhead. The TTL is set to one year in the `Cache-Control` header.
+
+**The long tail problem**
+
+The Pareto principle is extreme in video: YouTube has approximately 800 million videos, but the top 1% by view count accounts for roughly 99% of total watch time. The bottom 80% of videos may be watched a handful of times per month. For this long tail, edge PoPs will almost never have the content cached. The cache-miss path is: edge misses → regional PoP misses → S3 origin fetch → fill regional PoP → fill edge PoP → serve viewer. This adds 200–500ms of latency for the first viewer in a PoP region but amortizes across all subsequent viewers in that region who are served from the regional cache.
+
+**Pre-warming for viral events**
+
+The dangerous scenario is a video that goes from zero to massive viewership in minutes — a breaking news clip, a celebrity upload, a Super Bowl ad. The cold CDN state means the first wave of viewers all experience cache misses simultaneously, creating an origin fetch stampede (the "thundering herd" problem).
+
+YouTube's mitigation is a real-time view velocity monitor. A streaming analytics job (Flink) computes per-video view rate over a 60-second sliding window. If the rate exceeds a threshold (e.g., 10,000 views/minute and growing), an alert fires and a pre-warm job pushes the video's top-three quality tiers (360p, 720p, 1080p) to the top-50 edge PoPs. The push is a simple HTTP GET against each edge PoP's internal cache-fill endpoint with the CDN's internal IP range bypassing the public-facing cache-miss path.
+
+**Origin shielding**
+
+Even with pre-warming, origin fetch load can spike. Origin shielding adds a dedicated shield PoP — a single node per region that aggregates all origin requests from that region's edge PoPs. Cache misses from edge PoPs hit the shield PoP first; only the shield PoP fetches from S3. This collapses N concurrent cache-miss requests (one from each edge PoP) into a single origin request, providing "request coalescing" that protects S3 under load.
+
+**Cache purge for deleted or updated content**
+
+When a creator deletes a video or YouTube removes it for policy violation, the segment cache must be purged within a defined SLA (60 seconds per YouTube's own policy). This is done via tag-based invalidation: each video's CDN objects are tagged with the `video_id` at cache-fill time, and a single tag-invalidation API call purges all associated objects from all PoPs simultaneously. Tag-based invalidation is far more efficient than URL-based invalidation when a video has thousands of segments across dozens of resolutions.
+
+### Recommendation engine
+
+YouTube's recommendation system drives 70% of total watch time — the single highest-leverage system in the product after the core playback infrastructure. The 2016 Google Research paper "Deep Neural Networks for YouTube Recommendations" (Covington, Adams, Sargin) remains the canonical reference.
+
+**Two-stage architecture**
+
+The recommendation pipeline has two stages: candidate generation and ranking. Separating them is a deliberate architectural trade-off: a model complex enough to rank 800 million videos with high accuracy would be too slow to run at query time; a model fast enough to retrieve from 800 million is too simple to rank well. Candidate generation retrieves a tractable set (hundreds of candidates) at high recall; ranking applies a high-capacity model to the small candidate set with high precision.
+
+**Stage 1: Two-tower candidate generation**
+
+The two-tower model consists of a user encoder and a video encoder, each producing a dense embedding vector in the same high-dimensional space (e.g., 256 dimensions). The user encoder takes as input the user's watch history (average of video embeddings from the last 100 watched videos), demographic signals, and device type. The video encoder takes video content signals: title/description text embeddings (from a BERT-style model), category, channel, and aggregated engagement statistics.
+
+Training objective: maximize the dot product between the user embedding and embeddings of videos the user actually watched, relative to randomly sampled negative examples (in-batch negatives plus hard negatives from non-clicked impressions).
+
+At serving time:
+1. Compute the current user's embedding (fast, single forward pass through the user encoder tower).
+2. Run approximate nearest-neighbor (ANN) search using ScaNN (Google's Scalable Nearest Neighbors library) against the pre-indexed video embedding corpus.
+3. Retrieve the top 500 candidates by embedding similarity.
+
+The video embeddings are recomputed nightly via a batch offline job and indexed into ScaNN. New videos are bootstrapped using content embeddings from title/description before watch signals accumulate.
+
+**Stage 2: Ranking model**
+
+The 500 candidates from Stage 1 are passed through a ranking model — a deep neural network with hundreds of features including:
+
+- **Engagement prediction**: predicted watch-through rate (how much of the video will the user watch?), predicted CTR (will the user click?), predicted like probability.
+- **Context signals**: time of day (users watch different content types in the morning versus evening), device type (mobile vs. desktop), continuity (if the user just watched a cooking video, a follow-up cooking video ranks higher).
+- **Video quality signals**: upload quality, average view duration across all users, audience retention curve shape (drop-offs in the first 30 seconds are penalized).
+- **Freshness**: a freshness bonus decays as `exp(-age_hours / 48)` to surface newer content, balanced against engagement signal reliability (fresh videos have fewer signals).
+- **Diversity**: a diversity constraint ensures the top-20 results do not all come from the same channel, preventing creator monopolization of the recommendation slot.
+
+The ranking model outputs a scalar score per candidate; the top 20 by score are returned as watch-next recommendations.
+
+**Serving latency budget**
+
+The end-to-end recommendation latency budget for a page load is 150ms. Breakdown: user embedding compute (20ms), ScaNN ANN search over 800M embeddings (30ms, GPU-accelerated), ranking model inference over 500 candidates (50ms), serialization and network (20ms), Redis cache write for future requests (async, not on critical path). The Redis cache stores the ranked top-20 result with a 1-hour TTL keyed on `recs:{video_id}:{user_id}` (personalized) or `recs:{video_id}` (non-personalized for anonymous users).
+
+**Cold start for new users**
+
+A new user has no watch history. The system falls back to a region-specific popularity ranking weighted by category (if the user specified interests during signup) or pure global popularity otherwise. After three video watches, the personalized embedding becomes meaningful and the system transitions to the two-tower retrieval path.
+
+### View count consistency
+
+View count is a fascinating case study in deliberate eventual consistency. YouTube's displayed view counts are not precise real-time numbers — they cannot be, at scale.
+
+**Why exact real-time counts are impossible**
+
+At 41.7 million concurrent streams, view events arrive at roughly 5–15 million per second during peak (accounting for the 30-second minimum watch time filter). A synchronous MySQL write per view event would require a sharded write cluster capable of millions of transactions per second — prohibitively expensive and fragile. Even with sharding, hot videos (a single viral video might have 500,000 concurrent viewers) would create hot-shard problems regardless of the sharding key.
+
+**Redis INCR layer**
+
+Every confirmed view event (30 seconds of watch time, deduped per session) fires a Redis `INCR views:{video_id}` command. Redis processes this at approximately 100,000 to 500,000 INCR operations per second per node. For the hottest videos, a Redis cluster with consistent hashing across 20 nodes provides 10 million INCR/s capacity — sufficient for the entire platform.
+
+The background flush worker runs every 5 minutes. For each `views:{video_id}` key modified since the last flush:
+
+```text
+1. GETSET views:{video_id} 0  → returns current count C and atomically resets to 0
+2. UPDATE videos SET view_count = view_count + C WHERE video_id = video_id
+```
+
+Using `GETSET` (or `GETDEL` in Redis 6.2+) is critical — it atomically reads and resets the counter, preventing the race condition where new views arrive between the GET and the reset.
+
+**Display rounding**
+
+YouTube rounds displayed view counts above 10,000 to one decimal place of the most significant unit:
+
+```text
+< 10,000    → exact ("9,847 views")
+< 1,000,000 → rounded to hundreds ("87,200 views" shows as "87K views")
+≥ 1,000,000 → one decimal place ("1.2M views")
+```
+
+This eliminates the expectation of real-time precision and reduces user confusion when counts appear to jump non-monotonically (which can happen when the Redis flush catches up after a viral spike).
+
+**Deduplication**
+
+The 30-second minimum watch time is enforced at two layers: the client SDK fires the view event only after 30 seconds of continuous play, and the server-side handler checks the `watch_duration_sec` field in the POST body. Session-level deduplication (one view per session per video) is enforced by a Bloom filter in Redis keyed on `viewed:{session_id}:{video_id}`, with a 24-hour TTL. Bloom filter false positives result in a missed view count increment — the acceptable tradeoff for avoiding double-counting.
+
+## Java integration
+
+### Part A: TranscodingOrchestrator
+
+```java
+package com.youtube.transcoding;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Instant;
+import java.util.List;
+
+record VideoUploadedEvent(String videoId, String rawS3Key, String channelId, long fileSizeBytes) {}
+record TranscodingJob(String videoId, int resolutionP, String codec, String rawS3Key, String outputPrefix) {}
+record TranscodingCompletedEvent(String videoId, int resolutionP, String codec, String manifestKey, int segmentCount, boolean success, String errorMessage) {}
+
+@Service
+public class TranscodingOrchestrator {
+
+    private static final List<Integer> RESOLUTIONS = List.of(144, 240, 360, 480, 720, 1080);
+    private static final String H264 = "h264";
+    private static final String VP9  = "vp9";
+
+    private final KafkaTemplate<String, Object> kafka;
+    private final VideoRepository videoRepo;
+    private final VideoVariantRepository variantRepo;
+
+    public TranscodingOrchestrator(KafkaTemplate<String, Object> kafka,
+                                   VideoRepository videoRepo,
+                                   VideoVariantRepository variantRepo) {
+        this.kafka      = kafka;
+        this.videoRepo  = videoRepo;
+        this.variantRepo = variantRepo;
+    }
+
+    @KafkaListener(topics = "video-uploaded", groupId = "transcoding-orchestrator")
+    @Transactional
+    public void handleVideoUploaded(ConsumerRecord<String, VideoUploadedEvent> record) {
+        VideoUploadedEvent event = record.value();
+        videoRepo.updateStatus(event.videoId(), VideoStatus.PROCESSING);
+        for (int res : RESOLUTIONS) {
+            String outputPrefix = "videos/%s/%dp/%s".formatted(event.videoId(), res, H264);
+            TranscodingJob job = new TranscodingJob(event.videoId(), res, H264, event.rawS3Key(), outputPrefix);
+            kafka.send("transcoding-jobs", event.videoId(), job);
+            variantRepo.createVariant(event.videoId(), res, H264, VideoVariantStatus.QUEUED);
+        }
+        String outputPrefixVp9 = "videos/%s/720p/%s".formatted(event.videoId(), VP9);
+        kafka.send("transcoding-jobs", event.videoId(),
+            new TranscodingJob(event.videoId(), 720, VP9, event.rawS3Key(), outputPrefixVp9));
+        variantRepo.createVariant(event.videoId(), 720, VP9, VideoVariantStatus.QUEUED);
+    }
+
+    @KafkaListener(topics = "transcoding-completed", groupId = "transcoding-orchestrator")
+    @Transactional
+    public void handleTranscodingCompleted(ConsumerRecord<String, TranscodingCompletedEvent> record) {
+        TranscodingCompletedEvent event = record.value();
+        if (!event.success()) {
+            variantRepo.updateStatus(event.videoId(), event.resolutionP(), event.codec(), VideoVariantStatus.FAILED);
+            return;
+        }
+        variantRepo.markReady(event.videoId(), event.resolutionP(), event.codec(),
+            event.manifestKey(), event.segmentCount(), Instant.now());
+        boolean allReady = variantRepo.countPending(event.videoId()) == 0;
+        if (allReady) {
+            videoRepo.updateStatus(event.videoId(), VideoStatus.READY);
+            kafka.send("video-ready", event.videoId(), new VideoReadyEvent(event.videoId(), Instant.now()));
+        }
+    }
+}
+```
+
+### Part B: VideoController
+
+```java
+package com.youtube.api;
+
+import io.lettuce.core.api.sync.RedisCommands;
+import org.springframework.http.ResponseEntity;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.web.bind.annotation.*;
+import software.amazon.awssdk.services.s3.presigner.S3Presigner;
+import software.amazon.awssdk.services.s3.presigner.model.PutObjectPresignRequest;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.UUID;
+
+@RestController
+public class VideoController {
+
+    private final VideoRepository videoRepo;
+    private final VideoVariantRepository variantRepo;
+    private final RecommendationService recService;
+    private final KafkaTemplate<String, Object> kafka;
+    private final RedisCommands<String, String> redis;
+    private final S3Presigner s3Presigner;
+    private static final String RAW_BUCKET = "yt-raw-uploads";
+
+    public VideoController(VideoRepository videoRepo, VideoVariantRepository variantRepo,
+                           RecommendationService recService, KafkaTemplate<String, Object> kafka,
+                           RedisCommands<String, String> redis, S3Presigner s3Presigner) {
+        this.videoRepo   = videoRepo;
+        this.variantRepo = variantRepo;
+        this.recService  = recService;
+        this.kafka       = kafka;
+        this.redis       = redis;
+        this.s3Presigner = s3Presigner;
+    }
+
+    @PostMapping("/upload/initiate")
+    public ResponseEntity<UploadInitiateResponse> initiateUpload(@RequestBody UploadInitiateRequest req,
+                                                                  @RequestAttribute String userId) {
+        String uploadId = "up_" + UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+        String s3Key    = "raw/%s/%s".formatted(uploadId, req.fileName());
+        String videoId  = VideoIdGenerator.generate();
+        videoRepo.createPending(videoId, userId, req.title(), req.description(), req.privacy());
+        redis.hset("upload:session:" + uploadId, java.util.Map.of("videoId", videoId, "s3Key", s3Key));
+        redis.expire("upload:session:" + uploadId, 86400);
+        String presignedUrl = s3Presigner.presignPutObject(PutObjectPresignRequest.builder()
+            .signatureDuration(Duration.ofHours(24))
+            .putObjectRequest(r -> r.bucket(RAW_BUCKET).key(s3Key))
+            .build()).url().toString();
+        return ResponseEntity.ok(new UploadInitiateResponse(uploadId, presignedUrl, videoId));
+    }
+
+    @PostMapping("/upload/complete")
+    public ResponseEntity<UploadCompleteResponse> completeUpload(@RequestBody UploadCompleteRequest req) {
+        var session = redis.hgetall("upload:session:" + req.uploadId());
+        String videoId = session.get("videoId");
+        String s3Key   = session.get("s3Key");
+        videoRepo.updateStatus(videoId, VideoStatus.UPLOADING);
+        kafka.send("video-uploaded", videoId, new VideoUploadedEvent(videoId, s3Key, null, 0));
+        return ResponseEntity.accepted().body(new UploadCompleteResponse(videoId, "processing"));
+    }
+
+    @GetMapping("/watch")
+    public ResponseEntity<WatchResponse> watch(@RequestParam("v") String videoId) {
+        var video = videoRepo.findById(videoId).orElseThrow();
+        if (video.status() != VideoStatus.READY) return ResponseEntity.accepted().build();
+        long viewCount = Long.parseLong(redis.get("views:" + videoId) != null
+            ? redis.get("views:" + videoId) : "0") + video.viewCount();
+        return ResponseEntity.ok(new WatchResponse(video, viewCount,
+            "https://cdn.youtube.com/manifest/%s.m3u8".formatted(videoId)));
+    }
+
+    @PostMapping("/api/v1/videos/{videoId}/view")
+    public ResponseEntity<Void> recordView(@PathVariable String videoId,
+                                            @RequestBody ViewRequest req) {
+        if (req.watchDurationSec() < 30) return ResponseEntity.noContent().build();
+        String dedupKey = "viewed:%s:%s".formatted(req.sessionId(), videoId);
+        if (redis.exists(dedupKey) > 0) return ResponseEntity.noContent().build();
+        redis.setex(dedupKey, 86400, "1");
+        redis.incr("views:" + videoId);
+        kafka.send("view-events", videoId, new ViewEvent(videoId, req.sessionId(),
+            req.watchDurationSec(), req.qualityPlayed(), Instant.now()));
+        return ResponseEntity.noContent().build();
+    }
+
+    @GetMapping("/api/v1/recommendations")
+    public ResponseEntity<RecommendationsResponse> recommendations(
+            @RequestParam String videoId, @RequestParam(defaultValue = "20") int count) {
+        String cached = redis.get("recs:" + videoId);
+        if (cached != null) return ResponseEntity.ok(RecommendationsResponse.fromJson(cached, "cached"));
+        List<VideoSummary> recs = recService.fetchRecommendations(videoId, count);
+        redis.setex("recs:" + videoId, 3600, VideoSummary.toJson(recs));
+        return ResponseEntity.ok(new RecommendationsResponse(recs, "realtime"));
+    }
+}
+```
+
+## Trade-off analysis
+
+<TradeoffTable
+  columns={["Approach", "Upload Experience", "Playback Start", "Storage Cost", "Transcode Cost"]}
+  rows={[
+    ["Single quality, no transcoding", "Simple — direct upload to S3, no processing delay", "Instant once upload completes, but bitrate is fixed; buffers on slow connections", "Lowest — one file per video, original format", "None — zero compute beyond storage"],
+    ["Server-side transcoding, single CDN tier", "Upload fast; 5–20 min processing delay; good creator experience", "Good on fast connections; degrades on slow because no quality ladder to descend", "3–5× raw (multiple resolutions); manageable at moderate scale", "High CPU cost; deterministic — proportional to content hours"],
+    ["Client ABR + multi-tier CDN (no multi-codec)", "Same as above for upload; ABR enables graceful quality switching", "Excellent — player starts at low quality, upgrades within 2–3 segments; TTFB under 1s", "5–7× raw (7 quality tiers); justified by CDN cache-hit savings", "Moderate — H.264 only; well-understood tooling"],
+    ["YouTube's approach: multi-codec + pre-warm CDN + ABR + Redis view counts", "Best — resumable chunked upload bypasses API servers; async transcoding returns immediately", "Best — edge cache serves most segments; 99%+ hit ratio; p99 TTFB under 200ms", "7–10× raw (H.264 + VP9 + AV1 × 7 resolutions); offset by smaller AV1/VP9 file sizes", "Highest — AV1 encoding is 20–50× slower than H.264; requires GPU fleet; justified at YouTube's scale"],
+  ]}
+/>
+
+## Common pitfalls
+
+<Pitfall>
+**Blocking the upload API until transcoding completes.** Transcoding a 1-hour video at 1080p in H.264 takes 10–20 minutes on a single CPU core, even with hardware acceleration. If the upload endpoint holds the HTTP connection open while encoding completes, the creator's browser times out, the connection is torn down, and the upload fails with no useful error. The correct design is always: accept the upload, return `202 Accepted` with a `video_id` and `status: processing`, then deliver the transcoding result asynchronously. Poll via `/api/v1/videos/{video_id}` or push via WebSocket/SSE when status transitions to `ready`.
+</Pitfall>
+
+<Pitfall>
+**Placing all video segments in a single S3 bucket region and expecting the CDN to cover global latency.** A CDN cache miss always falls back to the S3 origin. If your S3 origin is in `us-east-1` and your viewer is in Tokyo, the cache-miss path introduces 150–200ms of cross-Pacific round-trip time before the first byte of video arrives. For long-tail content (rarely cached at edge), this latency is the median viewer experience. The fix is S3 multi-region replication (or multi-region access points) combined with CDN origin shielding: shield PoPs per region each pull from their nearest S3 replica, so cache misses are resolved regionally rather than inter-continentally. Additionally, use origin shielding to collapse concurrent cache-miss requests into a single origin fetch, preventing origin stampede under load.
+</Pitfall>
+
+## Curveball questions
+
+<Curveball>
+**"The Super Bowl halftime show is uploaded 30 minutes before airtime — 50 million users will try to watch within 5 minutes of the upload completing. How do you ensure the CDN is pre-warmed and transcoding is prioritized so the video is ready in time?"**
+
+This is a multi-layer problem. On the transcoding side: pre-negotiated "priority upload" for major events — the video is flagged at the `/upload/initiate` call as `priority: critical`, which places its transcoding jobs at the head of the Kafka `transcoding-jobs` queue and allocates a dedicated GPU worker pool reserved for high-priority encodes. Lower resolutions (360p, 480p, 720p) are encoded first in parallel and marked ready before 1080p and 4K are done. This gives a watchable video within 5 minutes for 90% of viewers.
+
+On the CDN side: as soon as `video-ready` events for the initial quality tiers arrive, a CDN pre-warm job fires. It issues synthetic fetch requests for each segment of each ready quality tier against the internal cache-fill endpoints of the top-200 edge PoPs globally (prioritized by estimated viewership from Super Bowl geo-distribution data). Each PoP fetches from the nearest S3 replica via origin shield. At 50,000 segments per quality tier across 200 PoPs, this is 10 million cache-fill requests in parallel — well within CDN infrastructure capacity when spread across 10–15 minutes of pre-warm time. By airtime, the cache-hit ratio for the first wave of viewers is above 95%.
+</Curveball>
+
+<Curveball>
+**"A creator wants to replace the audio track in an already-published 2-hour video (to swap copyrighted music with licensed music). How do you re-transcode and replace segments without creating a new video_id or breaking existing shares or embeds?"**
+
+Audio replacement cannot use the same segments — the `.ts` chunks contain muxed audio and video. However, re-encoding the entire 2-hour video for an audio change is wasteful. The HLS protocol supports audio/video demuxing: you can serve audio-only `EXT-X-MEDIA` tracks and video-only streams separately, then the player muxes them at playback. If the original encoding was done in this demuxed format, audio replacement is trivial: re-encode only the audio track, generate new audio-only `.aac` segments, update the manifest to reference the new audio stream while keeping all video segments unchanged.
+
+If the original segments are muxed (the common case for older videos), the approach is: encode the new audio independently, demux the video stream from the existing `.ts` files (FFmpeg `-c:v copy -an` extracts the video stream with no re-encoding), remux with the new audio (`-c:v copy -c:a aac`), then generate new `.ts` segments. The video_id stays the same; the manifest is updated to point to the new segments under a new key prefix (`videos/{video_id}/audio_v2/{res}/`). A CDN tag-invalidation purges the old cached segments. Existing embeds continue to work because the video_id and the embed URL are unchanged — only the manifest and segment URLs (which the player re-fetches on each load) change.
+</Curveball>
+
+<Curveball>
+**"YouTube wants to reduce storage costs by 40%. Propose a tiering strategy for old, rarely-watched videos that preserves quality for users who do watch them."**
+
+Start by measuring the access pattern. YouTube's video corpus follows a power-law distribution: roughly 50% of videos are watched fewer than 10 times per month. For this cold tier, a three-part strategy applies:
+
+First, codec re-encoding: transcode cold-tier videos from H.264 to AV1, which produces 50% smaller files at equivalent quality. Schedule this as a background batch job during off-peak hours, replacing the H.264 variants with AV1 (serving AV1 to AV1-capable clients and transcoding on-the-fly to H.264 for legacy clients — or maintaining a single low-quality H.264 fallback). This alone achieves 30–40% storage reduction on the cold corpus.
+
+Second, resolution pruning: remove the 4K and 1080p variants for videos that have never been played at those resolutions and have fewer than 100 monthly views. If a video suddenly gets a traffic spike (news event, viral resurfacing), re-generate the pruned variants on-demand from the original raw file (which must be retained) and cache them at the CDN. The re-generation takes a few minutes but is acceptable for cold-to-warm transitions.
+
+Third, S3 storage class migration: move segment objects for cold-tier videos from S3 Standard to S3 Intelligent-Tiering or S3 Glacier Instant Retrieval. Glacier Instant Retrieval has millisecond retrieval latency (suitable for CDN origin fetch) at 68% lower storage cost than Standard. The CDN still serves from cache; the cost saving applies only to origin storage at rest.
+
+Combined, these three measures can achieve 40–50% storage cost reduction on the cold corpus, which represents 30–40% of total storage, yielding a platform-wide reduction of 15–20% — complemented by AV1 re-encoding of popular content for an additional 10–15%.
+</Curveball>
+
+## Further reading
+
+- **Apple HLS Specification** — RFC 8216 (tools.ietf.org/html/rfc8216): the authoritative specification for HTTP Live Streaming, covering segment format, manifest syntax, and the closed-loop ABR feedback model.
+- **MPEG-DASH Standard** — ISO/IEC 23009-1: the international standard for Dynamic Adaptive Streaming over HTTP; read alongside the HLS spec to understand where the two protocols converge and diverge.
+- **Covington, Adams, and Sargin (2016)** — "Deep Neural Networks for YouTube Recommendations" (RecSys 2016): the foundational paper describing the two-tower candidate generation model and the ranking DNN; available on the ACM Digital Library and widely mirrored. The architecture described in this article is a direct descendant of this paper's production system.
+- **Conviva State of Streaming** (annual) — CDN performance benchmarks, average rebuffering rates, and geographic latency distributions across major video platforms; useful for grounding capacity estimates in real-world data.
+- **FFmpeg Documentation** (trac.ffmpeg.org) — the canonical reference for encoding flags, codec parameters, HLS segmenter options (`-hls_time`, `-hls_segment_type`), and hardware acceleration (NVENC, VideoToolbox, VAAPI).
+- **Google ScaNN** — "Accelerating Large-Scale Inference with Anisotropic Vector Quantization" (ICML 2020): the ANN library used for YouTube recommendation candidate retrieval; describes the quantization strategy that makes 800M-embedding search feasible in under 30ms.
+
+<RelatedQuestions items={[
+  { slug: "netflix", title: "Design Netflix", difficulty: "staff" },
+  { slug: "tiktok-reels", title: "Design TikTok/Reels", difficulty: "senior" },
+  { slug: "twitch-live-streaming", title: "Design Twitch Live Streaming", difficulty: "senior" },
+]} />

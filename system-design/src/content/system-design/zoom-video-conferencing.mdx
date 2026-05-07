@@ -1,0 +1,576 @@
+---
+title: "Design Zoom Video Conferencing"
+slug: "zoom-video-conferencing"
+category: "social"
+difficulty: "senior"
+estimatedReadMinutes: 24
+tags: ["webrtc", "sfu", "mcu", "video-streaming", "jitter-buffer", "simulcast", "coturn"]
+companyFlavors: ["Zoom", "Google Meet", "Microsoft Teams", "WebEx"]
+prerequisites: ["design-a-cache", "cdn-design"]
+relatedQuestions: ["slack", "twitch-live-streaming", "discord"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design a video conferencing system like Zoom: WebRTC peer negotiation, SFU vs MCU topologies, simulcast for adaptive quality, jitter buffer management, and the network engineering behind 1-second latency for 1,000-person webinars."
+javaPackages:
+  - "org.springframework.boot:spring-boot-starter-websocket:3.3.0"
+  - "org.springframework.boot:spring-boot-starter-data-redis:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="zoom-video-conferencing" title="Design Zoom Video Conferencing" />
+
+<Tldr>
+- **SFU (Selective Forwarding Unit)** is the standard topology for group video calls — each participant sends one stream up; the SFU selectively forwards encoded streams down to each subscriber based on their available downlink bandwidth, with zero server-side transcoding.
+- **Simulcast**: senders encode video simultaneously at three quality layers (low/medium/high — typically 180p, 360p, 720p); the SFU picks which layer to forward per subscriber using RTCP receiver reports and Transport-CC feedback, switching at keyframe boundaries to avoid visual artifacts.
+- **WebRTC signaling** (SDP offer/answer exchange, ICE candidate trickle) travels over WebSocket; actual media flows over SRTP/UDP through the SFU — UDP is non-negotiable because TCP's retransmission behavior causes head-of-line blocking that is far worse than the occasional dropped frame.
+- **Jitter buffer** at the receiver absorbs variable network delay (target depth 150–200 ms); NACK requests retransmit missing RTP sequence numbers; FEC (XOR-based redundant packets) reconstructs losses without a round-trip; PLI (Picture Loss Indication) triggers a keyframe request when loss is severe enough that reference frames are corrupt.
+- **Screen sharing** is a separate high-resolution, high-framerate stream (up to 1080p at 15 fps for slides, higher for video content) that the SFU pins to all participants at full quality regardless of active-speaker selection logic or bandwidth-based layer switching applied to camera feeds.
+</Tldr>
+
+## The scale of the problem
+
+Zoom crossed 300 million daily meeting participants during the April 2020 pandemic peak — a 30x spike in three months. At that moment every architectural decision made years earlier was stress-tested at a scale its designers had not anticipated. The system survived. Understanding why requires understanding the fundamental constraint of real-time video: unlike a video-on-demand service where seconds of buffering are invisible to users, a video call must deliver audio frames to the receiver within 150 ms of capture, and video frames within 500 ms, or the human brain perceives an uncomfortable disconnect between what it sees and what it hears. This latency budget is 50x tighter than a YouTube stream. Every component — codec choice, transport protocol, server topology, buffer depth — must be justified against that budget.
+
+The naive starting point for a multi-party video call is a peer-to-peer (P2P) mesh: each participant connects directly to every other participant, exchanging encoded streams without any server in the middle. For two people, a P2P connection is ideal — lowest latency (direct path), zero server cost. At three participants, the upload burden begins to show: each participant must upload two streams simultaneously. At five participants, each uploads four streams; for a participant on a typical 10 Mbps residential connection encoding at 1.5 Mbps per stream, four uploads consumes 6 Mbps of the uplink — 60% of total uplink capacity just for the call, before the rest of their household's traffic. At ten participants the mesh is simply impossible for residential internet connections. P2P mesh is architecturally limited to approximately three concurrent participants under real-world network conditions.
+
+The two server-mediated topologies are MCU (Multipoint Control Unit) and SFU (Selective Forwarding Unit). The MCU receives all participant streams, decodes them on the server, composites them into a single mixed video frame (like a Brady Bunch grid), re-encodes the composite, and sends one stream to each participant. From the client's perspective this is perfect — one upstream and one downstream regardless of the number of participants. The problem is server cost: decoding and re-encoding N streams simultaneously is GPU-intensive. A single 720p H.264 decode-encode cycle requires roughly 2 Gbps of memory bandwidth; compositing a 16-person grid requires 16 parallel decode operations plus one encode. An MCU fleet sized for a million concurrent participants requires tens of thousands of GPU servers, an operating cost that is economically prohibitive for a mass-market video service. The MCU also adds 500 ms or more of encode-decode latency. SFU is the correct architecture for Zoom's scale: it routes encoded RTP packets from sender to receivers without ever decoding them. The SFU's CPU cost per participant is the cost of packet inspection and forwarding — an order of magnitude less than MCU transcoding. The tradeoff is that each receiver downloads N-1 streams rather than one mixed stream, but with active-speaker selection (receive only the top-N speakers, not all N-1), client downlink cost stays manageable even in large meetings.
+
+## Clarifying questions
+
+Lock down these eight questions before sketching any architecture. Each answer closes off at least one major design branch.
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| What is the maximum participants per call? | 1,000 for webinars, 100 for regular meetings | Determines SFU topology — single SFU handles 100-person meetings; 1,000-person webinars require cascaded multi-SFU architecture with cross-SFU stream forwarding |
+| What video quality targets? | Up to 1080p30 on good connections; adaptive down to 180p on poor connections | Drives simulcast layer count, bandwidth budget per participant, and codec selection (H.264 baseline for compatibility vs. VP9/AV1 for efficiency) |
+| What audio codec? | Opus at 48 kHz with variable bitrate (6–510 Kbps) | Opus is the WebRTC standard; its built-in DTX (Discontinuous Transmission) drops bitrate to ~1 Kbps during silence — critical for bandwidth efficiency in large meetings |
+| What is the glass-to-glass latency target? | < 1 second end-to-end for audio; < 500 ms p99 for video | Rules out MCU (adds 500 ms+ encode latency); constrains jitter buffer depth; requires UDP transport |
+| Is recording in scope? | Cloud recording — Zoom captures at the SFU level | Recording service taps the SFU's forwarded stream, bypassing client devices; introduces compliance, storage, and post-processing requirements |
+| Is background blur/replacement in scope? | Client-side ML inference only — server does not process video content | Simplifies server architecture significantly; background blur runs in WebAssembly or a dedicated native thread on client hardware |
+| Are breakout rooms in scope? | Yes — participants can be split into sub-meetings | Breakout rooms are logically separate meetings sharing the parent meeting's session token; requires dynamic SFU reassignment without dropping the WebSocket connection |
+| Is PSTN dial-in (phone numbers for joining by phone call) in scope? | Out of scope for this interview | PSTN integration requires a gateway that transcodes between SRTP/Opus and PSTN audio codecs (G.711, G.722), adding an entirely separate compliance and telco interconnect problem |
+
+## Functional requirements
+
+- Participants can create, join, and leave meetings identified by a meeting ID and a join token; the host can admit or remove participants and end the meeting for all.
+- Audio and video streams are transmitted in real time using WebRTC; participants can mute/unmute their microphone and enable/disable their camera independently.
+- Screen sharing transmits a participant's desktop or application window as a separate high-quality stream; at most one participant shares their screen at a time (presenter model).
+- Active-speaker detection identifies the loudest sustained voice every 300 ms and broadcasts the result to all clients so they can update their layout (large tile for speaker, thumbnails for others).
+- Cloud recording captures the meeting at the SFU level, assembles individual audio and video tracks, and makes a transcoded MP4 available in the user's account after the meeting ends.
+- An in-meeting chat sidebar allows participants to send text messages visible to all participants; chat is stored and retrievable from meeting history.
+
+## Non-functional requirements
+
+- **Scale**: 300 million daily meeting participants; peak 10 million concurrent participants across millions of simultaneous meetings.
+- **Audio latency**: p99 glass-to-glass audio latency under 150 ms on a stable connection (jitter-free path); p99 under 500 ms on a congested residential connection (jitter buffer engaged).
+- **Video latency**: p99 glass-to-glass video latency under 500 ms at 720p; degradation to lower simulcast layer is preferred over buffering.
+- **Packet loss resilience**: no visible audio artifacts up to 5% random packet loss (FEC + redundant encoding); no visible video freeze up to 3% loss (NACK + FEC); PLI keyframe recovery for loss spikes above 10%.
+- **Uptime**: 99.95% monthly availability for active meetings; signaling plane and SFU plane are independently deployable and have separate failure domains.
+- **Security**: all media encrypted with SRTP (Secure Real-time Transport Protocol); signaling encrypted with TLS 1.3; optional end-to-end encryption for sensitive meetings.
+
+<Capacity title="Zoom Capacity Estimates">
+
+**Concurrent participants**
+
+Daily active participants: 300 M. Average meeting duration: 45 minutes. Meetings are distributed across roughly 16 active hours per day.
+
+$$\text{Concurrent participants} = \frac{300{,}000{,}000 \times 45\text{ min}}{16\text{ h} \times 60\text{ min/h}} \approx 14{,}000{,}000$$
+
+Round to **10 M concurrent participants** at sustained peak (accounting for non-uniform distribution and burst headroom).
+
+**Per-participant bandwidth**
+
+Simulcast upload: 3 layers at 150 Kbps + 600 Kbps + 1,500 Kbps = **2.25 Mbps up** per sender.
+
+Receive (active-speaker model — download up to 4 streams): $4 \times 750\text{ Kbps avg} = 3\text{ Mbps down}$.
+
+Total per participant: approximately **5.25 Mbps bidirectional** at 720p.
+
+**Aggregate SFU egress**
+
+$$\text{SFU egress} = 10{,}000{,}000 \times 3\text{ Mbps} = 30\text{ Pbps aggregate}$$
+
+This is distributed across thousands of geographically dispersed edge SFU clusters — no single datacenter approaches this number.
+
+**SFU server count**
+
+One SFU server (64-core, 10 Gbps NIC) can handle approximately 500 participants at 720p (packet forwarding is CPU-bound on SRTP cipher + RTP header inspection).
+
+$$\text{SFU servers} = \frac{10{,}000{,}000}{500} = 20{,}000 \text{ SFU servers at peak}$$
+
+**Signaling load**
+
+Average 5 participants per meeting; 10 M concurrent meetings; joins spread over 5-minute windows:
+
+$$\text{Join events/s} = \frac{10{,}000{,}000 \times 5}{5 \times 60} \approx 167{,}000 \text{ WebSocket events/s}$$
+
+Signaling servers are horizontally scalable; 1,000 WebSocket servers at 200 connections each covers the load with headroom.
+
+**Recording storage**
+
+If 10% of meetings are recorded at 720p (average 500 MB/hour):
+
+$$\text{Daily storage} = 300{,}000{,}000 \times \frac{45}{60}\text{ h} \times 10\% \times 500\text{ MB/h} \approx 1.1\text{ PB/day}$$
+
+</Capacity>
+
+## API design — signaling protocol over WebSocket
+
+All real-time signaling between client and server travels over a persistent WebSocket connection established before any media flows. The signaling layer is responsible for WebRTC negotiation (SDP exchange, ICE candidate trickle) and meeting-control events (participant join/leave, mute, active speaker). Media never touches the signaling server — it goes directly to the SFU over UDP once the WebRTC connection is established.
+
+**WebSocket events (JSON envelope)**
+
+Client to server — join a meeting and begin WebRTC negotiation:
+
+```json
+{
+  "type": "join",
+  "meeting_id": "abc-123-xyz",
+  "user_id": "u_9f3a",
+  "display_name": "Alice",
+  "sdp_offer": "v=0\r\no=- 46... (full WebRTC SDP)"
+}
+```
+
+Server to client — SDP answer with ICE candidates:
+
+```json
+{
+  "type": "answer",
+  "sdp_answer": "v=0\r\no=- 77... (SFU SDP answer)",
+  "ice_candidates": [
+    { "candidate": "candidate:1 1 UDP 2113667327 203.0.113.5 49152 typ srflx ...", "sdpMid": "video" }
+  ]
+}
+```
+
+Client to server — trickle ICE candidate after initial offer:
+
+```json
+{
+  "type": "ice_candidate",
+  "candidate": "candidate:2 1 UDP 1677729535 192.168.1.42 54321 typ host ...",
+  "sdpMid": "audio"
+}
+```
+
+Server to client — new participant joined (broadcast to all existing participants):
+
+```json
+{
+  "type": "participant_joined",
+  "user_id": "u_7b2c",
+  "display_name": "Bob",
+  "video_track_id": "track_v_7b2c",
+  "audio_track_id": "track_a_7b2c"
+}
+```
+
+Server to client — active speaker update (broadcast every 300 ms):
+
+```json
+{
+  "type": "active_speaker",
+  "user_id": "u_9f3a",
+  "audio_level_db": -18.4
+}
+```
+
+Client to server — subscriber requests a specific simulcast layer (fallback; normally SFU decides):
+
+```json
+{
+  "type": "simulcast_layer",
+  "track_id": "track_v_9f3a",
+  "preferred_layer": "high"
+}
+```
+
+**REST endpoints**
+
+```http
+POST   /v1/meetings
+       Body: { host_user_id, topic, max_participants, password? }
+       Returns: { meeting_id, join_token, host_join_url, scheduled_start_at }
+
+GET    /v1/meetings/{meeting_id}
+       Returns: { meeting_id, status, participant_count, started_at, host_id }
+
+GET    /v1/meetings/{meeting_id}/participants
+       Returns: [ { user_id, display_name, is_muted, is_video_on, joined_at } ]
+
+POST   /v1/meetings/{meeting_id}/recording/start
+POST   /v1/meetings/{meeting_id}/recording/stop
+       Returns: { recording_id, status: "processing" }
+
+GET    /v1/recordings/{recording_id}
+       Returns: { recording_id, status, download_url, duration_sec, size_bytes }
+```
+
+## Data model
+
+**meetings** — persisted in MySQL for durability, mirrored in Redis for active-meeting fast reads:
+
+```sql
+CREATE TABLE meetings (
+  meeting_id     VARCHAR(36)  PRIMARY KEY,
+  host_id        BIGINT       NOT NULL,
+  topic          VARCHAR(255),
+  status         ENUM('scheduled','active','ended') NOT NULL DEFAULT 'scheduled',
+  max_participants INT        NOT NULL DEFAULT 100,
+  password_hash  VARCHAR(128),
+  started_at     TIMESTAMP    NULL,
+  ended_at       TIMESTAMP    NULL,
+  recording_url  TEXT         NULL,
+  created_at     TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_host (host_id),
+  INDEX idx_status_started (status, started_at)
+);
+```
+
+**participants** — active participant state stored in Redis Hash (TTL 86400 s):
+
+```text
+Key:   meeting:{meeting_id}:participants
+Type:  Hash
+Field: {user_id}
+Value: JSON { display_name, is_muted, is_video_on, sfu_server_addr,
+              video_track_id, audio_track_id, joined_at_epoch }
+```
+
+**sfu_assignments** — which SFU cluster owns this meeting:
+
+```text
+Key:   meeting:{meeting_id}:sfu
+Type:  String (or List for cascaded multi-SFU)
+Value: "sfu-us-east-1a.internal:8443"
+TTL:   86400
+```
+
+**signaling_sessions** — maps a user's current WebSocket connection to a signaling server:
+
+```text
+Key:   session:{user_id}:{meeting_id}
+Type:  String
+Value: "sig-server-07.internal:8080"
+TTL:   86400
+```
+
+**recordings** — MySQL + S3:
+
+```sql
+CREATE TABLE recordings (
+  recording_id   VARCHAR(36)  PRIMARY KEY,
+  meeting_id     VARCHAR(36)  NOT NULL,
+  s3_bucket      VARCHAR(128) NOT NULL,
+  s3_key         TEXT         NOT NULL,
+  duration_sec   INT,
+  size_bytes     BIGINT,
+  status         ENUM('recording','processing','ready','failed') NOT NULL,
+  started_at     TIMESTAMP    NOT NULL,
+  completed_at   TIMESTAMP    NULL,
+  INDEX idx_meeting (meeting_id)
+);
+```
+
+## Architecture diagrams
+
+**Call setup and WebRTC negotiation flow:**
+
+<Mermaid diagram={`sequenceDiagram
+  participant CA as Client A
+  participant SS as Signaling Server
+  participant RD as Redis
+  participant SFU as SFU Server
+
+  CA->>SS: WS connect + {type:join, meeting_id, sdp_offer}
+  SS->>RD: GET meeting:{id}:sfu
+  RD-->>SS: sfu-us-east-1a:8443
+  SS->>SFU: Forward SDP offer (gRPC)
+  SFU-->>SS: SDP answer + ICE candidates
+  SS-->>CA: {type:answer, sdp_answer, ice_candidates}
+  CA->>SFU: ICE connectivity checks (STUN/UDP)
+  SFU-->>CA: ICE binding response
+  Note over CA,SFU: DTLS handshake — SRTP keys exchanged
+  CA->>SFU: SRTP/UDP audio + video (simulcast 3 layers)
+  SFU->>CA: SRTP/UDP forwarded streams from other participants`} />
+
+**SFU topology for a 4-person call with active-speaker selection:**
+
+<Mermaid diagram={`flowchart LR
+  CA[Client A\nSpeaking] -->|upload 3 simulcast layers| SFU
+  CB[Client B] -->|upload 3 simulcast layers| SFU
+  CC[Client C] -->|upload 3 simulcast layers| SFU
+  CD[Client D] -->|upload 3 simulcast layers| SFU
+
+  subgraph SFU [SFU Server]
+    AS[Active Speaker\nDetection]
+    FW[Selective\nForwarder]
+    BW[Per-subscriber\nBandwidth Estimator]
+    AS --> FW
+    BW --> FW
+  end
+
+  SFU -->|A high-layer + B low + C low| CD
+  SFU -->|A high-layer + C low + D low| CB
+  SFU -->|B high-layer + C low + D low| CA
+  SFU -->|A high-layer + B low + D low| CC`} />
+
+## Deep dives
+
+### SFU vs MCU vs P2P mesh
+
+The choice of server topology is the single most consequential architectural decision in a video conferencing system. Each topology optimizes for a different constraint, and the tradeoffs compound with participant count.
+
+**P2P mesh** has zero server cost and minimum latency (direct path between clients). The fatal flaw is upload bandwidth: in a full mesh of N participants, each participant maintains N-1 upload streams. A 10-person meeting requires 9 simultaneous uploads per participant. At 1 Mbps per stream that is 9 Mbps of upload — beyond what most residential internet connections can sustain. Beyond bandwidth, NAT traversal between participants requires a STUN/TURN relay when direct paths are unavailable, and the probability of at least one blocked NAT in a group of 10 approaches certainty. P2P mesh caps out at approximately 3-4 participants in practice.
+
+**MCU (Multipoint Control Unit)** solves the client bandwidth problem by centralizing all mixing on a server. Each participant uploads one stream to the MCU and downloads one composite stream. From the client's perspective the call is always a two-party WebRTC connection regardless of group size. The server cost is ruinous: the MCU must decode every incoming stream, composite video frames using a layout engine (CPU/GPU intensive), and re-encode the composite for every outgoing stream. A 16-person 720p MCU call requires 16 decoder instances and 16 encoder instances running simultaneously, with a typical server handling fewer than 10 such calls. GPU-accelerated MCU infrastructure costs 10-50x more per participant-hour than SFU. There is also an inherent 500 ms+ latency from the decode-composite-encode pipeline.
+
+**SFU (Selective Forwarding Unit)** is the architecture used by Zoom, Google Meet, Microsoft Teams, and every other modern video conferencing system at scale. The SFU receives RTP packets from senders and forwards them — without decoding — to selected subscribers. SRTP packets are forwarded as opaque byte arrays; the SFU inspects only the RTP header (sequence number, timestamp, SSRC) to make forwarding decisions. This makes the SFU CPU-efficient: the bottleneck is network I/O and SRTP cipher (AES-128-GCM), not video processing. The SFU tradeoff: each receiver downloads multiple streams (one per visible participant) rather than a single composite. This is managed through active-speaker selection — in a 100-person meeting, a client only downloads 4-6 streams (active speaker + a few others), not 99. The SFU tracks audio levels reported by participants and routes only the relevant streams to each subscriber.
+
+### Simulcast and bandwidth adaptation
+
+Simulcast is the mechanism by which SFU-based systems gracefully handle heterogeneous client network conditions. Without simulcast, a sender encodes at one fixed quality, and subscribers on poor connections simply drop packets — a worst-case outcome. With simulcast, the sender's browser (using the WebRTC simulcast API) opens three simultaneous encoding pipelines for the same camera feed:
+
+- **Low layer**: 180p at 15 fps, approximately 150 Kbps. For thumbnails and participants on severely constrained connections.
+- **Medium layer**: 360p at 30 fps, approximately 600 Kbps. For secondary speakers and participants on moderate connections.
+- **High layer**: 720p at 30 fps, approximately 1,500 Kbps. For the active speaker on participants with good downlink.
+
+Each layer is an independent RTP stream with its own SSRC (Synchronization Source Identifier). The SFU receives all three streams but forwards only one to each subscriber, selecting the layer based on the subscriber's estimated downlink bandwidth. Bandwidth estimation uses two mechanisms: RTCP Receiver Reports (RR) contain packet loss fraction and extended highest sequence number received, which together give a coarse loss estimate; and Transport-CC (Transport-wide Congestion Control), a Chrome-originated extension where the receiver timestamps every incoming RTP packet and sends those timestamps back to the sender, allowing the sender (and SFU) to run a bandwidth estimation algorithm (Google Congestion Control, GCC) on the one-way delay trend. GCC uses a Kalman filter to separate propagation delay increase (a leading indicator of congestion) from queuing delay and noise. The output is an estimated available bandwidth in Kbps, which the SFU uses to select the appropriate simulcast layer.
+
+Layer switching must happen at keyframe boundaries to avoid visual corruption. When the SFU decides to switch from medium to high layer for a subscriber (because their bandwidth estimate increased), it cannot simply start forwarding the high layer's RTP packets mid-stream — the decoder needs a keyframe (IDR frame in H.264) as a reference point. The SFU sends a RTCP PLI (Picture Loss Indication) to the sender requesting an immediate keyframe on the high layer, waits for the keyframe RTP packet, then begins forwarding the high layer. The transition is seamless from the viewer's perspective because the switch happens at a clean decode boundary.
+
+### Jitter buffer and packet loss recovery
+
+Real-time media over UDP means dealing with two fundamental problems that TCP was designed to hide from applications: out-of-order packet arrival and outright packet loss. The jitter buffer and loss recovery mechanisms are the WebRTC stack's solutions to these problems.
+
+**Jitter buffer** holds incoming RTP packets and reorders them by RTP sequence number before passing them to the decoder. Network jitter — variation in packet arrival time — is absorbed by the buffer depth. A buffer of 150 ms depth can absorb any burst of jitter up to 150 ms without the decoder seeing a gap. The tradeoff is that the buffer adds 150 ms of latency to all packets. WebRTC's adaptive jitter buffer (implemented in libwebrtc) dynamically adjusts depth: when network jitter is low and stable, the buffer shrinks to 60-80 ms, reducing glass-to-glass latency; when jitter spikes (e.g., a large file download begins on the same connection), the buffer grows to 200 ms. The buffer is implemented as a sorted array indexed by RTP sequence number with a sliding window.
+
+**NACK (Negative Acknowledgement)** handles packet loss by having the receiver detect missing sequence numbers. If sequence number 1000, 1001, 1003 arrive, the receiver knows 1002 is missing. After a brief hold time (one jitter estimate cycle), it sends a RTCP NACK for sequence 1002. The sender retransmits from its RTP retransmit buffer (typically 200-500 ms of recent packets). NACK is effective for loss under 5% on connections with RTT under 100 ms — the retransmit can arrive within the jitter buffer window and be played out normally. On high-latency connections (RTT > 300 ms), NACK retransmit arrives too late to be useful; FEC must carry more weight.
+
+**FEC (Forward Error Correction)** sends redundant data alongside original media, allowing the receiver to reconstruct missing packets without a retransmit round-trip. WebRTC's audio FEC (RED — Redundant Encoding) includes the previous Opus frame as a lower-bitrate redundant copy in the current packet. If the current packet is lost but the next arrives, the receiver can reconstruct the previous frame from its redundant copy. Opus also has built-in packet loss concealment (PLC) that interpolates from surrounding frames, making single-frame losses inaudible. Video FEC in WebRTC uses FlexFEC (RFC 8627): the sender groups N RTP packets and transmits an XOR-parity packet; if any single packet in the group is lost, the receiver XORs the N-1 received packets with the parity packet to recover the lost one. FlexFEC adds approximately 5-20% overhead; the WebRTC stack enables it adaptively based on observed loss rate.
+
+**PLI (Picture Loss Indication)** is the last resort. When loss is severe enough (>10%) that the video decoder's reference frames are corrupt, the decoder produces blocky or frozen output indefinitely because it cannot decode P-frames without a valid reference. The receiver sends a RTCP PLI to the sender, which responds by encoding a keyframe (IDR in H.264). The keyframe is large (10-30x a normal P-frame) but self-contained — the decoder can begin decoding cleanly from it. The SFU passes PLI upstream from subscriber to sender. PLI recovery takes one RTT plus encoding time, typically 200-500 ms total, during which the subscriber sees a frozen frame.
+
+### Active speaker detection and layout management
+
+Audio level measurement is performed at the SFU, not at the client, to give a consistent authoritative view of who is speaking. The SFU inspects RTP audio packets and reads the audio level extension (RFC 6464), a one-byte extension header that each sender embeds in audio RTP packets indicating the current frame's dBov level. The SFU aggregates audio levels per participant over a 200 ms rolling window (10 Opus frames at 20 ms each) and computes an exponentially weighted moving average to smooth out brief spikes. The participant with the highest sustained dBov reading above a silence threshold (typically -60 dBov) is declared the active speaker.
+
+Active speaker state is broadcast to all clients via the signaling WebSocket channel every 300 ms. The 300 ms update interval is a deliberate product decision: more frequent updates (e.g., 100 ms) cause the layout to switch rapidly when two people are speaking at similar levels, which is visually disorienting. Less frequent updates (e.g., 1 second) make the layout feel unresponsive to speaker transitions. At 300 ms, the layout switch happens noticeably but not annoyingly fast.
+
+When the SFU receives an active speaker change, it simultaneously updates the simulcast layer forwarded to each subscriber for the new speaker: the previous speaker's stream is downgraded to medium or low layer, and the new active speaker's stream is upgraded to high layer (subject to each subscriber's bandwidth estimate). This ensures the participant receiving the most visual attention gets the highest quality, while background thumbnails conserve bandwidth. Screen sharing overrides this logic entirely: a screen share stream is always pinned to full quality (high layer or the screen share's native resolution) for all subscribers, regardless of bandwidth estimates or active speaker state.
+
+### Signaling server and SFU assignment
+
+The signaling server is intentionally stateless at the application layer, pushing all meeting state into Redis. A WebSocket load balancer (HAProxy or AWS NLB with sticky sessions) routes a client's WebSocket connection to a signaling server instance; if that instance crashes, the client reconnects and a different instance can serve the session by reading state from Redis. Stateless signaling servers can be horizontally scaled without any session migration logic.
+
+SFU assignment uses consistent hashing on the meeting_id. The consistent hash ring maps meeting IDs to SFU clusters; all participants joining the same meeting land on the same SFU cluster, ensuring the SFU can internally forward streams between participants without crossing network boundaries. The consistent hash ring is stored in Redis and updated as SFU instances are added or drained. Geographic selection adds a second dimension: clients report their geolocation (from IP geolookup) to the signaling server, which selects the hash ring for the nearest regional SFU pool. A participant in Tokyo is assigned to an Asia-Pacific SFU cluster regardless of where the meeting was created.
+
+For webinars with more than 500 participants, a single SFU server cannot handle the full participant count within its NIC bandwidth budget. These large meetings use a **cascade SFU topology**: a root SFU receives streams from all senders and connects to a tier of leaf SFUs; each leaf SFU serves a subset of subscribers. The root SFU forwards each sender's stream to all leaf SFUs that have at least one subscriber interested in that sender. Leaf SFUs perform per-subscriber simulcast layer selection independently. The cascade adds one additional network hop (root SFU to leaf SFU) but keeps each SFU's participant count within single-server limits. This cascade is transparent to clients — they connect to their assigned leaf SFU and communicate with the signaling server exactly as in a small meeting.
+
+## Java integration
+
+### Part A — MeetingSignalingService.java
+
+```java
+package com.zoom.meeting.service;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.lettuce.core.api.sync.RedisCommands;
+import org.springframework.stereotype.Service;
+import java.util.*;
+
+@Service
+public class MeetingSignalingService {
+
+    private static final int TTL_SECONDS = 86_400;
+    private static final List<String> SFU_POOL = List.of(
+        "sfu-us-east-1a.internal:8443",
+        "sfu-us-east-1b.internal:8443",
+        "sfu-eu-west-1a.internal:8443",
+        "sfu-ap-east-1a.internal:8443"
+    );
+
+    private final RedisCommands<String, String> redis;
+    private final ObjectMapper mapper;
+
+    public MeetingSignalingService(RedisCommands<String, String> redis,
+                                   ObjectMapper mapper) {
+        this.redis  = redis;
+        this.mapper = mapper;
+    }
+
+    public String assignSfu(String meetingId) {
+        String key = "meeting:" + meetingId + ":sfu";
+        String existing = redis.get(key);
+        if (existing != null) return existing;
+        int index = Math.abs(meetingId.hashCode()) % SFU_POOL.size();
+        String sfuAddr = SFU_POOL.get(index);
+        redis.setex(key, TTL_SECONDS, sfuAddr);
+        return sfuAddr;
+    }
+
+    public void addParticipant(String meetingId, String userId,
+                                String sfuAddr, String displayName) throws Exception {
+        ParticipantInfo info = new ParticipantInfo(
+            userId, displayName, sfuAddr, false, true);
+        String json = mapper.writeValueAsString(info);
+        String hashKey  = "meeting:" + meetingId + ":participants";
+        String setKey   = "meeting:" + meetingId + ":participant_ids";
+        redis.hset(hashKey, userId, json);
+        redis.expire(hashKey, TTL_SECONDS);
+        redis.sadd(setKey, userId);
+        redis.expire(setKey, TTL_SECONDS);
+    }
+
+    public Set<String> getParticipantIds(String meetingId) {
+        return redis.smembers("meeting:" + meetingId + ":participant_ids");
+    }
+
+    public Map<String, String> getParticipants(String meetingId) {
+        return redis.hgetall("meeting:" + meetingId + ":participants");
+    }
+
+    public void removeParticipant(String meetingId, String userId) {
+        redis.hdel("meeting:" + meetingId + ":participants", userId);
+        redis.srem("meeting:" + meetingId + ":participant_ids", userId);
+    }
+
+    public record ParticipantInfo(
+        String userId, String displayName, String sfuAddr,
+        boolean isMuted, boolean isVideoOn) {}
+}
+```
+
+### Part B — MeetingController.java
+
+```java
+package com.zoom.meeting.controller;
+
+import com.zoom.meeting.service.MeetingSignalingService;
+import com.zoom.meeting.service.MeetingSignalingService.ParticipantInfo;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.messaging.handler.annotation.MessageMapping;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.web.bind.annotation.*;
+import java.util.*;
+
+@RestController
+@RequestMapping("/v1/meetings")
+public class MeetingController {
+
+    private final MeetingSignalingService signalingService;
+    private final KafkaTemplate<String, String> kafka;
+    private final SimpMessagingTemplate ws;
+
+    public MeetingController(MeetingSignalingService signalingService,
+                              KafkaTemplate<String, String> kafka,
+                              SimpMessagingTemplate ws) {
+        this.signalingService = signalingService;
+        this.kafka = kafka;
+        this.ws    = ws;
+    }
+
+    @PostMapping
+    public MeetingResponse createMeeting(@RequestBody CreateMeetingRequest req) {
+        String meetingId  = UUID.randomUUID().toString();
+        String joinToken  = UUID.randomUUID().toString();
+        String sfuEndpoint = signalingService.assignSfu(meetingId);
+        return new MeetingResponse(meetingId, joinToken, sfuEndpoint);
+    }
+
+    @GetMapping("/{id}/participants")
+    public List<String> listParticipants(@PathVariable String id) {
+        return new ArrayList<>(signalingService.getParticipants(id).values());
+    }
+
+    @PostMapping("/{id}/end")
+    public void endMeeting(@PathVariable String id) {
+        kafka.send("meeting-ended", id, "{\"meeting_id\":\"" + id + "\"}");
+    }
+
+    @MessageMapping("/join")
+    public void handleJoin(JoinMessage msg) throws Exception {
+        String sfuAddr = signalingService.assignSfu(msg.meetingId());
+        signalingService.addParticipant(
+            msg.meetingId(), msg.userId(), sfuAddr, msg.displayName());
+        ws.convertAndSend(
+            "/topic/meeting/" + msg.meetingId() + "/events",
+            Map.of("type", "participant_joined", "user_id", msg.userId(),
+                   "sfu_endpoint", sfuAddr));
+    }
+
+    public record CreateMeetingRequest(String hostUserId, String topic) {}
+    public record MeetingResponse(String meetingId, String joinToken, String sfuEndpoint) {}
+    public record JoinMessage(String meetingId, String userId,
+                               String displayName, String sdpOffer) {}
+}
+```
+
+## Topology trade-off comparison
+
+<TradeoffTable>
+| Topology | Server CPU | Client Bandwidth | Max Participants | Latency |
+|---|---|---|---|---|
+| P2P mesh | None — zero server involvement in media | O(N) upload per client — catastrophic at N > 4 | 3–4 practical limit (residential uplink) | Lowest — direct path, no server hop |
+| MCU (server mixing) | Extremely high — decode + composite + encode for every stream; GPU fleet required | Minimal — one upload, one download regardless of N | Theoretically unlimited, economically limited to ~50 per server | High — 500 ms+ encode-decode pipeline adds unavoidable latency |
+| SFU (basic, forward all) | Low — packet routing only, no transcoding; SRTP cipher is the bottleneck | O(N) download per client — grows with meeting size | 500–1,000 per SFU instance (NIC-bound not CPU-bound) | Very low — one network hop through SFU, no codec processing |
+| SFU + simulcast + active speaker | Low to medium — per-subscriber bandwidth estimation adds CPU; otherwise same as SFU | Controlled — client downloads only top-N speakers at adaptive quality; typical 2–4 Mbps down | 100 per meeting (regular); 1,000+ with cascaded SFU for webinars | Very low — same as basic SFU; simulcast layer switching adds < 1 RTT of switching latency |
+</TradeoffTable>
+
+<Pitfall>
+**Using TCP for media transport.** Many engineers instinctively reach for TCP for reliability, but TCP is the wrong transport for real-time media. TCP's retransmission mechanism causes head-of-line blocking: if a segment is lost, the TCP stack on the receiver withholds all subsequent segments until the retransmit arrives and the stream is reassembled in order. For a connection with 100 ms RTT, a single packet loss causes a 200 ms stall (one RTT for the retransmit to arrive). At 30 fps video, 200 ms is six frames frozen — visible as a clear stutter. More importantly, by the time a retransmitted audio packet arrives, 200 ms of audio time has passed and the packet is useless: playing it would mean playing audio from 200 ms ago while new audio continues arriving, creating an echo-like artifact. UDP is correct because the application layer (jitter buffer + NACK + FEC) handles loss recovery with policies tuned for media — late packets are discarded, FEC reconstructs losses without a round-trip, and PLC conceals brief gaps. WebRTC mandates UDP (SRTP over UDP) with TURN relay as a fallback only when UDP is fully blocked by firewalls.
+</Pitfall>
+
+<Pitfall>
+**A single global SFU for all participants in a meeting.** If a participant in Tokyo and a participant in New York join the same meeting, and the SFU is located in Virginia (US East), the Tokyo participant's media travels: Tokyo → Virginia SFU → New York. The one-way propagation delay from Tokyo to Virginia is approximately 150 ms. Add jitter buffer depth and the Tokyo participant experiences 350-400 ms glass-to-glass latency — barely within the 500 ms video target, and above the 150 ms audio target. The correct architecture is regional SFU placement with cascade: a Tokyo-region SFU handles Tokyo participants, a US-East SFU handles North American participants, and the two SFUs exchange stream data over a dedicated inter-datacenter link (typically 80-100 ms RTT between continents). Each participant's media travels only to their regional SFU (~20-30 ms RTT), achieving sub-150 ms audio latency globally. Cascade SFU intercontinental links add latency only for the inter-continent leg, which is unavoidable given the speed of light.
+</Pitfall>
+
+<Curveball>
+**"A 1,000-person webinar starts — all 1,000 join within 30 seconds. How do you handle the signaling storm without overloading the signaling server?"**
+
+A 1,000-person simultaneous join generates 1,000 concurrent WebSocket connections in 30 seconds, each initiating a WebRTC negotiation (SDP offer → SFU processing → SDP answer + ICE candidates). The SDP processing on the SFU is the bottleneck: DTLS handshake + ICE candidate gathering takes 100-200 ms per participant, so 1,000 simultaneous handshakes would require 1,000 concurrent DTLS threads on the SFU — well above a single server's capacity.
+
+The solution is join rate-limiting with a virtual waiting room: the signaling server accepts WebSocket connections immediately (acknowledges the join request) but queues SDP offers and processes them at a maximum rate of 50 per second per SFU. Participants in the queue see a "Connecting..." state. The SFU processes handshakes in batches; at 50/second, 1,000 participants are admitted over 20 seconds — still within the 30-second join window. Additionally, for webinars, most participants are receive-only (attendees), not senders. The SFU can use a lighter-weight join path for receive-only participants: skip the ICE gathering step for their upload path, reducing handshake cost by 40%. Signaling servers are pre-scaled based on meeting registration count — when 1,000 RSVPs are recorded, the system pre-provisions SFU capacity and signals server capacity 10 minutes before the scheduled start.
+</Curveball>
+
+<Curveball>
+**"Zoom needs to offer end-to-end encryption for meetings. How does E2E encryption change the SFU architecture — specifically, if the SFU can't decrypt, how do you do active-speaker detection?"**
+
+Standard Zoom uses SRTP with server-held keys: the SFU decrypts SRTP to inspect RTP headers and audio level extensions, then re-encrypts for forwarding. E2E encryption (E2EE) means clients hold the media keys and the SFU cannot decrypt the media payload. The SFU becomes a true black-box forwarder — it forwards opaque encrypted packets without reading audio levels.
+
+Active speaker detection must move client-side. In E2EE mode, each participant's browser reads its own microphone audio level (already available from the WebRTC API's `getStats()` or the Web Audio API `AnalyserNode`) and sends a signed audio level metadata message over the signaling channel (not in the media stream). The signaling server aggregates these self-reported levels and broadcasts the active speaker. The vulnerability is that participants could spoof their reported audio level; Zoom's E2EE implementation uses a cryptographic signature on the level report using the participant's E2EE identity key pair, allowing other participants to verify authenticity. SFU-based simulcast layer selection also changes: without reading audio levels, the SFU relies entirely on the active speaker metadata channel and subscriber-reported bandwidth preferences for layer selection, rather than server-side audio level observation. E2EE is architecturally compatible with SFU forwarding; the cost is losing any server-side media intelligence that requires payload inspection.
+</Curveball>
+
+<Curveball>
+**"Design the waiting room feature: participants are held in a lobby until the host admits them, but they can see a 'waiting' screen. How does this interact with SFU assignment and signaling?"**
+
+The waiting room is a state machine with two distinct phases: lobby phase and meeting phase. In the lobby phase, the participant establishes a WebSocket signaling connection but does NOT perform WebRTC negotiation with the meeting's SFU. The signaling server assigns the participant to a waiting room state in Redis (`session:{user_id}:{meeting_id}:state = "waiting"`) and returns a lightweight lobby response rather than SDP answer. The participant renders a static waiting screen (no live video; optionally a pre-join camera preview using a local WebRTC loopback, which never leaves the device).
+
+The host receives a `participant_waiting` event via their signaling WebSocket. When the host admits a participant, the signaling server updates the state to `admitted`, sends a `join_admitted` event to the waiting participant's WebSocket, and only then initiates the full SDP offer/answer cycle with the meeting's SFU. This design has an important consequence: admitted participants experience a 200-500 ms join latency (WebRTC handshake time) after admission, which is visible as a brief "Joining..." state. To minimize this, the signaling server can pre-negotiate a tentative DTLS connection with the SFU during the waiting phase (without actually adding the participant to the media routing table) so that the DTLS handshake is already complete at admission time. When admitted, only an RTP routing rule needs to be added — reducing the observable join latency to under 100 ms. SFU capacity is allocated at admission time, not at waiting-room join time, ensuring waiting participants do not consume SFU resources.
+</Curveball>
+
+## Further reading
+
+- **WebRTC specification** — W3C WebRTC 1.0: Real-Time Communication Between Browsers: w3.org/TR/webrtc/
+- **RFC 8888** — RTP Control Protocol (RTCP) Feedback for Congestion Control: IETF RFC 8888 documents the Transport-CC feedback mechanism used by Google Congestion Control in libwebrtc.
+- **Jitsi Meet architecture** — "How Jitsi Videobridge Works" on the Jitsi blog: deep dive into an open-source SFU implementation with specific details on simulcast, bandwidth estimation, and the bridge's internal RTP routing engine.
+- **Scalable Video Coding for WebRTC** — Google Research paper by Kranch and Raman: the theoretical foundation for simulcast and SVC (Scalable Video Coding) in WebRTC, with performance measurements from real-world Chrome deployments.
+- **RFC 5764** — DTLS Extension to Establish Keys for the SRTP: the key negotiation mechanism underlying all WebRTC media security; essential reading for understanding the security boundary between signaling and media planes.
+- **Google Congestion Control (GCC)** — IETF RMCAT draft: the algorithm implemented in libwebrtc for bandwidth estimation; documents the Kalman filter approach to one-way delay trend analysis used by both Zoom and Google Meet.
+
+<RelatedQuestions items={[
+  { slug: "slack", title: "Design Slack", difficulty: "senior" },
+  { slug: "twitch-live-streaming", title: "Design Twitch Live Streaming", difficulty: "senior" },
+  { slug: "discord", title: "Design Discord", difficulty: "senior" },
+]} />

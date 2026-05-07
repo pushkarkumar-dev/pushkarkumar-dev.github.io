@@ -1,0 +1,555 @@
+---
+title: "Design LinkedIn's People You May Know"
+slug: "linkedin-connections"
+category: "social"
+difficulty: "senior"
+estimatedReadMinutes: 22
+tags: ["social-graph", "graph-traversal", "bfs", "recommendations", "neo4j", "2nd-degree-connections"]
+companyFlavors: ["LinkedIn", "Facebook", "Twitter/X", "Instagram"]
+prerequisites: ["consistent-hashing", "design-a-cache", "distributed-unique-id-generator"]
+relatedQuestions: ["facebook-news-feed", "twitter-timeline", "reddit"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design LinkedIn's social graph storage and the 'People You May Know' recommendation engine: BFS over a billion-node graph, 2nd-degree connection queries, common connection counting, and the real-time ranking pipeline that surfaces relevant suggestions."
+javaPackages:
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+  - "org.springframework.boot:spring-boot-starter-data-redis:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "org.springframework.data:spring-data-neo4j:7.3.0"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="linkedin-connections" title="Design LinkedIn's People You May Know" />
+
+<Tldr>
+- **Social graph as adjacency lists**: edges are stored bidirectionally (connections are symmetric); LinkedIn's production system uses a custom key-value store (Espresso) rather than a native graph database, with each user's neighbor list as a serialized sorted entry
+- **PYMK is a 2-hop BFS problem**: candidates = union of all friends-of-friends, minus existing connections, minus self; the most critical ranking signal is the count of common connections shared between the viewer and each candidate
+- **450 billion edges makes real-time BFS infeasible**: at 900 million members averaging 500 connections each, a per-request BFS would require 250 thousand edge reads per user; PYMK runs as a nightly Spark batch job with precomputed candidate sets cached in Redis
+- **Common connection count drives ranking**: computed offline via Spark join/aggregation and cached per user-pair in Redis; LinkedIn surfaces the actual names of mutual connections, not just the count
+- **Incremental updates for freshness**: newly joined users get immediate PYMK via a lightweight depth-1 BFS on their first-degree connections; when any connection is added, a Kafka event triggers an incremental cache update for both parties without re-running the full batch
+</Tldr>
+
+## The scale of the problem
+
+LinkedIn sits at a scale that breaks every intuition built from smaller graph problems. With 900 million registered members and a median user holding several hundred connections, the platform's social graph contains roughly 450 billion edges once bidirectional relationships are counted. To put that in perspective: if you stored just one edge as a pair of 4-byte user IDs, the raw edge data alone would consume 3.6 terabytes. Add timestamps, relationship metadata, and index structures, and you are looking at 7 to 10 terabytes of graph data that must be partitioned, replicated, and queried with sub-100-millisecond latency for connection list reads.
+
+This scale is precisely why the People You May Know (PYMK) feature — innocuous as it appears to the end user — is one of the most architecturally interesting systems LinkedIn has ever built. A naive implementation reads as follows: given user A, fetch all of A's connections (1-hop neighbors), then for each of those neighbors fetch their connections (2-hop neighbors), union the result, subtract A's existing connections, and rank by how many common connections each candidate shares with A. The algorithm is conceptually simple. The execution at 900 million users is not. At 500 average connections per user, the 2-hop neighborhood of a single user touches 500 × 500 = 250,000 candidate nodes before deduplication. Executing this query synchronously per request — at LinkedIn's load — would require tens of billions of edge lookups per second across the graph store. No distributed key-value system survives that workload at p99 < 100 ms.
+
+The answer, as it almost always is at this scale, is to move expensive computation offline. Rather than computing PYMK at read time, LinkedIn runs a nightly Spark job that precomputes PYMK candidate lists for all 900 million users and writes the results to Redis. The read path becomes a simple cache lookup. The write path — when a user makes a new connection — publishes a Kafka event that triggers an incremental cache update for the affected users without re-running the full batch. This pattern — precompute offline, serve from cache, update incrementally on change — is the core architectural insight of PYMK, and it generalizes to almost every graph-traversal recommendation problem you will encounter at scale.
+
+The third structural complexity is graph database selection. LinkedIn does not run Neo4j or any native graph database in its critical path. Native graph databases excel at multi-hop traversals when the graph fits in memory, but at 450 billion edges, no commercially available graph database offers the horizontal scalability and operational simplicity of a well-partitioned key-value store. LinkedIn's production graph store is built on Espresso (a MySQL-backed horizontally sharded document store) combined with a custom in-memory adjacency list cache. Edges are stored as serialized sorted lists keyed by user ID. BFS traversal is implemented at the application layer in Spark, not pushed down to a query engine. This is a critical trade-off to understand: you gain horizontal scalability and operational familiarity, but you lose native graph query semantics and must implement traversal logic yourself.
+
+## Clarifying questions
+
+Get clarity on these eight dimensions before drawing a single architecture box. Each one materially changes the design.
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| What is the scope of PYMK? | Focus on 2nd-degree connections (friends-of-friends); followers are out of scope for this session | 2nd-degree only = BFS depth 2; follower graph is directed and requires asymmetric storage — scoping to symmetric connections simplifies the edge model significantly |
+| Are connections bidirectional or directed? | Bidirectional only (a connection requires mutual acceptance) | Bidirectional edges can always be stored with the smaller user_id first, halving deduplication complexity; directed follower graphs need separate forward and reverse indexes |
+| How fresh must PYMK be? | Daily batch is acceptable; users do not expect real-time PYMK updates | Daily freshness unlocks offline Spark computation; real-time freshness would require incremental BFS on every new connection event, which is orders of magnitude more expensive |
+| How many PYMK results per page? | 20 results per request, cursor-paginated | Caps the candidate set that needs to be ranked at read time; top-1000 precomputed candidates in Redis is more than sufficient |
+| Should PYMK filter by industry or location? | No hard filters, but same-industry and same-location signals should boost ranking | These signals are precomputed offline as profile similarity scores; they do not change the BFS structure, only the final ranking formula |
+| Does privacy affect PYMK? | Yes — users can hide their connections list from others; hidden-connection users cannot be surfaced as PYMK bridges | Hidden connections break the BFS path: if user B hides their connections, no one should appear in PYMK solely because they are connected to B; the Spark job must respect privacy flags during adjacency expansion |
+| How does blocking interact with PYMK? | Blocked users must never appear in PYMK regardless of graph proximity | Blocking is a safety feature, not a preference; it must be enforced as a hard filter at both the batch precomputation stage and the real-time serving stage |
+| Is this a global system? | Global — one unified graph across all geographies | Global graph means cross-region edge replication, GDPR erasure requirements for EU users, and localized serving infrastructure; assume active-active with eventual consistency for reads |
+
+## Functional requirements
+
+- Users can view their 1st-degree connections in a paginated, searchable list, with connection degree and mutual connection count visible on each profile card
+- Users can send a connection invitation with an optional personal message; recipients can accept, decline, or ignore the invitation; senders can withdraw a pending invitation
+- The platform surfaces People You May Know recommendations — ranked candidates from the user's 2nd-degree graph — refreshed at least once per day, showing the count and names of mutual connections
+- Every profile view displays the degree of connection between the viewer and the profile owner (1st, 2nd, 3rd+)
+- Users can view the list of mutual connections shared with any other user, subject to both parties' privacy settings
+- Users can search for people by name, company, school, or job title and see their degree of connection in search results
+
+## Non-functional requirements
+
+- **Scale**: 900 million members; 450 billion bidirectional edges; peak write rate of approximately 50,000 new connections per second during global working hours
+- **PYMK freshness**: maximum 24-hour lag; newly joined users receive initial PYMK within 10 minutes via depth-1 BFS on first-degree connections
+- **Read latency**: p99 connection list read under 100 ms; p99 PYMK fetch under 50 ms (served from Redis cache)
+- **Write latency**: p99 connection invitation send under 500 ms; p99 invitation accept (which triggers graph update) under 1 second
+- **Availability**: 99.99% for the connection graph; PYMK can tolerate stale cache (last good result served if batch fails)
+- **GDPR erasure**: deleted user's node and all edges must be removed from graph store, Redis adjacency caches, and PYMK caches within 30 days of deletion request
+
+<Capacity title="LinkedIn Graph Capacity Estimates">
+
+**Edge storage (raw graph)**
+
+$$900\text{M members} \times 500\text{ avg connections} \times 2\text{ (bidirectional)} \times 8\text{ B/edge} = 7.2\text{ TB}$$
+
+Each edge is stored twice: once in user A's adjacency list and once in user B's list. Each edge entry needs the peer's user_id (8 bytes). With replication factor 3 for HA, raw storage is $7.2\text{ TB} \times 3 \approx 21.6\text{ TB}$ — well within the range of a moderately sized sharded key-value cluster.
+
+**2-hop candidate explosion**
+
+$$500\text{ avg connections} \times 500\text{ avg connections} = 250{,}000\text{ raw 2-hop candidates per user}$$
+
+After deduplication (many paths converge on the same candidate) and subtracting existing connections, the unique candidate set shrinks to roughly $50{,}000$ per user. Storing all 50K candidates per user in Redis would cost:
+
+$$900\text{M users} \times 50{,}000\text{ candidates} \times 8\text{ B} = 360\text{ TB}$$
+
+This is why you precompute *incrementally* and store only the **top-1,000 scored candidates** per user, not the full expansion:
+
+$$900\text{M} \times 1{,}000 \times (8\text{ B candidate\_id} + 4\text{ B common\_count}) = 10.8\text{ TB}$$
+
+With Redis overhead, plan for $\approx 20\text{ TB}$ of PYMK Redis capacity across the cluster.
+
+**Common connections cache**
+
+Top 1,000 PYMK candidates per user, storing a 4-byte common-connection count plus a short list of up to 10 mutual connection names (capped at ~128 bytes total per candidate pair):
+
+$$900\text{M users} \times 1{,}000\text{ candidates} \times 132\text{ B} \approx 118\text{ TB}$$
+
+In practice, this data is sharded across many Redis clusters with LRU eviction — the hot set (active users × their PYMK candidates) is a fraction of the theoretical total.
+
+**Batch BFS computation time**
+
+At 100 million BFS edge-traversal operations per second across a 500-node Spark cluster:
+
+$$\frac{900\text{M users} \times 50{,}000\text{ 2-hop candidates}}{100\text{M ops/s}} = 450\text{ seconds} \approx 7.5\text{ minutes}$$
+
+The full nightly batch comfortably fits within a 2-hour window, leaving ample margin for retries and stragglers.
+
+</Capacity>
+
+## API design
+
+All endpoints are authenticated via OAuth 2.0; the authenticated user's ID is extracted from the token server-side.
+
+**Connection management**
+
+```
+GET  /v1/connections?cursor={cursor}&count={count}
+```
+Returns paginated 1st-degree connections with profile summary cards. `cursor` is an opaque base64-encoded token encoding the last-seen `connected_at` timestamp plus `user_id`. `count` defaults to 20, maximum 50.
+
+```
+POST /v1/connections/invite
+Body: { "to_user_id": 123456, "message": "Hi Alice, we met at..." }
+```
+Creates a pending invitation. Returns 409 if an invitation already exists in either direction, or if the users are already connected, or if the target has blocked the sender.
+
+```
+PATCH /v1/connections/invite/{invitation_id}
+Body: { "action": "accept" | "decline" | "withdraw" }
+```
+Accepts (triggers graph update), declines (soft-deletes invitation), or withdraws (sender retracts). Acceptance is the only path that writes to the connection graph.
+
+```
+DELETE /v1/connections/{connection_id}
+```
+Removes a connection. Triggers adjacency list cleanup and publishes a `connection-removed` Kafka event for PYMK cache invalidation.
+
+**PYMK and mutual connections**
+
+```
+GET /v1/connections/pymk?count={count}&cursor={cursor}
+```
+Returns precomputed PYMK candidates from Redis cache. Each result includes `candidate_id`, `common_connection_count`, and up to 3 mutual connection names for display. Falls back to a real-time depth-1 BFS if the user has no cached PYMK (e.g., a brand-new account).
+
+```
+GET /v1/connections/mutual?with_user_id={id}&cursor={cursor}&count={count}
+```
+Lists mutual connections between the authenticated user and the specified user, subject to both users' privacy settings. Served from the common-connections Redis cache; degrades to a live set intersection if cache is cold.
+
+## Data model
+
+**connections table (MySQL, sharded by user_id_a)**
+
+```sql
+CREATE TABLE connections (
+    user_id_a   BIGINT       NOT NULL,
+    user_id_b   BIGINT       NOT NULL,
+    connected_at DATETIME(3) NOT NULL,
+    PRIMARY KEY (user_id_a, user_id_b),
+    INDEX idx_user_id_b (user_id_b, connected_at)
+) ENGINE=InnoDB;
+```
+
+Always store with `user_id_a < user_id_b` for canonical deduplication. The secondary index on `user_id_b` enables reverse lookups without a full scan.
+
+**invitations table (MySQL)**
+
+```sql
+CREATE TABLE invitations (
+    invitation_id  BIGINT       NOT NULL AUTO_INCREMENT,
+    sender_id      BIGINT       NOT NULL,
+    recipient_id   BIGINT       NOT NULL,
+    message        VARCHAR(300),
+    status         ENUM('pending','accepted','declined','withdrawn') NOT NULL DEFAULT 'pending',
+    created_at     DATETIME(3)  NOT NULL,
+    updated_at     DATETIME(3)  NOT NULL,
+    PRIMARY KEY (invitation_id),
+    UNIQUE INDEX idx_sender_recipient (sender_id, recipient_id),
+    INDEX idx_recipient_status (recipient_id, status, created_at)
+) ENGINE=InnoDB;
+```
+
+**graph_adjacency (Redis Sorted Set)**
+
+```
+Key:   adj:{userId}
+Type:  Sorted Set
+Score: connected_at (Unix epoch milliseconds)
+Value: peer_user_id (as string)
+```
+
+`ZADD adj:123 1700000000000 456` adds user 456 to user 123's adjacency list. `ZCARD adj:123` gives the degree (connection count) in O(1). `ZRANGE adj:123 0 -1` returns all connections for BFS traversal. Sharded across Redis cluster by `userId % num_shards`.
+
+**pymk_candidates (Redis)**
+
+```
+Key:   pymk:{userId}
+Type:  String (JSON-encoded list)
+Value: [{"candidateId":789,"commonCount":14,"mutualNames":["Alice S.","Bob J."]}, ...]
+TTL:   86400 seconds (24 hours)
+```
+
+Holds the top-1,000 precomputed PYMK candidates. The serving layer reads this key and returns the top-N requested by the client. Sorted by descending `commonCount` combined with profile-similarity score at write time.
+
+**common_connections_cache (Redis Hash)**
+
+```
+Key:   mutual:{min(a,b)}:{max(a,b)}
+Type:  Hash
+Fields: count (int), names (JSON array of up to 10 display names)
+TTL:   172800 seconds (48 hours)
+```
+
+Keying with canonical ordering (`min` first) ensures that the cache entry for users A and B is the same regardless of who looks it up. Populated by the Spark batch job; invalidated when either user adds or removes a connection.
+
+## Architecture and data flows
+
+<Mermaid diagram={`flowchart TD
+  subgraph Offline["Offline Batch (nightly Spark job)"]
+    ES[Edge Store\nEspresso/KV] -->|read all adjacency lists| SP[Spark Cluster]
+    SP -->|1-hop neighbors per user| HOP1[1-hop RDD]
+    HOP1 -->|join with edge store| HOP2[2-hop candidate pairs\nuser_A, candidate, via_node]
+    HOP2 -->|groupBy user_A + candidate\ncount = common connections| AGG[Aggregated RDD\nuser_A, candidate, common_count]
+    AGG -->|subtract existing connections\nsubtract privacy-hidden nodes\nsubtract blocked users| FILT[Filtered candidates]
+    FILT -->|join profile similarity scores| RANK[Ranked top-1000 per user]
+    RANK -->|SETEX pymk:userId JSON 86400| RC[(Redis PYMK\nCache)]
+    RANK -->|HSET mutual:a:b count names| RMC[(Redis Mutual\nCache)]
+  end
+  subgraph Online["Online Invitation Flow"]
+    U[User A] -->|POST invite| API[API Gateway]
+    API -->|write pending invitation| MySQL[(invitations\nMySQL)]
+    API -->|push notification| NS[Notification\nService]
+    REC[User B accepts] -->|PATCH invite accepted| API
+    API -->|write connection row| MYSQL2[(connections\nMySQL)]
+    API -->|ZADD adj:A score B\nZADD adj:B score A| RC2[(Redis Adjacency\nSorted Sets)]
+    API -->|publish connection-created| KF[Kafka]
+    KF -->|incremental PYMK consumer| INC[Incremental Updater\nfetch B's adj list\nadd new 2-hop candidates\nto A's pymk cache]
+    INC -->|UPDATE pymk:A + pymk:B| RC
+  end`} />
+
+The offline batch is the heavy lifter. The online path is intentionally thin: it writes the canonical edge, updates the in-memory adjacency sorted sets, and delegates PYMK refresh to an asynchronous Kafka consumer. This keeps invitation acceptance under 500 ms p99 even during high-write periods.
+
+## Deep dives
+
+### Social graph storage choices
+
+The most common interview mistake is defaulting to Neo4j. Neo4j's native graph storage is purpose-built for multi-hop traversals and delivers excellent performance when the full graph fits in the working set of a single cluster. LinkedIn's graph, at 450 billion edges, does not come close to fitting. Neo4j's ACID transactional model, its single-primary clustering architecture (even in the enterprise Causal Clustering variant), and its Java heap-bound page cache make it unsuitable for horizontal scaling beyond a few billion edges. LinkedIn has documented this extensively: their early graph infrastructure was relational (MySQL with adjacency table joins), which failed catastrophically under 2-hop query load as the graph grew past 100 million members.
+
+LinkedIn's current approach partitions the graph by user ID. Each user's complete adjacency list — all their connection IDs, sorted by connection timestamp — is stored as a single serialized value in Espresso (a MySQL-backed sharded document store). A read for user A's connections is a single key-value lookup against the shard owning A's user ID. The serialized adjacency list is typically a sorted array of 64-bit integers. At 500 connections per user, this is a 4 KB blob — trivially cacheable in Redis with a 1-hour TTL for hot users.
+
+The trade-off: you lose native graph query semantics entirely. There is no Cypher query that fetches 2-hop neighbors. You implement BFS yourself in the application layer (in Spark for batch, in Java for incremental). Multi-hop traversal requires multiple round trips to the adjacency store, which is acceptable in a Spark executor context (where you can issue many parallel fetches and broadcast small adjacency lists) but prohibitive in a synchronous API handler. This is the fundamental reason PYMK must be precomputed offline.
+
+One optimization LinkedIn applies is a "small degree" optimization: for users with fewer than 50 connections (common for new joiners), a real-time 2-hop BFS is feasible because the candidate set is small (50 × 50 = 2,500 reads). The API server performs this synchronously and caches the result, bypassing the need to wait for the next nightly batch. This is the freshness mechanism for new users.
+
+### PYMK: 2-hop BFS at scale
+
+The Spark job structure is worth spelling out precisely because the naive MapReduce formulation misses several correctness requirements.
+
+**Stage 1 — Load adjacency lists.** Read the full edge table from Espresso into a Spark RDD of `(user_id, neighbor_id)` pairs. This is the canonical 1-hop edge list. At 450 billion edges this RDD is large; it is partitioned by `user_id` across the Spark cluster.
+
+**Stage 2 — Generate 2-hop candidate pairs.** For each edge `(A, B)` in the 1-hop RDD, join B's neighbors into the result. This produces triples `(A, candidate, via_B)` for every `candidate` in B's adjacency list. In Spark this is a self-join of the edge RDD: `edges.join(edges.map(e => (e.neighbor, e.user))).map(...)`. The result is the raw 2-hop expansion — 250,000 triples per user on average.
+
+**Stage 3 — Aggregate common connection count.** Group by `(A, candidate)` and count distinct `via_B` values. The count is the number of common connections between A and the candidate. This is the most expensive step: it requires a shuffle across all 450 billion triples.
+
+**Stage 4 — Filter.** Remove pairs where A and the candidate are already connected (anti-join against the 1-hop edge RDD). Remove pairs where the candidate has their connection list set to private (join against a privacy_flags lookup table). Remove blocked pairs (join against a block_list table).
+
+**Stage 5 — Rank and truncate.** For each user A, sort candidates by a composite score: `0.5 × normalized_common_count + 0.3 × profile_similarity + 0.1 × recency_of_mutual_connections + 0.1 × engagement_probability`. Keep the top 1,000. The profile similarity scores are pre-joined from a separately computed feature table.
+
+**Stage 6 — Write to Redis.** For each user, serialize the top-1,000 candidate list as a JSON array and write to `pymk:{userId}` with a 24-hour TTL. Also write the mutual connection details to `mutual:{min(a,b)}:{max(a,b)}` for all candidate pairs.
+
+**Incremental update on new connection.** When user A connects to user B, the Kafka consumer fetches B's adjacency list (1-hop) and adds each of B's connections as a new 2-hop candidate for A (and vice versa). It computes common connection counts for only these new candidates (by intersecting with A's existing adjacency list) and merges them into A's cached PYMK list, evicting the lowest-scoring existing candidates if the list exceeds 1,000 entries. This incremental update runs in under 100 ms for typical degree users and keeps PYMK fresh within seconds of a new connection forming.
+
+### Common connection counting
+
+Common connection count is not just a ranking signal — it is the primary trust signal that makes PYMK persuasive to users. Seeing "You both know Alice Smith, Bob Jones, and 3 others" is far more compelling than an anonymous count. LinkedIn displays the actual profile names of mutual connections, which means the cache must store not just the integer count but a list of mutual connection identities.
+
+The implementation stores a compact structure in Redis: for each `(A, candidate)` pair in the top-1,000, the `mutual:{min}:{max}` Redis Hash contains a `count` field (integer) and a `names` field (JSON array of up to 10 display names, sorted by A's interaction frequency with each mutual connection — the mutual connections you interact with most frequently appear first). The name list is truncated at 10 for storage efficiency; the display UI typically shows 3 names and "and N others."
+
+Staleness of 24 hours is acceptable here. Mutual connections do not change rapidly — a user adds perhaps 2 to 5 connections per week on average. A 24-hour stale count is almost never wrong by more than 1 or 2, which has no material effect on ranking order.
+
+One subtle correctness requirement: if user A removes a connection to user C, and C was a mutual connection displayed in A's PYMK list for candidate D, the mutual connection entry should be invalidated. The `connection-removed` Kafka event triggers a targeted cache invalidation of all `mutual:{A}:{*}` and `mutual:{*}:{A}` keys, which forces a lazy recomputation on next access. This is safe because removals are rare and the degraded behavior (showing a stale count for a few hours) is acceptable.
+
+### Profile similarity signals
+
+Common connection count alone produces mediocre PYMK quality. Two users might share 50 mutual connections but work in completely different industries and have zero professional overlap. LinkedIn's production ranking formula incorporates profile-level features computed offline:
+
+**Same company (current or past)**: binary feature; weighted heavily if current employer matches. Former coworkers are high-quality PYMK candidates even with low mutual connection counts because the shared professional context creates a natural opening for connection.
+
+**Same school**: binary feature per institution; weighted by recency (graduated in the same decade scores higher than decade-apart alumni).
+
+**Industry vertical match**: LinkedIn maps each user to one of approximately 150 industry categories. Exact match scores 1.0; adjacent industries (e.g., "Software Engineering" and "Data Science") score 0.5 using a precomputed industry-similarity matrix.
+
+**Geographic proximity**: same city scores higher than same country; remote-work flags reduce the weight of geographic signals for users who list remote locations.
+
+**Job title embedding similarity**: LinkedIn trains a shallow embedding model on job titles; cosine similarity between title embeddings captures semantic proximity (e.g., "Senior Software Engineer" and "Staff Engineer" are semantically close). These embeddings are precomputed per user and stored in a feature store; the cosine similarity for top PYMK candidate pairs is computed during the Spark batch job.
+
+**Engagement probability**: a lightweight model trained on historical PYMK acceptance rates, conditioned on the above features. If users with similar profiles to A historically accepted connections with users similar to the candidate, that boosts the engagement probability score.
+
+The combined ranking formula is:
+
+$$\text{score}(A, C) = 0.5 \cdot \hat{cc} + 0.3 \cdot \text{sim}(A, C) + 0.1 \cdot \text{recency} + 0.1 \cdot \hat{p}(\text{accept})$$
+
+where $\hat{cc}$ is the normalized common connection count (divided by the maximum count in A's candidate set), $\text{sim}(A, C)$ is the composite profile similarity score in $[0, 1]$, $\text{recency}$ decays exponentially with the age of the most recent mutual connection formed, and $\hat{p}(\text{accept})$ is the predicted acceptance probability.
+
+### Degree of connection display
+
+Every LinkedIn profile shows "1st", "2nd", or "3rd+" degree of connection to the viewer. This must be consistent, fast, and correct — inconsistency between PYMK degree labels and profile view degree labels erodes user trust.
+
+**1st degree**: O(1) check. `ZSCORE adj:{viewerId} {profileId}` — a non-null response means 1st-degree connected.
+
+**2nd degree**: more expensive. The naive approach — fetch viewer's connections, check if profile is in any of their connections' adjacency lists — requires up to 500 Redis lookups. The optimized approach uses the precomputed PYMK candidate list: if `profileId` appears in `pymk:{viewerId}`, it is 2nd-degree. This is fast but has a false-negative risk for users whose 2-hop neighborhood exceeds 1,000 candidates (the cache truncation threshold). For these cases, a bounded real-time BFS (depth 2, maximum 500 nodes expanded) is performed and cached in Redis with a 1-hour TTL.
+
+**3rd+**: anything that is not 1st or 2nd degree. No traversal needed — it is the default label for everyone else.
+
+Profile degree caching: `degree:{viewerId}:{profileId}` → `{1|2|3}` with TTL of 1 hour. Invalidated by `connection-created` and `connection-removed` events for the affected user pair.
+
+## Java integration
+
+### Part A — ConnectionGraphService.java
+
+```java
+package com.linkedin.connections.service;
+
+import io.lettuce.core.api.sync.RedisCommands;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.springframework.stereotype.Service;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+@Service
+public class ConnectionGraphService {
+
+    private static final String ADJ_PREFIX   = "adj:";
+    private static final String PYMK_PREFIX  = "pymk:";
+    private static final String TOPIC_CREATED = "connection-created";
+    private static final String TOPIC_REMOVED = "connection-removed";
+
+    private final RedisCommands<String, String> redis;
+    private final KafkaProducer<String, String> kafka;
+    private final ObjectMapper objectMapper;
+
+    public ConnectionGraphService(RedisCommands<String, String> redis,
+                                  KafkaProducer<String, String> kafka,
+                                  ObjectMapper objectMapper) {
+        this.redis        = redis;
+        this.kafka        = kafka;
+        this.objectMapper = objectMapper;
+    }
+
+    public void addConnection(long userA, long userB, long connectedAt) {
+        redis.zadd(ADJ_PREFIX + userA, connectedAt, String.valueOf(userB));
+        redis.zadd(ADJ_PREFIX + userB, connectedAt, String.valueOf(userA));
+        String payload = String.format("{\"userA\":%d,\"userB\":%d}", userA, userB);
+        kafka.send(new ProducerRecord<>(TOPIC_CREATED, String.valueOf(userA), payload));
+    }
+
+    public Set<Long> getConnections(long userId) {
+        List<String> members = redis.zrange(ADJ_PREFIX + userId, 0, -1);
+        return members.stream().map(Long::parseLong).collect(Collectors.toSet());
+    }
+
+    public boolean isConnected(long userA, long userB) {
+        return redis.zscore(ADJ_PREFIX + userA, String.valueOf(userB)) != null;
+    }
+
+    public long getDegree(long userId) {
+        Long card = redis.zcard(ADJ_PREFIX + userId);
+        return card != null ? card : 0L;
+    }
+
+    public List<PymkCandidate> getPymkCandidates(long userId) {
+        String raw = redis.get(PYMK_PREFIX + userId);
+        if (raw == null) return Collections.emptyList();
+        try {
+            return objectMapper.readValue(raw,
+                objectMapper.getTypeFactory()
+                    .constructCollectionType(List.class, PymkCandidate.class));
+        } catch (Exception e) {
+            return Collections.emptyList();
+        }
+    }
+
+    public void removeConnection(long userA, long userB) {
+        redis.zrem(ADJ_PREFIX + userA, String.valueOf(userB));
+        redis.zrem(ADJ_PREFIX + userB, String.valueOf(userA));
+        String payload = String.format("{\"userA\":%d,\"userB\":%d}", userA, userB);
+        kafka.send(new ProducerRecord<>(TOPIC_REMOVED, String.valueOf(userA), payload));
+    }
+
+    public record PymkCandidate(long candidateId, int commonCount, List<String> mutualNames) {}
+}
+```
+
+### Part B — ConnectionController.java
+
+```java
+package com.linkedin.connections.controller;
+
+import com.linkedin.connections.service.ConnectionGraphService;
+import com.linkedin.connections.service.ConnectionGraphService.PymkCandidate;
+import com.linkedin.connections.service.InvitationService;
+import com.linkedin.connections.service.UserService;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/v1/connections")
+public class ConnectionController {
+
+    private final ConnectionGraphService graphService;
+    private final InvitationService invitationService;
+    private final UserService userService;
+
+    public ConnectionController(ConnectionGraphService graphService,
+                                InvitationService invitationService,
+                                UserService userService) {
+        this.graphService      = graphService;
+        this.invitationService = invitationService;
+        this.userService       = userService;
+    }
+
+    @GetMapping
+    public ResponseEntity<List<UserProfileCard>> getConnections(
+            @AuthenticationPrincipal long viewerId,
+            @RequestParam(defaultValue = "") String cursor,
+            @RequestParam(defaultValue = "20") int count) {
+        var connectionIds = graphService.getConnections(viewerId);
+        var profiles = userService.fetchProfileCards(connectionIds, cursor, count);
+        return ResponseEntity.ok(profiles);
+    }
+
+    @GetMapping("/pymk")
+    public ResponseEntity<List<PymkCandidate>> getPymk(
+            @AuthenticationPrincipal long viewerId,
+            @RequestParam(defaultValue = "20") int count) {
+        var candidates = graphService.getPymkCandidates(viewerId);
+        return ResponseEntity.ok(candidates.stream().limit(count).toList());
+    }
+
+    @PostMapping("/invite")
+    public ResponseEntity<InvitationResponse> sendInvite(
+            @AuthenticationPrincipal long senderId,
+            @RequestBody InviteRequest req) {
+        var invitation = invitationService.create(senderId, req.toUserId(), req.message());
+        return ResponseEntity.status(201).body(invitation);
+    }
+
+    @PatchMapping("/invite/{invitationId}")
+    public ResponseEntity<Void> respondToInvite(
+            @AuthenticationPrincipal long userId,
+            @PathVariable long invitationId,
+            @RequestBody InviteActionRequest action) {
+        if ("accept".equals(action.action())) {
+            var inv = invitationService.accept(invitationId, userId);
+            graphService.addConnection(inv.senderId(), inv.recipientId(), System.currentTimeMillis());
+        } else {
+            invitationService.decline(invitationId, userId, action.action());
+        }
+        return ResponseEntity.noContent().build();
+    }
+
+    @DeleteMapping("/{connectionId}")
+    public ResponseEntity<Void> removeConnection(
+            @AuthenticationPrincipal long userId,
+            @PathVariable long connectionId) {
+        long peerId = invitationService.resolvePeer(userId, connectionId);
+        graphService.removeConnection(userId, peerId);
+        invitationService.deleteConnectionRecord(connectionId);
+        return ResponseEntity.noContent().build();
+    }
+}
+```
+
+## Trade-off comparison
+
+<TradeoffTable
+  headers={["Approach", "Storage", "1-hop Read", "2-hop Query", "PYMK Freshness"]}
+  rows={[
+    ["Relational DB (adjacency table)", "Moderate — rows with indexes; JOIN for 2-hop", "Fast with index (O log n)", "Expensive JOIN across billions of rows; 2-hop requires self-join or recursive CTE; degrades rapidly past 100M edges", "Could be real-time but kills DB under load"],
+    ["Native graph DB (Neo4j)", "Compact native format; fits well under ~10B edges", "Very fast — pointer-chasing on disk", "Excellent for multi-hop on graphs that fit in memory; horizontal scalability is limited; 450B edges exceed practical cluster sizes", "Real-time traversal feasible at smaller scale; not at LinkedIn scale"],
+    ["Custom adjacency list store (LinkedIn's approach)", "Lean — serialized sorted arrays in KV store; 7.2 TB raw; scales horizontally to any size", "O(1) key lookup; deserialize array — fast for typical degrees", "Must implement BFS in application layer; Spark batch for PYMK; incremental updates via Kafka consumers", "24-hour batch lag; minutes lag with incremental Kafka consumer for changed users"],
+    ["Distributed graph processing (Pregel / Spark GraphX)", "No native serving store — sits on top of HDFS/object storage", "Not designed for online serving; requires materialization", "Excellent throughput for batch graph algorithms at any scale; not suitable for sub-second online reads", "Batch only; freshness determined by job frequency; not suitable for real-time updates"],
+  ]}
+/>
+
+## Pitfalls
+
+<Pitfall>
+**Running BFS per request for PYMK.** At 500 average connections per user, a synchronous 2-hop BFS generates 500 × 500 = 250,000 edge reads per request. At LinkedIn's peak load of millions of PYMK page loads per minute, this translates to hundreds of billions of edge reads per minute against the graph store — an immediately fatal load. Even with aggressive Redis caching of individual adjacency lists, the read fan-out overwhelms any reasonable infrastructure. The mandatory mitigation is offline precomputation: run the full BFS in a nightly Spark batch job, write results to Redis with a 24-hour TTL, and serve PYMK exclusively from cache. The online path does zero graph traversal. Any architecture that does not establish this separation at the design stage will fail the interview.
+</Pitfall>
+
+<Pitfall>
+**Storing the full 50K 2-hop candidate list per user in Redis.** The raw 2-hop expansion yields approximately 50,000 unique candidates per user after deduplication. Storing all of them in Redis costs $900\text{M} \times 50{,}000 \times 8\text{ B} = 360\text{ TB}$ — more than 10x the size of the entire raw edge graph. The correct approach is to rank and truncate at the Spark job output stage: keep only the top-1,000 scored candidates per user before writing to Redis. 1,000 candidates covers far more pagination than any user will ever scroll through, and the storage footprint drops to a manageable $\approx 20\text{ TB}$ (including Redis overhead). Never let the precomputed output size be proportional to the raw 2-hop expansion size.
+</Pitfall>
+
+## Curveballs
+
+<Curveball>
+**"A celebrity joins LinkedIn and gets 2 million followers in a week. How does your adjacency list store handle the write load, and how does PYMK handle the explosion of 2-hop candidates through this hub node?"**
+
+This is the classic "hot partition" or "celebrity problem." Two distinct issues arise. First, write load: the adjacency list key `adj:{celebrityId}` receives 2 million `ZADD` operations in a week, with spikes during announcement events. A single Redis node owning this key becomes a hot spot. Mitigation: for users crossing a follower threshold (e.g., 100,000 connections), switch to a read-replica fan-out model — writes go to a primary shard, reads are distributed across multiple replicas. The sorted set is small enough (2M entries × 8 bytes = 16 MB) that full replication is feasible.
+
+Second, PYMK explosion: the celebrity is now a common mutual connection for potentially millions of user pairs. Their presence in the 2-hop graph creates an enormous number of `(A, candidate)` pairs during the Spark batch job, all with `common_count = 1` (because only one path runs through the celebrity). These low-quality candidates would flood PYMK recommendations if not handled. Mitigation: during the Spark aggregation stage, apply a "hub dampening" factor to paths that route through high-degree nodes. A mutual connection through a node with degree > 10,000 contributes a fractional weight (e.g., `1 / log(degree)`) rather than a full count of 1. This mirrors the inverse-document-frequency concept in information retrieval — a mutual connection that everyone shares carries less signal than a mutual connection that only a small circle shares.
+</Curveball>
+
+<Curveball>
+**"LinkedIn acquires a company and wants to import its 50 million user social graph into LinkedIn's graph. Design the bulk import without disrupting live serving."**
+
+Bulk import at 50 million users is a batch ETL problem with a live-serving constraint. The naïve approach — write all edges to the production graph store directly — causes hotspot writes on the adjacency partitions of acquired users who may not exist yet in LinkedIn's ID space, and floods the Kafka `connection-created` topic, triggering tens of billions of incremental PYMK updates.
+
+A phased approach: **Phase 1 — ID mapping.** Create LinkedIn user IDs for all 50M acquired users (or map email/phone matches to existing LinkedIn accounts using privacy-safe hashed matching). This produces an `acquired_id → linkedin_id` mapping table. **Phase 2 — Shadow write to edge store.** Write all edges from the acquired graph directly to the Espresso adjacency store using a separate bulk-load path that bypasses the Kafka event pipeline. This prevents the incremental PYMK consumer from being overwhelmed. Mark these edges with a `source=import` flag. **Phase 3 — Batch PYMK recompute.** Schedule the next nightly Spark job to run immediately after edge import completes. The job naturally picks up all new edges. **Phase 4 — Notification rollout.** After PYMK is recomputed, notify users of new connection suggestions in batches (e.g., 5M users per hour) rather than all at once, to spread the read load. **Phase 5 — Validate and cutover.** Compare a sample of imported users' PYMK lists against expected results, then remove the `source=import` flag and treat edges as fully canonical.
+
+Key safeguard: imported connections should not immediately be surfaced as 1st-degree connections to LinkedIn users who never consented to the cross-platform connection. The import flow should distinguish between "mirrored edges from acquired platform" and "mutual acceptance on LinkedIn" — only the latter should appear as 1st-degree connections.
+</Curveball>
+
+<Curveball>
+**"GDPR erasure: a user deletes their account. How do you remove their node and all 500+ edges from adjacency lists and PYMK caches within 30 days, across a distributed system?"**
+
+GDPR Article 17 gives LinkedIn 30 days to erase a deleted user's data from all systems. The challenge is the distributed fan-out: the deleted user's ID appears in up to 500 other users' adjacency sorted sets, in an unknown number of `pymk:{userId}` caches as a candidate, and in `mutual:{a}:{b}` caches as a mutual connection entry. There is no central index mapping "which users' caches contain user X" — you cannot scan all 900 million Redis keys efficiently.
+
+**Deletion workflow:** On account deletion request, immediately set a `deleted` flag in the users table (visible to all read paths; deleted users return 404 on profile lookup and are filtered from PYMK serving immediately). This provides effective erasure from user experience within seconds. **Asynchronous hard erasure:** publish a `user-deleted` event to Kafka. A dedicated GDPR erasure consumer processes this event by: (1) reading the deleted user's adjacency list from Redis before it is cleared (this gives the list of all 500 affected peers); (2) for each peer, issuing `ZREM adj:{peerId} {deletedUserId}` — this is O(500) Redis operations, fully parallelizable; (3) deleting `adj:{deletedUserId}` and `pymk:{deletedUserId}`; (4) writing a task to a durable deletion job queue with all affected peer IDs. **Cascade cleanup:** a background worker processes the deletion job queue, scanning for `mutual:` keys referencing the deleted user and invalidating them, and for `pymk:` keys where the deleted user appears as a candidate — handled by triggering an incremental PYMK recompute for affected peers. The 30-day window is generous: with 500 affected peers, the entire cascade typically completes within hours. The compliance deadline exists to accommodate rare cases where data is in cold storage (archive/backup tapes) that requires scheduled purge cycles.
+</Curveball>
+
+## Further reading
+
+- Shao B., Wang H., Li Y.: "Trinity: A Distributed Graph Engine on a Memory Cloud" (SIGMOD 2013) — foundational patterns for distributed graph storage at the scale of hundreds of billions of edges, including the adjacency list partitioning scheme that influenced LinkedIn's Espresso-based graph layer
+- LinkedIn Engineering Blog: "The Architecture of People You May Know" — LinkedIn's own account of how PYMK evolved from a simple MySQL JOIN to a multi-stage Hadoop (and later Spark) pipeline with incremental updates, covering the hub-dampening problem and the privacy-awareness requirements in the BFS expansion
+- Low Y., Gonzalez J., Kyrola A., Bickson D., Guestrin C., Hellerstein J.M.: "GraphX: Graph Processing in a Distributed Dataflow Framework" (OSDI 2014) — explains the vertex-cut partitioning strategy that makes Spark GraphX efficient for large-scale BFS and aggregation on power-law graphs (which social graphs are)
+- Brin S., Page L.: "The Anatomy of a Large-Scale Hypertextual Web Search Engine" (WWW 1998) — while not about social graphs, the PageRank formulation of link authority as an iterative graph computation is directly analogous to influence propagation in social graph ranking
+
+<RelatedQuestions items={[
+  { slug: "facebook-news-feed", title: "Design Facebook News Feed", difficulty: "staff" },
+  { slug: "twitter-timeline", title: "Design Twitter's Home Timeline", difficulty: "senior" },
+  { slug: "reddit", title: "Design Reddit", difficulty: "senior" },
+]} />

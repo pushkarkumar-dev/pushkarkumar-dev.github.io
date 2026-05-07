@@ -1,0 +1,89 @@
+---
+import { ClientRouter } from 'astro:transitions';
+
+export interface Props {
+  title: string;
+  description?: string;
+  ogImage?: string;
+}
+
+const {
+  title,
+  description = 'Staff-level system design interview prep — 60 questions with deep-dives, capacity math, and tradeoff analysis.',
+  ogImage,
+} = Astro.props;
+
+const canonicalUrl = new URL(Astro.url.pathname, Astro.site);
+---
+
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="generator" content={Astro.generator} />
+
+    <!-- No-FOUC theme script: runs before paint -->
+    <script is:inline>
+      (function () {
+        var stored = localStorage.getItem('sd-theme');
+        var preferred = stored || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+        document.documentElement.setAttribute('data-theme', preferred);
+      })();
+    </script>
+
+    <title>{title} | System Design</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonicalUrl} />
+
+    <!-- Open Graph -->
+    <meta property="og:title" content={`${title} | System Design`} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content={canonicalUrl} />
+    {ogImage && <meta property="og:image" content={ogImage} />}
+    <meta name="twitter:card" content="summary_large_image" />
+
+    <!-- Fonts: preconnect early, then load async with display=swap -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Geist:wght@300..700&family=JetBrains+Mono:wght@400;500&family=Source+Serif+4:ital,opsz,wght@0,8..60,300..900;1,8..60,300..900&display=swap"
+      rel="stylesheet"
+    />
+
+    <!-- Global styles (tokens + Tailwind + prose) -->
+    <style is:global>
+      @import '../styles/globals.css';
+    </style>
+
+    <!-- View Transitions (cross-page cross-fade) -->
+    <ClientRouter />
+
+    <slot name="head" />
+  </head>
+
+  <body>
+    <!-- Skip to content -->
+    <a
+      href="#main-content"
+      class="sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-50 focus:px-4 focus:py-2 focus:rounded-md focus:bg-[var(--accent)] focus:text-black focus:font-medium"
+    >
+      Skip to content
+    </a>
+
+    <slot />
+
+    <!-- Theme toggle global script -->
+    <script is:inline>
+      window.__setTheme = function (theme) {
+        document.documentElement.setAttribute('data-theme', theme);
+        localStorage.setItem('sd-theme', theme);
+      };
+      window.__getTheme = function () {
+        return document.documentElement.getAttribute('data-theme') || 'dark';
+      };
+    </script>
+  </body>
+</html>

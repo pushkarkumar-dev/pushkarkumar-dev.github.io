@@ -1,0 +1,647 @@
+---
+title: "Design Instagram"
+slug: "instagram"
+category: "social"
+difficulty: "senior"
+estimatedReadMinutes: 24
+tags: ["feed", "media-storage", "cdn", "ranking", "stories", "reels"]
+companyFlavors: ["Instagram", "TikTok", "Pinterest", "Snapchat"]
+prerequisites: ["twitter-timeline", "photo-storage-haystack", "cdn-design"]
+relatedQuestions: ["twitter-timeline", "facebook-news-feed", "youtube-design"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design Instagram end-to-end: photo/video upload pipeline, ranked home feed, ephemeral Stories with 24-hour TTL, and the Explore page. Balance write amplification against read-latency at 2 B MAU."
+javaPackages:
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+  - "org.springframework.boot:spring-boot-starter-data-redis:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "software.amazon.awssdk:s3:2.25.0"
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="instagram" title="Design Instagram" />
+
+<Tldr>
+- **Upload pipeline**: client sends chunks directly to S3 via pre-signed URLs (bypassing API servers); a Kafka "media-uploaded" event triggers TranscodeWorker, which generates multiple resolutions; CDN origin push distributes variants globally; FanoutService writes ranked candidate post IDs into follower feed caches.
+- **Feed ranking**: precomputed per-user ranked list stored in Redis — not a chronological stream. Ranking signals include recency (exponential decay), engagement rate (likes + comments ÷ reach), relationship strength (DM frequency, mutual follows), and content-type preference (photos vs. Reels). Ranking runs offline every 10 minutes; result is a JSON-encoded ordered list with 10-minute TTL.
+- **Stories**: stored in the same S3 object store as posts; `expires_at = created_at + 86400s` enforced at the application layer, with an S3 lifecycle policy as a backup that deletes media after 25 hours. Seen-state is a per-story Bloom filter in Redis — not a DB row — ordered unseen-first, then seen, by recency.
+- **Celebrity fan-out**: accounts with more than approximately 1 million followers use fan-out-on-read (pull model) rather than writing into millions of feed caches. A hybrid threshold matches what Instagram/Twitter use in production; pure fan-out-on-write is reserved for ordinary accounts (followers < 1M).
+- **Explore page**: fully decoupled from the social graph. Offline CLIP-style multimodal embeddings are indexed with FAISS for approximate nearest-neighbor search; collaborative filtering overlays user-engagement similarity. Results are cached per user for 30 minutes in Redis — no social-graph dependency anywhere in the pipeline.
+</Tldr>
+
+## The scale of the problem
+
+Instagram sits at 2 billion monthly active users with roughly 100 million posts uploaded every day — photos, Reels, Carousels, and Stories combined. At that scale, the engineering decisions that seem academic in a 10,000-user service become existential. Chronological feed delivery, which works perfectly well for a small social product, fails at Instagram's scale for a simple reason: the average Instagram user follows 500 accounts, and those 500 accounts collectively post hundreds of items per day. A chronological feed for that user has hundreds of items to page through; the practical result is that recent, low-engagement content from close friends is buried under high-frequency posts from brands and celebrities. Ranking is not a product luxury — it is the mechanism by which users find content worth engaging with before closing the app.
+
+The transition from chronological to ranked feed introduces a genuinely hard systems problem: to rank a feed personalized to each user, you need engagement signals (likes, comments, shares, watch time) on candidate posts before you can score them, but those signals are only generated after users have been shown the posts. This circular dependency is resolved by decoupling the scoring pipeline from the read path. Candidate posts are scored offline against a feature set assembled from the previous few days of engagement data, and the resulting ranked list is materialized into a per-user Redis cache that the feed API reads directly. The ranking model never runs on the critical read path.
+
+The third dimension of complexity is media. Instagram is not a text social network — every post involves a media asset that can range from a 50 KB thumbnail to a 200 MB Reel. Serving 463,000 feed reads per second, each loading multiple media items at an average of 500 KB, implies roughly 1.8 TB/s of CDN egress bandwidth at peak. No single origin cluster can sustain that. The storage and delivery architecture must be designed from day one around CDN-first delivery, with object storage as the origin, chunked upload to bypass API server bandwidth limits, and transcoding to right-size media for each client's network and screen.
+
+## Clarifying questions
+
+Lock down these eight questions before sketching any architecture. Each answer gates at least one major design decision.
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| Should the feed be ranked or chronological? | Ranked — ML-scored based on engagement and relationship signals | Determines the entire feed architecture: ranked requires offline scoring pipeline, precomputed cache, candidate generation; chronological is a much simpler sorted-set query |
+| Which media types must be supported? | Photos, Reels (short video), Carousels, Stories — DMs out of scope unless probed | Video adds transcoding pipeline, multi-resolution delivery, CDN segment caching; Stories add ephemeral TTL enforcement and seen-state tracking |
+| What is the upload size limit? | Photos up to 30 MB, Reels up to 100 MB | Determines chunked upload strategy, pre-signed URL chunk size, transcoding memory requirements, and origin storage costs |
+| What is the Stories TTL? | 24 hours from creation | Drives expires_at indexing strategy, S3 lifecycle policy configuration, and whether TTL is enforced at app layer, cache layer, or both |
+| Should the Explore page use the social graph? | No — Explore is interest-based, no social-graph dependency | Explore becomes a separate embedding + collaborative filtering pipeline; simplifies the cold-start problem for new users with no social graph |
+| Is DM (direct messaging) in scope? | Out of scope for this interview | Removes real-time messaging, end-to-end encryption, and inbox fan-out from consideration — very different problem domain |
+| Are notifications in scope? | Out of scope — assume a separate notification service exists | Avoids the push/pull notification architecture rabbit hole; feed and notification pipelines are independent |
+| Is the system global or single-region? | Global — multi-region with CDN edge delivery | Drives data residency decisions, cross-region replication of post metadata, CDN PoP strategy, and latency SLAs per region |
+
+## Functional requirements
+
+- Users can upload photos and short videos (Reels); uploads are chunked directly to object storage via pre-signed URLs and processed asynchronously by a transcoding service.
+- Each user has a personalized home feed that shows posts from followed accounts, ranked by a multi-signal model rather than pure recency.
+- Users can post ephemeral Stories that expire after exactly 24 hours; Stories show an ordered ring of unseen content first, then seen content.
+- The Explore page surfaces content from accounts the user does not follow, ranked by interest and engagement signals with no social-graph dependency.
+- Users can like, comment on, and share posts; engagement events flow into a stream processor that updates ranking signals for subsequent feed refreshes.
+- Users can follow and unfollow accounts; unfollow immediately removes that account's posts from future feed refreshes (eventual consistency on existing cached feeds is acceptable).
+
+## Non-functional requirements
+
+- **Scale**: 2 billion MAU; 100 million posts/day; peak feed reads at 463,000 requests/second.
+- **Upload latency**: p99 < 5 seconds for a 10 MB photo from client to S3 (chunked upload + confirmation); transcoding is asynchronous and does not block the upload response.
+- **Feed read latency**: p99 < 200ms end-to-end for a ranked home feed page (Redis cache hit path); p99 < 1s for cache miss (cold-start ranking path).
+- **Availability**: 99.99% for feed reads and media delivery; Stories expiry can have eventual consistency within a 1-minute window.
+- **Durability**: 11 nines for media stored in S3; post metadata replicated across at least 3 availability zones.
+- **Retention**: media retained for 7 years for active posts; Stories media deleted within 25 hours of creation via S3 lifecycle policy; deleted posts purged from CDN within 60 seconds via tag-based cache invalidation.
+- **Consistency**: read-after-write for the uploader's own feed; eventual consistency (< 60 seconds) for followers' feeds after a post is published.
+
+<Capacity title="Instagram Capacity Estimates">
+
+**Upload throughput**
+
+$$
+\frac{100\text{M posts}}{86{,}400\text{s}} \approx 1{,}157 \text{ uploads/s sustained; } \approx 3{,}500\text{ uploads/s at peak (3× factor)}
+$$
+
+**Storage ingestion**
+
+$$
+100\text{M photos/day} \times 3\text{ MB avg} = 300\text{ TB/day for photos}
+$$
+
+$$
+\text{Reels (assume 20\% of uploads, avg 50 MB)} = 20\text{M} \times 50\text{ MB} = 1\text{ PB/day}
+$$
+
+Combined raw ingestion before variant multiplication is approximately **1.3 PB/day**. Each photo produces 3 variants (thumbnail, medium, full); each Reel produces 3 quality levels × segment files. Storage multiplier ≈ 3×, yielding roughly **4 PB/day** of variant storage. At $0.023/GB/month on S3 Standard for the first year, then tiered to S3 Intelligent-Tiering, 7-year retention approaches **10 EB total**.
+
+**Feed read throughput**
+
+$$
+2\text{B MAU} \times 20\text{ sessions/day} \times 10\text{ feed-loads/session} \div 86{,}400\text{s} \approx 463{,}000\text{ feed reads/s}
+$$
+
+463K feed reads/s is the steady-state estimate. With a diurnal 2× peak factor, the system must sustain **~925K feed reads/s** during peak hours. Each feed read that hits the Redis cache is a single `LRANGE feed:{userId} 0 19` command — sub-millisecond at the cache layer, dominated by network RTT (~1–5ms within a datacenter).
+
+**Transcoding**
+
+$$
+100\text{M uploads/day} \times 3\text{ variants} \times 2\text{s avg transcode time} = 600\text{M transcode-seconds/day}
+$$
+
+$$
+\frac{600\text{M transcode-seconds}}{86{,}400\text{s/day}} \approx 6{,}944\text{ concurrent transcode-seconds sustained}
+$$
+
+Assuming each transcoding worker handles one transcode at a time and costs 2 vCPUs, the peak transcode fleet is approximately **14,000 vCPUs** — roughly 1,750 8-core machines. In practice, transcoding bursts are absorbed by auto-scaling worker groups backed by an SQS/Kafka queue, so the fleet can scale down during low-traffic hours.
+
+**CDN egress bandwidth**
+
+$$
+463{,}000\text{ feed reads/s} \times 500\text{ KB avg media per feed item} \times 10\text{ items/load} \approx 1.8\text{ TB/s CDN egress}
+$$
+
+At a 95% CDN hit ratio (industry baseline for media-heavy social networks), origin bandwidth is approximately **90 GB/s** — well within the capacity of a multi-region S3 + CloudFront setup. The 5% CDN misses that reach the origin are primarily new uploads not yet cached at edge, and Reels segments that are too large to be efficiently cached at all edge PoPs.
+
+</Capacity>
+
+## API design
+
+The API surface covers five core operations. Each endpoint is designed to be stateless at the API server layer — all state lives in Redis, Postgres, and S3.
+
+```http
+POST /v1/media/upload
+  Body: { filename: string, content_type: string, size_bytes: int }
+  Returns: {
+    upload_id: "upl_8f3a2c9d",
+    parts: [
+      { part_number: 1, presigned_url: "https://s3.amazonaws.com/...", max_bytes: 5242880 },
+      { part_number: 2, presigned_url: "https://s3.amazonaws.com/...", max_bytes: 5242880 }
+    ],
+    complete_url: "/v1/media/upload/upl_8f3a2c9d/complete"
+  }
+
+POST /v1/media/upload/{upload_id}/complete
+  Body: { parts: [{ part_number: 1, etag: "abc123" }, ...] }
+  Returns: { media_key: "media/2025/01/15/pid_8f3a2c9d", status: "processing" }
+
+POST /v1/posts
+  Body: { media_keys: ["media/2025/01/15/pid_8f3a2c9d"], caption: string, location?: string }
+  Returns: { post_id: "post_9b4d1f2e", created_at: "2025-01-15T10:30:00Z", status: "published" }
+  Side-effect: publishes "post.created" Kafka event → triggers FanoutService
+
+GET /v1/feed?cursor={cursor}&count={count}
+  Auth: Bearer token (identifies requesting user)
+  Returns: {
+    posts: [{ post_id, user_id, media_variants, caption, like_count, comment_count, ... }],
+    next_cursor: "eyJsYXN0X3Bvc3RfaWQiOiI5YjRkMWYyZSJ9",
+    has_more: true
+  }
+  Latency target: p99 < 200ms (Redis cache hit); p99 < 1s (cache miss, ranking path)
+
+GET /v1/stories/{userId}
+  Returns: {
+    unseen: [{ story_id, media_url, created_at, expires_at }],
+    seen:   [{ story_id, media_url, created_at, expires_at }]
+  }
+  Note: media_url is a pre-signed CDN URL with 1-hour TTL; forces re-auth every hour
+
+GET /v1/explore?cursor={cursor}&count={count}
+  Auth: Bearer token (for personalization; not required for cold users)
+  Returns: { posts: [...], next_cursor: "...", has_more: true }
+  Cache: results cached per user for 30 minutes
+```
+
+The two-step upload flow (initiate → complete) is the most important API design decision for media. Routing a 100 MB Reel through an API server wastes bandwidth, saturates API server memory, and adds latency. Pre-signed S3 URLs transfer media directly between the client and S3, letting API servers focus on metadata operations. The `complete` call fires only after the client has successfully uploaded all parts — S3's multipart upload API guarantees that an incomplete multipart upload cannot be assembled into a readable object, preventing partial media from entering the processing pipeline.
+
+## Data model
+
+**posts table** (Postgres, sharded by `user_id` range, then by `created_at` for time-series locality):
+
+```sql
+CREATE TABLE posts (
+  post_id       BIGINT        NOT NULL,
+  user_id       BIGINT        NOT NULL,
+  media_keys    TEXT[]        NOT NULL,
+  caption       TEXT,
+  location      TEXT,
+  created_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
+  is_deleted    BOOLEAN       NOT NULL DEFAULT false,
+  PRIMARY KEY (user_id, post_id)
+);
+
+CREATE INDEX idx_posts_created ON posts (user_id, created_at DESC)
+  WHERE is_deleted = false;
+```
+
+**media_variants table** (Postgres, same shard as posts):
+
+```sql
+CREATE TABLE media_variants (
+  post_id      BIGINT        NOT NULL,
+  variant      TEXT          NOT NULL,
+  s3_key       TEXT          NOT NULL,
+  cdn_url      TEXT          NOT NULL,
+  width_px     INT,
+  height_px    INT,
+  duration_ms  INT,
+  PRIMARY KEY (post_id, variant)
+);
+```
+
+Variants include: `thumb_320` (320×320 JPEG), `medium_640` (640px wide), `full_res` (original dimensions), `reel_720p` (H.264 720p MP4), `reel_1080p` (H.264 1080p MP4).
+
+**stories table** (Postgres, separate schema from posts due to different TTL semantics):
+
+```sql
+CREATE TABLE stories (
+  story_id    BIGINT        NOT NULL PRIMARY KEY,
+  user_id     BIGINT        NOT NULL,
+  media_key   TEXT          NOT NULL,
+  cdn_url     TEXT          NOT NULL,
+  created_at  TIMESTAMPTZ   NOT NULL DEFAULT now(),
+  expires_at  TIMESTAMPTZ   NOT NULL GENERATED ALWAYS AS (created_at + INTERVAL '24 hours') STORED
+);
+
+CREATE INDEX idx_stories_user_expires ON stories (user_id, expires_at)
+  WHERE expires_at > now();
+```
+
+**feed_cache** (Redis, key per user):
+
+```
+Key:   feed:{userId}
+Type:  List (LPUSH on insert, LRANGE on read)
+Value: JSON-encoded array of ranked post_id strings, descending score
+TTL:   600 seconds (10 minutes)
+
+Example LRANGE feed:12345 0 19  →  ["post_9b4d1f2e", "post_7c2a3b1d", ...]
+```
+
+**engagement_events** (Kafka topic, partitioned by `post_id`):
+
+```
+Topic:   engagement.events
+Key:     post_id (string)
+Value:   {
+  "post_id":    "post_9b4d1f2e",
+  "user_id":    "usr_4411",
+  "event_type": "like",          // view | like | comment | share | save | reel_complete
+  "timestamp":  "2025-01-15T10:31:00Z",
+  "session_id": "sess_82f3a"
+}
+Retention: 7 days
+Consumers: RankingFeatureAggregator (Flink), EngagementCounterService, NotificationService
+```
+
+**seen_stories** (Redis Bloom filter, one filter per story):
+
+```
+Key:    story_seen:{storyId}
+Type:   RedisBloom BF.ADD / BF.EXISTS
+Params: error_rate=0.01, initial_capacity=5000
+TTL:    25 hours (matches media expiry)
+```
+
+The Bloom filter for story seen-state is a deliberate approximation. A 1% false positive rate means that roughly 1 in 100 stories will appear as "seen" to a viewer who has not actually seen it — the cost is one slightly reordered story ring. The benefit is that storing a set membership check for potentially millions of viewers per story in a Redis Bloom filter costs roughly 10 KB per filter at 5,000-viewer capacity versus tens of megabytes in a Set or sorted set. For creators who need exact viewer counts for analytics, a separate counter service reads from the `engagement.events` Kafka stream.
+
+## Architecture overview
+
+<Mermaid diagram={`flowchart TD
+  subgraph UploadPath["Upload Path"]
+    C1[Client] -->|"1 · POST /v1/media/upload"| API[Upload API]
+    API -->|"2 · returns pre-signed URLs"| C1
+    C1 -->|"3 · PUT chunks directly"| S3[S3 Object Store]
+    C1 -->|"4 · POST /complete"| API
+    API -->|"5 · publishes media.uploaded"| KafkaU[Kafka\nmedia.uploaded topic]
+    KafkaU -->|"6 · consumed by"| TW[TranscodeWorker\nFFmpeg cluster]
+    TW -->|"7 · write variants"| S3
+    TW -->|"8 · write variant metadata"| PG[Postgres\nmedia_variants]
+    TW -->|"9 · CDN origin push"| CDN[CloudFront CDN]
+    TW -->|"10 · publishes post.created"| KafkaP[Kafka\npost.created topic]
+    KafkaP -->|"11 · fan-out"| FS[FanoutService]
+    FS -->|"12 · invalidate follower caches"| Redis[Redis\nfeed caches]
+  end
+
+  subgraph ReadPath["Feed Read Path"]
+    C2[Client] -->|"GET /v1/feed"| FAPI[Feed API]
+    FAPI -->|"1 · LRANGE feed:userId"| Redis
+    Redis -->|"2a · cache hit"| FAPI
+    Redis -->|"2b · cache miss"| RS[RankingService]
+    RS -->|"3 · fetch candidates"| PG2[Postgres\nposts table]
+    RS -->|"4 · fetch signals"| ES[EngagementStore\nRedis counters]
+    RS -->|"5 · score + sort"| RS
+    RS -->|"6 · LPUSH + EXPIRE 600s"| Redis
+    FAPI -->|"7 · hydrate media variants"| PG2
+    FAPI -->|"8 · return FeedResponse"| C2
+  end`} />
+
+The diagram separates the upload path (write path) from the feed read path deliberately. The two paths share only the Postgres post database and the Redis feed cache. Everything else — the transcoding fleet, the fan-out service, the ranking service — operates asynchronously and does not block the feed read path. This isolation is the key to meeting the p99 < 200ms feed read SLA even when the transcoding fleet is under heavy load from a burst of uploads.
+
+## Deep dives
+
+### Media upload pipeline
+
+The naive upload architecture routes the media binary through the API server: client uploads to API server → API server writes to S3. This fails at scale for three reasons. First, API servers are CPU-optimized compute; they have 10–40 Gbps network interfaces, but running 3,500 simultaneous 100 MB Reel uploads would require 3,500 × 100 MB / 10 Gbps = 280 seconds of sustained bandwidth — clearly impossible on a single server and expensive to provision across a fleet. Second, keeping 100 MB payloads in API server memory means each active upload consumes 100 MB of heap — 1,000 concurrent uploads = 100 GB of heap, which exhausts any normal JVM before handling a single request normally. Third, API server bandwidth is not purpose-built for large sequential uploads; S3's transfer acceleration and multipart API are specifically optimized for this workload.
+
+The correct pattern is **client-direct-to-S3** via pre-signed URLs. The API server generates a pre-signed multipart upload URL for each chunk (5 MB chunks are the S3 minimum for multipart), returns them to the client, and the client uploads each chunk directly to S3 in parallel. The API server's involvement after the initiation step is zero until the client calls `/complete`. The `complete` call triggers S3's `CompleteMultipartUpload` API, which assembles the chunks server-side — no data moves back through the API layer.
+
+After the complete signal, the API server publishes a `media.uploaded` event to Kafka. TranscodeWorker pods (autoscaled via KEDA on Kafka consumer lag) pick up the event and invoke FFmpeg to generate variants:
+
+- For photos: thumbnail 320×320, medium 640px wide (maintain aspect ratio), full-resolution (original, losslessly re-encoded to strip EXIF GPS data)
+- For Reels: 720p H.264 MP4, 1080p H.264 MP4, HLS segmented playlist for adaptive bitrate delivery
+
+After transcoding, workers write variant S3 keys and CDN URLs to the `media_variants` Postgres table and call the CloudFront cache seeding API to warm the most popular edge PoPs before the first viewer requests the media. CDN pre-warming is the difference between a 5% CDN miss rate on new posts versus a 40% miss rate during the viral warm-up window.
+
+### Feed ranking
+
+Instagram's feed ranking is a two-stage pipeline: **candidate generation** followed by **lightweight scoring**.
+
+Candidate generation pulls the last 7 days of posts from all accounts the user follows, capped at 500 candidates. The candidate query runs against a Postgres index on `(user_id, created_at DESC)` for each followee — in practice, this is parallelized and results are merged in the ranking service. For users who follow more than 1,000 accounts, the candidate set is further pruned by pre-filtering followees who have posted in the last 48 hours, reducing the candidate pool to a tractable size.
+
+Scoring uses four feature families:
+
+**Recency**: exponential decay with a half-life of 12 hours. A post from 12 hours ago scores 0.5× relative to a post from the current moment. The decay formula is:
+
+$$
+\text{recency}(t) = e^{-\lambda \cdot \Delta t}, \quad \lambda = \frac{\ln 2}{12\text{h}}
+$$
+
+**Engagement rate**: `(likes + comments × 2 + shares × 3 + saves × 5) / reach`. Weighted engagement penalizes raw impression count and rewards deep engagement actions. The `reach` denominator is the number of times this post has already been shown to users — posts shown widely without generating engagement are scored down.
+
+**Relationship strength**: computed offline nightly from the last 90 days of interactions. Signals include DM frequency, comment history, mutual followers, and profile visit frequency. Stored as a float in a Redis hash `rel_strength:{userId}` keyed by followee ID.
+
+**Content-type preference**: the requesting user's historical engagement rate broken down by content type (photo vs. Reel vs. Carousel). A user who consistently watches 80% of Reels to completion gets a content-type boost applied to Reel candidates. Stored per user in Postgres `user_preferences` table, refreshed nightly.
+
+The combined score:
+
+$$
+\text{score} = 0.35 \cdot \text{recency} + 0.40 \cdot \text{engagementRate} + 0.15 \cdot \text{relationshipStrength} + 0.10 \cdot \text{contentTypePref}
+$$
+
+This scoring formula is a simplified logistic regression. In production, Instagram uses a multi-tower neural network trained on click-through and engagement data, but the feature categories are the same. For an interview, the explicit formula demonstrates you understand the tradeoffs between freshness, relevance, and social proximity.
+
+The ranked list (top 100 post IDs) is serialized as a JSON array and pushed to Redis with a 10-minute TTL. The feed API reads this list and hydrates post content from a PostCache (Redis) or Postgres on cache miss. The ranking service never sits on the read path — it runs on a schedule triggered by either cache expiry or a fan-out event from a followed account posting new content.
+
+### Fan-out strategy and celebrity accounts
+
+When a user with 1,000 followers posts a photo, the fan-out service invalidates (or overwrites) 1,000 Redis feed cache entries. At 1,157 posts/second × 1,000 followers average = 1.16 million cache writes per second — manageable with a Redis cluster of reasonable size.
+
+The problem arises with celebrity accounts. Kylie Jenner has 400 million Instagram followers. Fan-out-on-write for a 400M-follower account means writing 400 million cache entries per post. At 64 bytes per cache entry, that is 25.6 GB of data to write — in the best case, across hundreds of Redis shards, this still takes minutes and generates a thundering herd of cache invalidations that cascades into mass RankingService invocations.
+
+The solution is a **hybrid fan-out** with a threshold. Accounts with followers above a configurable threshold (approximately 1 million, matching the threshold documented in various Instagram and Twitter engineering write-ups) use **fan-out-on-read**: their posts are not pushed into follower feed caches. Instead, the feed API pulls posts from high-follower accounts directly at read time, merges them with the precomputed ranked list from Redis, and re-ranks inline. The inline merge is lightweight because celebrity posts form a small fraction of the candidate set — the heavy lifting (fetching 500 candidates from followed ordinary accounts) is already done from the Redis cache.
+
+The threshold logic in the FanoutService:
+
+```python
+if followee.follower_count < 1_000_000:
+    publish post_id to each follower's feed cache via Redis pipeline
+else:
+    write post to celebrity_posts:{postId} key in Redis (TTL 7 days)
+    no per-follower fan-out
+```
+
+At read time, the Feed API fetches the celebrity posts for each celebrity the user follows (at most 10–20 such accounts typically) and merges them with the Redis-cached ranked list before returning the response.
+
+### Stories architecture
+
+Stories have different storage, delivery, and state management requirements from regular posts, but they share the same S3 object store and CDN.
+
+**Expiry enforcement** operates at two independent layers for defense in depth. The primary enforcement is at the application layer: every Stories query filters `WHERE expires_at > now()`. The backup is an S3 lifecycle policy on the `stories/` prefix that deletes objects 25 hours after creation — a 1-hour buffer beyond the 24-hour app-layer cutoff to handle clock skew and delayed Postgres writes.
+
+**Seen-state** is tracked via Redis Bloom filters rather than a DB row or Redis Set. A Bloom filter with a 1% false positive rate and 5,000-viewer initial capacity requires roughly 7 KB of memory in Redis. Scaling to 500,000 viewers (a celebrity's Story) requires auto-expansion, which the RedisBloom module supports via `BF.ADD` with automatic scaling. The alternative — storing a Redis Set of viewer user IDs — would require approximately 8 bytes × 500,000 viewers = 4 MB per story in Redis memory. At 500 million Stories per day (Instagram's reported scale), that is 4 MB × 500M = 2 PB of Redis memory needed just for seen-state, which is not economically viable.
+
+**Story ordering**: the Stories ring shows unseen stories first (ordered by creator account's `last_story_created_at` descending), followed by seen stories (same ordering). The sort is computed at read time in the Stories API by joining the Postgres `stories` table result with the Redis Bloom filter result for each story ID. This is a small in-memory sort — a typical user follows 500 accounts, of which perhaps 50 have active Stories — so the sort is O(50 log 50), completing in microseconds.
+
+**Delivery URLs**: Story media is served via pre-signed CDN URLs with a 1-hour expiry. This is not the same as the 24-hour Story TTL — the 1-hour URL expiry forces clients to re-request the media URL every hour, giving the backend an opportunity to serve a 404 after the Story expires even if the client cached the URL from an earlier request. This prevents the common mistake of serving expired Story media from CDN cache because the CDN cached a 200 response that was valid when originally fetched.
+
+### Explore page
+
+The Explore page is architecturally isolated from the social graph, which is both a product decision and a systems decision. Decoupling from the social graph enables Explore to work for new users with no follows, provides a discovery mechanism orthogonal to the filter bubble of your follow graph, and allows the Explore pipeline to evolve independently of the feed ranking pipeline.
+
+The pipeline has three stages:
+
+**Content embedding**: every photo and Reel, upon upload completion, is passed through a CLIP-style multimodal encoder that produces a 512-dimensional embedding vector capturing visual and caption semantics. This embedding job runs asynchronously on GPU workers, publishing `{post_id, embedding_vector}` to a vector index. The vector index is FAISS (Facebook AI Similarity Search) running on CPU nodes — FAISS supports approximate nearest-neighbor (ANN) search at millisecond latency for 512-dimensional vectors across billions of indexed items.
+
+**User interest profile**: built from the user's engagement history on Explore and their home feed. Posts the user liked, commented on, or watched to completion contribute their embedding vectors to a user-level interest centroid (a running weighted average). The interest centroid is updated nightly and stored as a 512-dimensional vector per user in a Redis hash.
+
+**Serving**: at read time, the Explore API retrieves the user's interest centroid, runs a FAISS ANN query for the top 200 nearest post embeddings, applies a popularity re-ranker (upweights posts with high engagement rate in the last 6 hours), and returns the top 50 results. Results are cached per user for 30 minutes in Redis. Collaborative filtering overlays a "users like you also engaged with" signal: a separate model identifies the 100 users most similar in engagement history and injects their top-engaged posts of the last 24 hours as candidates before the ANN query.
+
+## Java integration
+
+### Part A — FeedRankingService.java
+
+```java
+package dev.pushkar.instagram.feed;
+
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Service;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Comparator;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+@Service
+public class FeedRankingService {
+
+    private static final int  CANDIDATE_LIMIT = 500;
+    private static final int  FEED_CACHE_SIZE = 100;
+    private static final long FEED_TTL_SECONDS = 600L;
+    private static final double DECAY_LAMBDA = Math.log(2) / 12.0;
+
+    private final PostRepository           postRepo;
+    private final EngagementSignalStore    signalStore;
+    private final RelationshipStrengthRepo relRepo;
+    private final StringRedisTemplate      redis;
+
+    public FeedRankingService(PostRepository postRepo,
+                              EngagementSignalStore signalStore,
+                              RelationshipStrengthRepo relRepo,
+                              StringRedisTemplate redis) {
+        this.postRepo    = postRepo;
+        this.signalStore = signalStore;
+        this.relRepo     = relRepo;
+        this.redis       = redis;
+    }
+
+    public List<Long> rankAndCache(long userId, List<Long> followeeIds) {
+        List<PostCandidate> candidates = postRepo
+            .findRecentByUserIds(followeeIds, Instant.now().minus(Duration.ofDays(7)), CANDIDATE_LIMIT);
+
+        List<Long> ranked = candidates.stream()
+            .map(p -> new ScoredPost(p.postId(), score(userId, p)))
+            .sorted(Comparator.comparingDouble(ScoredPost::score).reversed())
+            .limit(FEED_CACHE_SIZE)
+            .map(ScoredPost::postId)
+            .toList();
+
+        String key   = "feed:" + userId;
+        String value = String.join(",", ranked.stream().map(String::valueOf).toList());
+        redis.opsForValue().set(key, value, FEED_TTL_SECONDS, TimeUnit.SECONDS);
+        return ranked;
+    }
+
+    private double score(long userId, PostCandidate p) {
+        double recency     = recencyScore(p.createdAt());
+        double engagement  = signalStore.getEngagementRate(p.postId());
+        double relationship = relRepo.getStrength(userId, p.authorId());
+        double contentPref  = signalStore.getContentTypePref(userId, p.contentType());
+
+        return 0.35 * recency + 0.40 * engagement
+             + 0.15 * relationship + 0.10 * contentPref;
+    }
+
+    private double recencyScore(Instant createdAt) {
+        double deltaHours = Duration.between(createdAt, Instant.now()).toMinutes() / 60.0;
+        return Math.exp(-DECAY_LAMBDA * deltaHours);
+    }
+
+    private record ScoredPost(long postId, double score) {}
+}
+```
+
+The exponential decay function is worth examining carefully. With `DECAY_LAMBDA = ln(2) / 12`, a post that is exactly 12 hours old scores `e^(-ln(2)) = 0.5` — exactly half the score of a brand-new post. A post that is 24 hours old scores 0.25, and a 48-hour-old post scores 0.0625. This decay rate reflects Instagram's product goal: recent posts dominate, but well-engaged older content is not completely suppressed because the engagement signal (weighted 40%) can compensate for recency decay.
+
+### Part B — FeedController.java
+
+```java
+package dev.pushkar.instagram.feed;
+
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.security.Principal;
+import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@RestController
+@RequestMapping("/v1/feed")
+public class FeedController {
+
+    private static final int DEFAULT_PAGE_SIZE = 20;
+
+    private final StringRedisTemplate  redis;
+    private final FeedRankingService   rankingService;
+    private final PostHydrationService hydrator;
+    private final UserGraphService     graphService;
+
+    public FeedController(StringRedisTemplate redis,
+                          FeedRankingService rankingService,
+                          PostHydrationService hydrator,
+                          UserGraphService graphService) {
+        this.redis          = redis;
+        this.rankingService = rankingService;
+        this.hydrator       = hydrator;
+        this.graphService   = graphService;
+    }
+
+    @GetMapping
+    public ResponseEntity<FeedResponse> getFeed(
+            @RequestParam(defaultValue = "0") long cursor,
+            @RequestParam(defaultValue = "" + DEFAULT_PAGE_SIZE) int count,
+            Principal principal) {
+
+        long userId = Long.parseLong(principal.getName());
+        String cacheKey = "feed:" + userId;
+
+        String cached = redis.opsForValue().get(cacheKey);
+        List<Long> rankedIds;
+
+        if (cached == null || cached.isBlank()) {
+            List<Long> followeeIds = graphService.getFolloweeIds(userId);
+            rankedIds = rankingService.rankAndCache(userId, followeeIds);
+        } else {
+            rankedIds = Arrays.stream(cached.split(","))
+                .map(Long::parseLong)
+                .collect(Collectors.toList());
+        }
+
+        int fromIdx = cursorToIndex(rankedIds, cursor);
+        int toIdx   = Math.min(fromIdx + count, rankedIds.size());
+        List<Long> page = rankedIds.subList(fromIdx, toIdx);
+
+        List<PostDto> posts = hydrator.hydrate(page);
+        long nextCursor = toIdx < rankedIds.size() ? rankedIds.get(toIdx - 1) : -1L;
+
+        return ResponseEntity.ok(new FeedResponse(posts, nextCursor, nextCursor != -1L));
+    }
+
+    private int cursorToIndex(List<Long> ids, long cursor) {
+        if (cursor == 0L) return 0;
+        int idx = ids.indexOf(cursor);
+        return idx == -1 ? 0 : idx + 1;
+    }
+
+    public record FeedResponse(List<PostDto> posts, long nextCursor, boolean hasMore) {}
+}
+```
+
+The cursor-based pagination strategy deserves explanation. Rather than using `OFFSET n LIMIT k` (which requires scanning and discarding `n` rows in Postgres), the cursor is the last seen `post_id` from the previous page. The controller finds that ID's position in the ranked list stored in Redis and returns the next `count` items. This approach is O(1) for the pagination lookup against the in-memory list and stateless — the server stores no session data between requests. The trade-off is that if the ranked list is refreshed (Redis TTL expires and ranking reruns between page requests), the cursor may point to a different position in the new list. The fallback `idx == -1 ? 0 : idx + 1` restarts from the beginning in that case, which is acceptable — the user sees a fresh ranked feed rather than a stale continuation.
+
+<TradeoffTable title="Feed delivery strategy comparison">
+
+| Approach | Read Latency | Write Cost | Freshness | Storage |
+|---|---|---|---|---|
+| **Pure fan-out-on-write** | Sub-millisecond (Redis list read, no computation) | O(followers) per post — catastrophic for celebrity accounts with 400M followers; write amplification is unbounded | High — feed is updated immediately on post; TTL-based staleness only | O(followers × feed_size) — 1M users × 100 posts = 100M Redis entries minimum |
+| **Pure fan-out-on-read** | High — must query all followee post tables at read time, merge, and rank; p99 easily > 2s at scale | O(1) per post — only write to the author's post table | Perfect — always reflects the latest posts at read time | O(posts) — only the post tables; no per-user feed materialization |
+| **Hybrid (follower-count threshold)** | Low for ordinary accounts (precomputed cache); moderate overhead for celebrity posts (inline merge at read time) | O(min(followers, threshold)) per post — bounded write amplification; celebrities get O(1) write cost | High — ordinary account posts appear within cache TTL (10 min); celebrity posts appear immediately at next read | O(non-celebrity-followers × feed_size) — significantly less than pure fan-out-on-write |
+| **Pre-ranked Redis cache (Instagram's approach)** | Sub-millisecond on cache hit (LRANGE); ~500ms on cache miss (ranking + hydration) | Cache invalidation on new post from followed account; ranking runs offline every 10 min; negligible per-post write cost | Moderate — feed is up to 10 minutes stale by design (TTL); acceptable for a ranked, non-chronological feed | O(users × feed_cache_size) — 2B users × 100 post IDs × 8 bytes = 1.6 TB Redis — feasible across a Redis cluster |
+
+</TradeoffTable>
+
+<Pitfall title="Cache stampede on fan-out — invalidating all follower caches simultaneously">
+
+When a followed account posts and the FanoutService deletes (or expires) all follower feed caches simultaneously, every follower's next feed request becomes a cache miss. If the account has 500,000 followers and all of them check Instagram within the next 10 minutes, the RankingService receives 500,000 concurrent cold-start ranking requests — each of which fans out to Postgres queries for candidate posts, Redis reads for engagement signals, and a serialization write back to Redis. The resulting thundering herd can collapse the RankingService and cascade into Postgres overload.
+
+The correct mitigations are probabilistic early expiry (also known as XFetch or jitter-based early recomputation) and lazy invalidation. With probabilistic early expiry, each cache entry has a small probability of being considered "expired" even before its actual TTL, with probability increasing as the TTL approaches zero. This staggers cache refreshes across time rather than bunching them at the TTL boundary. Lazy invalidation is simpler: instead of deleting follower caches on post, simply let them expire naturally. The new post will appear in the follower's feed the next time the cache is recomputed (within 10 minutes). For a ranked, non-chronological feed, a 10-minute delay in a new post appearing is a perfectly acceptable product behavior — Instagram users are not expecting real-time chronological updates.
+
+If you do need faster delivery (for close-friend posts, for example), use a targeted invalidation that only refreshes the cache for followers who have been active in the last 30 minutes — typically a small fraction of total followers — and lets the rest pick up the post on their next natural cache refresh.
+
+</Pitfall>
+
+<Pitfall title="Storing Story viewer lists in a database row or a large Redis Set">
+
+A common first instinct is to store the list of users who have seen a Story as an array column in Postgres or a Redis Set: `SADD story_seen:{storyId} {viewerUserId}`. This works fine at 1,000 viewers. At 1 million viewers (which is routine for any mid-tier influencer on Instagram), a Redis Set of 1M 8-byte integers consumes 8 MB per story. Instagram reports 500 million Stories per day — even if only 0.1% of Stories reach 1M viewers, that is 500,000 large Sets consuming 4 TB of Redis memory just for seen-state. The Postgres array approach is worse: it requires updating a potentially gigabyte-sized array on every view event, generating write amplification that kills insert throughput.
+
+The correct data structure is a Redis Bloom filter (via the RedisBloom module or a client-side implementation). A Bloom filter with a 1% false positive rate and initial capacity of 5,000 viewers requires approximately 7 KB regardless of actual viewer count, with automatic scaling to handle more viewers while maintaining the error rate. The `BF.ADD` operation is O(k) where k is the number of hash functions (typically 7 for a 1% error rate), making it blindingly fast. The 1% false positive rate means that 1 in 100 Stories will appear as already-seen to a viewer who has not seen it — the viewer sees the Story in the "seen" ring rather than the "unseen" ring. This is an acceptable product degradation; the alternative is an order-of-magnitude increase in Redis memory cost.
+
+For creators who need exact viewer counts and viewer identity for analytics (the "X people have seen your Story" display), maintain a separate counter in Redis (`INCR story_view_count:{storyId}`) and write viewer identity to a Kafka topic for async aggregation into an analytics store (Druid or BigQuery). The real-time display shows the approximate counter; the exact viewer list is available in the creator analytics dashboard after a processing delay.
+
+</Pitfall>
+
+<Curveball question="A celebrity with 200 million followers posts a Reel and all 200 million followers open Instagram within 60 seconds. How do you prevent your ranking service and Postgres from being overwhelmed?">
+
+This scenario stress-tests three layers simultaneously: the fan-out service (does it try to write 200M cache entries?), the RankingService (does every follower trigger a cold-start ranking?), and Postgres (does every ranking job query the post table?).
+
+Layer 1 — fan-out: the celebrity's account exceeds the 1M-follower threshold, so the fan-out service does not write to any follower feed cache. Instead, it writes the post to a `celebrity_posts:{postId}` Redis key with a 7-day TTL. Zero write amplification for the fan-out step.
+
+Layer 2 — feed cache behavior: since no cache was invalidated, all 200M followers' existing feed caches are intact. When a follower opens Instagram, the feed API reads their existing Redis cache (a cache hit). The celebrity's post is not in the cached ranked list — it will appear via the inline merge that the feed API performs for celebrity accounts. This inline merge fetches the top 5 celebrity posts from Redis (not Postgres), re-ranks them against the existing cache, and inserts them into the response. No RankingService invocation, no Postgres query.
+
+Layer 3 — the CDN warming problem: 200M users requesting the Reel within 60 seconds means 200M CDN cache lookups for the Reel's video segments. If the CDN edge nodes have not cached the Reel yet, 200M requests simultaneously hit the CDN origin (S3 + CloudFront). The mitigation is CDN pre-warming: the upload pipeline proactively pushes the Reel to CDN edge nodes in top-traffic regions immediately after transcoding completes, using CloudFront's cache-seeding API. For the most-followed accounts, pre-warming can be triggered before the post is even published (pre-positioning during the processing window).
+
+Layer 4 — the Kafka consumer: the `post.created` event for this post is processed by the FanoutService, which determines the fan-out strategy in milliseconds. No storm propagates downstream. The engagement events that flow from 200M views (like events, Reel completions) do generate a Kafka throughput spike on the `engagement.events` topic — the RankingFeatureAggregator (Flink) must handle this spike. Partitioning `engagement.events` by `post_id` means all events for this Reel go to one partition group. Ensure the Flink job auto-scales on consumer lag and that the Kafka partition count is high enough to distribute the 200M events across multiple consumers.
+
+</Curveball>
+
+<Curveball question="Implement 'Close Friends' Stories — visible only to a curated list of up to 150 followers. How does this change your fan-out and seen-state architecture?">
+
+Close Friends introduces access control at the content layer — a post is visible to a subset of followers, not all of them. This has cascading effects on the fan-out, the feed cache, the Stories ring, and the seen-state tracking.
+
+**Fan-out change**: the FanoutService must look up the author's Close Friends list (stored as a Redis Set `close_friends:{userId}`, max 150 members) and fan-out the Story only to those members. The fan-out is now O(150) regardless of the author's total follower count — even a celebrity with 200M followers fans out Close Friends Stories to at most 150 Redis entries. This is strictly cheaper than ordinary Story delivery.
+
+**Stories ring change**: the Stories API currently fetches all active Stories from Postgres and filters by `expires_at > now()`. With Close Friends, the query must add `AND (is_public = true OR ? = ANY(close_friends_user_ids))`. The `close_friends_user_ids` column on the `stories` table would be an integer array — feasible for 150 members, but array membership checks in Postgres (`= ANY(...)`) are linear in array size. At 150 members, this is fast; it would not scale to 10,000 members. Alternatively, the FanoutService writes Close Friends Story IDs to a per-recipient Redis Set `cf_stories:{recipientUserId}`, and the Stories API for that recipient fetches from that Set rather than querying Postgres with a permissions check. This shifts the access control enforcement to the fan-out phase (write time) rather than the read phase.
+
+**Seen-state change**: the Bloom filter approach still works for Close Friends Stories. With a maximum of 150 viewers, the Bloom filter memory cost is trivially small (under 1 KB per Story). If exact viewer identity is needed (which makes more sense for Close Friends than for public Stories), a Redis Set is now economically viable at 150 × 8 bytes = 1,200 bytes per Story — well within budget.
+
+**CDN delivery**: Close Friends Story media must not be publicly accessible via CDN URL guessing. The media S3 key should be unguessable (UUID-based, not sequential), and CDN delivery should use pre-signed URLs with viewer-specific tokens rather than public CDN URLs. Each Close Friends Story view generates a fresh pre-signed URL with the viewer's user ID embedded, allowing the backend to audit access.
+
+</Curveball>
+
+<Curveball question="Instagram wants to add a 'Collab' feature where two users co-author a single post that appears in both their followers' feeds. Walk through the data model and fan-out changes.">
+
+The Collab feature breaks a key assumption in the current data model: every post has exactly one `user_id` author. A Collab post has two authors, and the post must appear in the feeds of both authors' follower sets.
+
+**Data model change**: add a `post_collaborators` table:
+
+```sql
+CREATE TABLE post_collaborators (
+  post_id      BIGINT  NOT NULL REFERENCES posts(post_id),
+  user_id      BIGINT  NOT NULL,
+  role         TEXT    NOT NULL DEFAULT 'collaborator',
+  accepted_at  TIMESTAMPTZ,
+  PRIMARY KEY (post_id, user_id)
+);
+CREATE INDEX idx_collab_user ON post_collaborators (user_id);
+```
+
+The `posts` table retains its original `user_id` as the primary author (the initiating user). The collaborator's acceptance triggers a state change in `post_collaborators.accepted_at`. Before the collaborator accepts, the post appears only in the primary author's profile and feed. After acceptance, the post appears in both profiles and fans out to both follower sets.
+
+**Fan-out change**: the FanoutService, upon receiving a `collaborator.accepted` Kafka event, must fan-out the post to the collaborator's followers in addition to the primary author's followers (which may have already been fanned out at post creation time). This is additive — the collaborator's followers receive a feed cache invalidation pointing to the same post ID. The post itself does not need to be duplicated in storage.
+
+**Feed API change**: the ranked feed must now include posts where `user_id` is a followee OR where the post appears in `post_collaborators` for a followee. The simplest implementation: when the FanoutService fans out to the collaborator's followers, it writes `post_id` into their feed cache entries exactly as it would for an ordinary post by that author. From the feed cache's perspective, the post appears to have been authored by the collaborator — the display layer resolves authorship from `posts` and `post_collaborators` tables and shows both avatars.
+
+**Profile page change**: both authors' profile grids must display the Collab post. The profile page query currently fetches `posts WHERE user_id = ?`. With Collabs, it must UNION with `post_collaborators WHERE user_id = ? AND accepted_at IS NOT NULL`. This adds one indexed query per profile page load — acceptable at Postgres scale with the `idx_collab_user` index.
+
+**Edge case — uncollab**: if one author removes themselves from the Collab post, the post must be removed from their profile and their followers' feeds must be invalidated. The FanoutService handles this as a `collaborator.removed` event, writing a tombstone into the collaborator's followers' feed caches.
+
+</Curveball>
+
+## Further reading
+
+- [Instagram Engineering Blog: "Storing Hundreds of Millions of Simple Objects with Cassandra" (2012)](https://instagram-engineering.com/storing-hundreds-of-millions-of-simple-objects-with-cassandra-and-redis-at-instagram-5f0e6b53fe30) — Instagram's early-stage infrastructure post describing how they used Cassandra alongside Redis to handle their rapidly growing media metadata. The post is notable for being written when Instagram had only 3 engineers, illustrating how thoughtful data model choices compound into significant scale headroom before additional engineers are needed.
+- ["How Instagram Scaled to 14 Million Users with Only 3 Engineers" — High Scalability Blog](http://highscalability.com/blog/2012/4/16/how-instagram-scaled-to-14-million-users-with-only-3-enginee.html) — A detailed technical breakdown of Instagram's early architecture decisions: Django + uWSGI for the API layer, Postgres with sharding for user data, Redis for the activity feed, Solr for search, and Gearman for task queues. The original architecture shows which components the team considered "solved problems" (media storage, CDN) versus active differentiators (feed ranking, notifications).
+- [Facebook AI Research: "Powered by AI: Instagram's Explore Recommender System" (2019)](https://ai.meta.com/blog/powered-by-ai-instagrams-explore-recommender-system/) — The definitive public description of Instagram's Explore recommendation pipeline, including the two-stage candidate retrieval and ranking architecture, the embedding approach (using account-level embeddings derived from engagement history), and the infrastructure powering real-time serving. The paper's discussion of the candidate retrieval recall vs. latency tradeoff is directly applicable to any interest-based recommendation system.
+
+<RelatedQuestions items={[
+  { slug: "twitter-timeline", title: "Design Twitter Timeline", difficulty: "senior" },
+  { slug: "facebook-news-feed", title: "Design Facebook News Feed", difficulty: "senior" },
+  { slug: "youtube-design", title: "Design YouTube", difficulty: "senior" },
+]} />

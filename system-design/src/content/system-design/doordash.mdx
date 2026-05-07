@@ -1,0 +1,747 @@
+---
+title: "Design DoorDash"
+slug: "doordash"
+category: "commerce"
+difficulty: "senior"
+estimatedReadMinutes: 23
+tags: ["delivery", "matching", "geospatial", "order-tracking", "restaurant-catalog", "dasher", "real-time"]
+companyFlavors: ["DoorDash", "Uber Eats", "Grubhub", "Instacart"]
+prerequisites: ["uber-ride-matching", "stripe-payment-gateway", "design-a-cache"]
+relatedQuestions: ["uber-ride-matching", "amazon-product-catalog", "airbnb"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design DoorDash's food delivery platform: restaurant catalog with real-time menu updates, three-sided marketplace matching (customer → restaurant → Dasher), order state machine, real-time delivery tracking, and the operational complexity of coordinating kitchen prep time with Dasher arrival."
+javaPackages:
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+  - "org.springframework.boot:spring-boot-starter-data-jpa:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "org.springframework.boot:spring-boot-starter-websocket:3.3.0"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="doordash" title="Design DoorDash" />
+
+<Tldr>
+- **Three-sided marketplace**: customer places order → restaurant accepts and preps → Dasher picks up → delivers; each transition is a state machine event, and **timing coordination is the hard problem** — a Dasher who arrives before food is ready wastes time standing in a restaurant lobby; a Dasher who arrives too late finds cold food that will generate a one-star review.
+- **ETA-aware Dasher dispatch**: find available Dashers within the geohash cell of the restaurant; assign to the Dasher whose estimated arrival time at the restaurant most closely matches the restaurant's predicted ready time — not simply the nearest Dasher; minimizing the gap `|travel_time - remaining_prep_time|` is the core dispatch objective function.
+- **Order state machine**: `PLACED → RESTAURANT_ACCEPTED → PREPARING → READY_FOR_PICKUP → DASHER_PICKED_UP → DELIVERED` with cancellation escape hatches at each pre-pickup step; hot state lives in Redis for fast reads during tracking, durable state in PostgreSQL, and a Kafka event fires on every transition to fan out to notification, analytics, and billing services.
+- **Real-time tracking**: customers see the Dasher moving on a map during delivery; the Dasher's mobile app sends WebSocket location updates every 4 seconds → Location Service writes to Redis Geo → if the Dasher is on an active delivery, the update is published to a per-order Kafka topic → Order Tracking Service pushes the coordinates to the customer's WebSocket connection.
+- **Restaurant catalog**: menus are stored in PostgreSQL as the source of truth with item-level availability toggles (86'ing an out-of-stock item); updates flow through Kafka to Elasticsearch within 30 seconds for search freshness; cart validation always hits PostgreSQL directly so a customer can never place an order for an item that was 86'd between browse and checkout.
+</Tldr>
+
+## The scale of the problem
+
+DoorDash launched in 2013 as a small Stanford experiment delivering food from restaurants that did not offer their own delivery. By 2024 it had become the dominant food delivery platform in the United States, with approximately 37 million active customers, 700,000 restaurant partners, and 7 million registered Dashers (delivery contractors). The platform processes more than 2 billion orders per year, which averages to roughly 63 orders per second — but the distribution is anything but uniform. Peak demand on events like Super Bowl Sunday or Valentine's Day can reach 10x the average, and demand is highly localized: a single neighborhood in San Francisco may spike while the rest of the country is quiet.
+
+Food delivery is meaningfully harder to design than ride-sharing, and understanding why is essential before touching any system diagram. Uber and Lyft are **two-sided** marketplaces: a rider and a driver, one pickup location, one destination. The moment the driver picks up the passenger, the service is nearly complete — delivery starts. DoorDash is a **three-sided** marketplace: a customer, a restaurant, and a Dasher, with three separate parties whose timing must be precisely coordinated. The restaurant is not a passive participant. It must accept the order, cook the food, and signal when the food is ready. That kitchen introduces a latency variable — estimated prep time — that has no equivalent in ride-sharing. A restaurant that estimates 15-minute prep time but actually takes 30 minutes causes a Dasher to wait 15 minutes in a restaurant lobby. That Dasher is not earning money, and when the food finally arrives at the customer's door it is lukewarm. The damage flows in multiple directions simultaneously: Dasher economics suffer, food quality suffers, and customer satisfaction scores drop.
+
+The system also operates across two fundamentally different interaction patterns that must coexist in the same platform. The **catalog experience** — browsing restaurants, viewing menus, reading reviews, building a cart — is latency-sensitive but not real-time: a menu page that loads in 150ms feels fast, and stale data is acceptable as long as the checkout validates against the source of truth. The **dispatch and tracking experience** — from the moment an order is placed through delivery — is genuinely real-time: a Dasher's GPS position must be visible on the customer's map within 10 seconds of the Dasher moving, and the order state machine must be consistent across the restaurant tablet, the Dasher app, the customer app, and DoorDash's internal operations dashboard simultaneously. Building a system that handles both the high-read catalog pattern and the real-time coordination pattern under one umbrella, at the scale of 7 million active Dashers, is the core engineering challenge.
+
+## Clarifying questions
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| What is the maximum delivery radius? | Up to 15 km from the restaurant to the customer; the restaurant itself defines a delivery radius in its merchant settings | Bounds the GEORADIUS search space for Dasher dispatch and constrains the Elasticsearch geo_distance filter for restaurant search |
+| What order types are in scope? | Delivery only — not pickup (customer collects from restaurant) or dine-in for this design | Removes the in-restaurant experience, Dasher routing back to HQ, and customer self-pickup flows from scope |
+| Is real-time tracking mandatory? | Yes — customers expect to see the Dasher moving on a map; this is a core product requirement, not a nice-to-have | Drives the need for WebSocket infrastructure for both Dashers (push location) and customers (receive location); no polling model will meet the 10-second freshness requirement at scale |
+| How do restaurants manage their menus? | Mix of manual management via the Merchant Portal tablet app and POS system integration for large chains (McDonald's, Chipotle, Starbucks push menu updates via API) | POS integration means DoorDash must maintain an ingestion pipeline for external menu updates alongside the manual management API; availability changes from POS must reflect in under 30 seconds |
+| Are group orders in scope? | Yes — multiple participants can add items to a shared cart before the creator places the combined order; split-payment support is needed | Group orders require a separate coordination data model (order_groups, per-participant carts, payment splitting) and a deadline mechanism after which the order locks |
+| Is DashPass (subscription) in scope? | No — subscription tier management and fee overrides are out of scope for this design | DashPass affects pricing logic (zero delivery fee for subscribers) but does not change the core dispatch or state machine design; bracket it as a billing concern |
+| Is alcohol or age-verification delivery in scope? | No — age-gated products require in-person ID verification flows and regulatory compliance that are out of scope | Simplifies the delivery confirmation step; no ID scan required at dropoff |
+| Are scheduled orders (ordering now, delivering at a future time) in scope? | Yes — customers can schedule delivery up to 7 days in advance; dispatch must account for the scheduled delivery window | Scheduled orders require a separate scheduling queue and trigger delayed dispatch so the Dasher arrives at the restaurant near the scheduled time, not immediately when the order is placed |
+
+## Functional requirements
+
+- Customers can browse restaurants near their delivery address, filtered and ranked by cuisine type, delivery ETA, rating, and price range; restaurant pages display menus with item availability in real time.
+- Customers can add items to a cart, apply promo codes, view a fee breakdown (subtotal, delivery fee, service fee, taxes), and place an order backed by a stored payment method; cart validation at checkout must verify item availability against the live menu source of truth.
+- After placing an order, customers receive real-time status updates (order placed, restaurant accepted, Dasher assigned, Dasher picked up, delivered) and see the Dasher's live GPS position on a map during the delivery phase.
+- Restaurant partners receive incoming orders on a tablet app in real time (WebSocket push); they accept orders with an estimated prep time, update item availability (86'ing out-of-stock items), and mark orders as ready for pickup.
+- DoorDash's Dasher dispatch system assigns the most suitable available Dasher to each accepted order, accounting for Dasher proximity to the restaurant and the restaurant's estimated food-ready time; Dashers receive order offers via the app and can accept or decline.
+- Dashers use turn-by-turn navigation to the restaurant for pickup and to the customer for delivery; they confirm pickup and delivery via the app, which triggers state machine transitions and triggers notifications to the customer.
+
+## Non-functional requirements
+
+- **Scale**: 37M active customers, 700K restaurant partners, 7M registered Dashers (3.5M active at peak); 2B+ orders per year; 63 orders/s average, up to 634 orders/s at peak.
+- **Menu page load**: p99 < 200ms for restaurant menu pages (served from cache); cold cache fallback to PostgreSQL must complete within 500ms.
+- **Order placement**: p99 < 1 second end-to-end (validation + payment authorization + Kafka publish + acknowledgement).
+- **Dasher dispatch**: a suitable Dasher must be offered the delivery within 2 minutes of a restaurant accepting the order; if the first Dasher declines, re-dispatch must complete within an additional 90 seconds.
+- **Location update freshness**: customer-visible Dasher position must be no more than 10 seconds stale during active delivery.
+- **Availability**: 99.99% uptime for the order placement and tracking paths (< 52 minutes downtime per year); restaurant browse and catalog can tolerate brief degradation with stale cache serving.
+- **Consistency**: order state must be consistent across restaurant tablet, Dasher app, and customer app; a Dasher cannot mark an order as PICKED_UP if the restaurant has not marked it as READY_FOR_PICKUP; state transitions are guarded by a Redis lock and validated server-side.
+
+<Capacity title="DoorDash Capacity Estimates">
+**Orders per second**
+
+$$\frac{2{,}000{,}000{,}000 \text{ orders/year}}{365 \times 86{,}400 \text{ s/year}} \approx 63.4 \text{ orders/s average}$$
+
+Peak on Super Bowl Sunday or Valentine's Day reaches $10\times$ average $\approx 634$ orders/s. This is comfortably within a single Kafka cluster's throughput, but dispatch compute (routing API calls per order) must be pre-warmed for the 10x burst.
+
+**Dasher location updates**
+
+$$7{,}000{,}000 \text{ Dashers} \times 50\% \text{ active} = 3{,}500{,}000 \text{ active Dashers} \times \frac{1 \text{ update}}{4\text{s}} = 875{,}000 \text{ location updates/s}$$
+
+At 875K writes/s, location updates must be batched or partitioned. Redis Geo partitioned by `city_id` handles this: each city's geo set receives a bounded write rate, and GEORADIUS queries over a city-scoped set return only relevant candidates.
+
+**Restaurant menu reads**
+
+$$\frac{37{,}000{,}000 \text{ customers} \times 3 \text{ browses/session} \times 5 \text{ sessions/week}}{7 \text{ days} \times 86{,}400 \text{ s/day}} \approx 918 \text{ menu reads/s}$$
+
+At $\approx 918$ menu reads/s, a Redis cache with 5-minute TTL absorbs the vast majority of reads. Hot restaurants (top 0.1%) may receive 50–100 menu reads/s each; these cache entries should be pre-warmed on restaurant opening hours.
+
+**Restaurant search queries**
+
+$$\frac{37{,}000{,}000 \times 2 \text{ sessions/week}}{7 \times 86{,}400} \approx 1{,}224 \text{ restaurant searches/s}$$
+
+Elasticsearch with a dedicated search cluster handles $1{,}224$ searches/s easily; p99 latency target is 100ms for a geo+text query. Shard by geography (city or metro area) to keep shard sizes bounded.
+
+**Order state events**
+
+$$63.4 \text{ orders/s} \times 7 \text{ state transitions} = 443.8 \text{ Kafka events/s}$$
+
+Essentially trivial for a Kafka cluster. The state event topic is valuable not for throughput but for decoupling: Notification Service, Analytics Pipeline, and Billing Service all consume independently without coupling to the Order Service.
+</Capacity>
+
+## API design
+
+### Customer-facing API
+
+```
+GET /api/v1/restaurants
+  ?lat={latitude}
+  &lng={longitude}
+  &delivery_time={now|scheduled}
+  &cuisine={cuisine_type}
+  &sort={eta|rating|price}
+  &limit=20
+  &cursor={pagination_cursor}
+→ RestaurantSearchResult {
+    restaurants: [{
+      restaurant_id, name, cuisine_types, avg_rating,
+      delivery_eta_minutes, delivery_fee_cents, is_open_now,
+      thumbnail_url, distance_km
+    }],
+    next_cursor
+  }
+```
+
+```
+GET /api/v1/restaurants/{restaurant_id}/menu
+→ Menu {
+    restaurant_id, name, address, open_hours,
+    avg_prep_time_minutes,
+    categories: [{
+      category_name,
+      items: [{
+        item_id, name, description, price_cents,
+        is_available, dietary_flags, image_url
+      }]
+    }]
+  }
+```
+
+```
+POST /api/v1/orders
+Body: {
+  restaurant_id: "rest_abc123",
+  items: [{ item_id: "item_xyz", quantity: 2, customizations: ["no onions"] }],
+  delivery_address: { street, city, lat, lng },
+  payment_method_id: "pm_stripe_abc",
+  scheduled_for: null,
+  idempotency_key: "client-generated-uuid"
+}
+→ OrderResponse {
+    order_id, status: "PLACED",
+    estimated_delivery_eta: "2025-01-15T19:45:00Z",
+    subtotal_cents, delivery_fee_cents, service_fee_cents, total_cents
+  }
+```
+
+```
+GET /api/v1/orders/{order_id}/tracking
+→ TrackingResponse {
+    order_id, status,
+    restaurant: { name, address },
+    dasher: {
+      name, photo_url,
+      location: { lat, lng },
+      estimated_arrival_at
+    } | null,
+    estimated_delivery_at,
+    state_history: [{ status, occurred_at }]
+  }
+```
+
+### Restaurant tablet API
+
+```
+GET  /api/v1/restaurant/orders           → paginated incoming/active orders queue
+PATCH /api/v1/restaurant/orders/{order_id}/accept
+  Body: { estimated_prep_time_minutes: 18 }
+  → { status: "RESTAURANT_ACCEPTED", dispatch_triggered_at }
+
+PATCH /api/v1/restaurant/orders/{order_id}/ready
+  → { status: "READY_FOR_PICKUP", ready_at }
+
+PATCH /api/v1/menu/items/{item_id}/availability
+  Body: { is_available: false }
+  → { item_id, is_available: false, updated_at }
+```
+
+The restaurant tablet also maintains a persistent WebSocket connection to receive `NEW_ORDER` and `DASHER_APPROACHING` push events without polling.
+
+### Dasher API
+
+```
+WebSocket: wss://dasher.doordash.com/connect
+  Client → Server: { type: "LOCATION_UPDATE", lat, lng, accuracy_m, timestamp }
+  Server → Client: { type: "ORDER_OFFER", delivery_id, restaurant, customer,
+                     estimated_pay_cents, pickup_eta_minutes, delivery_eta_minutes }
+  Server → Client: { type: "OFFER_EXPIRED" }
+
+POST /api/v1/dasher/deliveries/{delivery_id}/accept
+POST /api/v1/dasher/deliveries/{delivery_id}/decline
+
+PATCH /api/v1/dasher/deliveries/{delivery_id}/status
+  Body: { status: "PICKED_UP" | "DELIVERED", lat, lng, photo_url? }
+```
+
+## Data model
+
+### PostgreSQL — core relational data
+
+```sql
+CREATE TABLE restaurants (
+  restaurant_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name            TEXT NOT NULL,
+  address         TEXT NOT NULL,
+  lat             DOUBLE PRECISION NOT NULL,
+  lng             DOUBLE PRECISION NOT NULL,
+  city            TEXT NOT NULL,
+  cuisine_types   TEXT[] NOT NULL,
+  avg_rating      NUMERIC(3,2),
+  delivery_radius_km SMALLINT NOT NULL DEFAULT 8,
+  is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+  prep_time_minutes_avg SMALLINT NOT NULL DEFAULT 20,
+  open_hours      JSONB NOT NULL,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE menu_items (
+  item_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  restaurant_id   UUID NOT NULL REFERENCES restaurants(restaurant_id),
+  name            TEXT NOT NULL,
+  description     TEXT,
+  price_cents     INT NOT NULL,
+  is_available    BOOLEAN NOT NULL DEFAULT TRUE,
+  category        TEXT NOT NULL,
+  image_key       TEXT,
+  dietary_flags   TEXT[],
+  display_order   SMALLINT NOT NULL DEFAULT 0,
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_menu_items_restaurant ON menu_items(restaurant_id) WHERE is_available = TRUE;
+
+CREATE TABLE orders (
+  order_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  customer_id         UUID NOT NULL,
+  restaurant_id       UUID NOT NULL REFERENCES restaurants(restaurant_id),
+  dasher_id           UUID,
+  items               JSONB NOT NULL,
+  subtotal_cents      INT NOT NULL,
+  delivery_fee_cents  INT NOT NULL,
+  service_fee_cents   INT NOT NULL,
+  total_cents         INT NOT NULL,
+  status              TEXT NOT NULL DEFAULT 'PLACED',
+  delivery_address    JSONB NOT NULL,
+  delivery_lat        DOUBLE PRECISION,
+  delivery_lng        DOUBLE PRECISION,
+  idempotency_key     TEXT UNIQUE NOT NULL,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  accepted_at         TIMESTAMPTZ,
+  ready_at            TIMESTAMPTZ,
+  picked_up_at        TIMESTAMPTZ,
+  delivered_at        TIMESTAMPTZ,
+  estimated_delivery_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_orders_customer ON orders(customer_id, created_at DESC);
+CREATE INDEX idx_orders_restaurant ON orders(restaurant_id, status) WHERE status NOT IN ('DELIVERED','CANCELLED');
+CREATE INDEX idx_orders_dasher ON orders(dasher_id, status) WHERE dasher_id IS NOT NULL;
+```
+
+### Redis — hot operational state
+
+```yaml
+# Order hot state — TTL 4h
+key:   "order:{order_id}"
+type:  Hash
+fields:
+  status:          PREPARING
+  dasher_id:       dasher_abc123
+  dasher_lat:      37.7749
+  dasher_lng:      -122.4194
+  prep_ready_at:   1705352700
+  estimated_delivery_at: 1705353600
+
+# Dasher status — TTL 30s (refreshed on heartbeat)
+key:   "dasher:{dasher_id}"
+type:  Hash
+fields:
+  status:           AVAILABLE          # AVAILABLE | ON_DELIVERY | OFFLINE
+  current_order_id: null
+  last_seen:        1705352600
+
+# Dasher locations — partitioned by city
+key:   "dashers:{city_id}"
+type:  Sorted Set (Redis Geo)
+       GEOADD dashers:san_francisco -122.4194 37.7749 dasher_abc123
+
+# Dispatch offer response — TTL 20s
+key:   "dispatch-response:{order_id}:{dasher_id}"
+type:  String
+value: "ACCEPTED" | "DECLINED"
+```
+
+### Elasticsearch — restaurant search index
+
+```yaml
+index: restaurants
+mappings:
+  restaurant_id:       keyword
+  name:                text (analyzed) + keyword (for sorting)
+  cuisine_types:       keyword (multi-value)
+  location:            geo_point
+  avg_rating:          float
+  is_open_now:         boolean
+  is_active:           boolean
+  delivery_eta_minutes: integer
+  delivery_radius_km:  integer
+  prep_time_minutes_avg: integer
+  price_tier:          integer  # 1-4 ($, $$, $$$, $$$$)
+
+settings:
+  number_of_shards: 6   # shard by city/metro in production
+  number_of_replicas: 2
+```
+
+## System flows
+
+<Mermaid diagram={`flowchart TD
+  A[Customer App] -->|POST /api/v1/orders| B[Order Service]
+  B -->|Validate items| C[(PostgreSQL\nMenu Items)]
+  B -->|Charge payment| D[Stripe]
+  B -->|INSERT order status=PLACED| E[(PostgreSQL\nOrders)]
+  B -->|SET order:id hash| F[(Redis\nOrder State)]
+  B -->|Publish order-placed| G[Kafka]
+  G -->|Consume| H[Restaurant Push Service]
+  H -->|WebSocket push NEW_ORDER| I[Restaurant Tablet]
+  I -->|PATCH accept + prep_time_minutes| B
+  B -->|Update status=RESTAURANT_ACCEPTED| E
+  B -->|Publish order-accepted| G
+  G -->|Consume| J[Dispatch Service]
+  J -->|GEORADIUS dashers:city_id| F
+  J -->|Filter AVAILABLE dashers| F
+  J -->|ETA API for each candidate| K[Routing Service]
+  J -->|Score = abs travel_time - prep_time| J
+  J -->|WebSocket push ORDER_OFFER| L[Dasher App]
+  L -->|POST accept| J
+  J -->|SET dasher status=ON_DELIVERY| F
+  J -->|Publish dasher-assigned| G
+  G -->|Consume| M[Notification Service]
+  M -->|Push notify| A
+  I -->|PATCH ready| B
+  B -->|Update status=READY_FOR_PICKUP| E
+  L -->|PATCH status=PICKED_UP| B
+  B -->|Update status=DASHER_PICKED_UP| E
+  L -->|PATCH status=DELIVERED| B
+  B -->|Update status=DELIVERED| E
+  B -->|Publish order-delivered| G
+  G -->|Consume| N[Billing Service]
+  N -->|Capture payment\nSettle Dasher pay| D`} />
+
+<Mermaid diagram={`flowchart LR
+  A[Dasher App] -->|WebSocket loc update every 4s| B[Location Service]
+  B -->|GEOADD dashers:city_id lng lat dasher_id| C[(Redis Geo)]
+  B -->|Is dasher ON_DELIVERY?| D[(Redis\ndasher:id hash)]
+  D -->|Yes: current_order_id| B
+  B -->|Publish to dasher-location-orderId topic| E[Kafka]
+  E -->|Consume by order_id affinity| F[Order Tracking Service]
+  F -->|Update order:id dasher_lat dasher_lng| C
+  F -->|Push LocationUpdate event| G[Customer WebSocket]
+  G -->|Map pin moves| H[Customer App]`} />
+
+## Deep dives
+
+### ETA-aware Dasher dispatch
+
+The most common mistake candidates make in this interview is treating DoorDash dispatch as equivalent to Uber dispatch: find the nearest available driver and assign them. That heuristic works for ride-sharing because the moment the driver picks up the passenger, value is delivered. In food delivery, the Dasher must first travel to the restaurant, then wait (if food is not ready), then travel to the customer. Every minute the Dasher waits at the restaurant is dead time — the Dasher is not earning, the food is getting colder, and the kitchen staff is annoyed by someone standing in their way.
+
+The correct objective function for dispatch minimizes the absolute timing gap between the Dasher's arrival at the restaurant and the food's readiness:
+
+$$\text{score}(d) = \left| \text{travel\_time}(d \rightarrow r) - \text{remaining\_prep\_time}(r) \right|$$
+
+where $d$ is a candidate Dasher and $r$ is the restaurant. The Dasher with the lowest score is the best dispatch candidate.
+
+The dispatch algorithm runs as follows:
+
+1. **Candidate retrieval**: `GEORADIUS dashers:{city_id} {restaurant_lng} {restaurant_lat} 8.0 km WITHCOORD WITHDIST COUNT 50 ASC` — get the 50 nearest Dashers by raw distance. Distance is a first-pass filter, not the ranking criterion.
+
+2. **Availability filter**: for each candidate Dasher, check `HMGET dasher:{dasher_id} status current_order_id` — discard any Dasher not in `AVAILABLE` status. This can be done with a Redis pipeline to issue all HMGET commands in a single round trip.
+
+3. **ETA computation**: for each remaining candidate, call the Routing Service with the Dasher's current lat/lng and the restaurant's lat/lng to get `travel_time_minutes`. The Routing Service uses a graph-based shortest-path algorithm (Dijkstra or A*) over a road network weighted by real-time traffic data. Results can be cached by `(origin_cell, dest_cell)` using H3 hexagonal grid cells at resolution 9 (~174m cell edge) — ETAs within the same cell pair are identical to within 1 minute accuracy.
+
+4. **Scoring and ranking**: compute `score = |travel_time - remaining_prep_time|` for each candidate. Sort ascending. The top candidate is offered the delivery first.
+
+5. **Offer and response**: push an `ORDER_OFFER` event to the Dasher's WebSocket connection with a 20-second accept window. Poll `dispatch-response:{order_id}:{dasher_id}` in Redis (written by the Dasher's accept/decline endpoint). If the Dasher accepts within 20 seconds, lock in the assignment. If they decline or timeout, move to the next ranked candidate.
+
+6. **Fallback expansion**: if all 50 initial candidates decline or are unavailable, expand the radius to 12 km and repeat. If still no match after 3 minutes, escalate to a human operator queue and notify the customer of a delay.
+
+**Scheduled orders**: when a customer schedules delivery for 7pm, the Dispatch Service must not dispatch a Dasher at noon. Instead, a scheduled job (backed by a priority queue in Redis ZSET keyed by `scheduled_delivery_time`) fires the dispatch trigger approximately `restaurant_avg_prep_time + estimated_dasher_travel_time` minutes before the desired delivery time. The system works backwards from the desired delivery time to compute when dispatch should trigger.
+
+### Restaurant catalog and menu management
+
+The restaurant catalog serves two distinct query patterns with different freshness requirements: **search** (find restaurants near me matching these filters) and **menu display** (show me every item on this restaurant's menu with current availability).
+
+**Menu storage and caching**: the canonical menu lives in PostgreSQL, partitioned by `restaurant_id`. This is the source of truth. Every cart operation and checkout validates against PostgreSQL directly — never against cache — because an item that was `is_available = TRUE` when the customer opened the menu page may have been 86'd in the 5 minutes they spent customizing their order. A stale cache hit leading to a confirmed order for an unavailable item creates a cancellation that damages all three sides of the marketplace.
+
+For the read path, menus are cached in Redis as serialized JSON with a key of `restaurant:{restaurant_id}:menu` and a 5-minute TTL. Cache invalidation is event-driven: when a restaurant updates item availability, the Order Service publishes a `menu-item-updated` Kafka event. A Cache Invalidation Consumer reads this event and executes `DEL restaurant:{restaurant_id}:menu` in Redis. The next menu read for that restaurant will be a cache miss, fetching fresh data from PostgreSQL and repopulating the cache.
+
+**86'ing an item (out-of-stock)**: the `PATCH /api/v1/menu/items/{item_id}/availability` endpoint executes two writes in a transaction: `UPDATE menu_items SET is_available = FALSE WHERE item_id = ?` in PostgreSQL, and publishes the `menu-item-updated` event. The Elasticsearch partial update consumer picks up the event and issues an Elasticsearch partial update (`_update` API with `doc: { is_available: false }`) within 30 seconds. This lag is acceptable for search (a customer searching for restaurants will not see the unavailable item in search results within 30s at most), but unacceptable for checkout (hence the PostgreSQL validation).
+
+**POS integration**: large chains operate their own point-of-sale systems that track real-time inventory — a Chipotle franchise knows exactly when it runs out of sofritas. These chains integrate via a push API: `POST /api/v1/merchant/menu/batch-update` with a list of item availability changes. DoorDash's Merchant Ingestion Service accepts these payloads, validates them, and processes them through the same Kafka pipeline as manual updates. The batch endpoint is idempotent (keyed on `item_id + is_available + updated_at`) so network retries from the POS system do not create duplicate invalidations.
+
+**Search relevance**: Elasticsearch powers restaurant discovery. The search query combines a `geo_distance` filter (customer lat/lng within `restaurant.delivery_radius_km`) with a BM25 relevance score on restaurant name and cuisine types, multiplied by a `function_score` that boosts on `avg_rating` and penalizes on `delivery_eta_minutes`. The is_open_now filter is computed at query time by comparing the current UTC time against the restaurant's `open_hours` JSONB field — this filter is applied as a pre-filter (not a post-filter) so Elasticsearch's query cache can be populated. Results are paginated using a `search_after` cursor based on `[score DESC, restaurant_id ASC]`.
+
+### Order state machine and restaurant coordination
+
+The order state machine is the operational heart of the platform. Every state transition has a real-world meaning and a business rule that governs when it is valid:
+
+| Transition | Trigger | Guard condition | Downstream effect |
+|---|---|---|---|
+| `PLACED → RESTAURANT_ACCEPTED` | Restaurant tablet PATCH accept | Order in PLACED state | Dispatch Service triggered; customer notified |
+| `RESTAURANT_ACCEPTED → PREPARING` | Restaurant tablet (implicit on accept) | None | Dasher dispatch clock starts |
+| `PREPARING → READY_FOR_PICKUP` | Restaurant PATCH ready | Order in PREPARING; Dasher assigned | Dasher notified to proceed to restaurant |
+| `READY_FOR_PICKUP → DASHER_PICKED_UP` | Dasher PATCH status=PICKED_UP | Order in READY_FOR_PICKUP | Customer notified; food-in-transit tracking begins |
+| `DASHER_PICKED_UP → DELIVERED` | Dasher PATCH status=DELIVERED | Order in DASHER_PICKED_UP | Payment captured; Dasher earnings credited |
+
+**State consistency**: state is maintained in two layers. Redis holds the hot operational state (`order:{order_id}` hash) for fast reads during tracking. PostgreSQL holds the durable state and the full transition timestamp history. Every state transition goes through an optimistic locking pattern: `UPDATE orders SET status = ? WHERE order_id = ? AND status = ?` — the `AND status = ?` guard ensures no two concurrent transitions can both succeed. If the PostgreSQL update affects 0 rows, the transition is rejected (the order is no longer in the expected state) and the caller receives a 409 Conflict.
+
+**Cancellation windows**: the cancellation policy is asymmetric. Customers can cancel freely before `RESTAURANT_ACCEPTED` (full refund, restaurant is not impacted). After the restaurant accepts but before `DASHER_PICKED_UP`, customers can still cancel but pay a cancellation fee (the restaurant has consumed ingredients and labor). After `DASHER_PICKED_UP`, cancellation is not allowed — the food is in transit. Restaurants can cancel before `PREPARING` (rare, typically due to ingredient outage) with a full customer refund and no Dasher impact. After `PREPARING`, restaurant cancellation triggers a manual review flow.
+
+**Kafka event fan-out**: every state transition publishes a Kafka event to the `order-state-events` topic (keyed by `order_id` for partition affinity). Consumers include:
+- **Notification Service**: sends push notifications to the customer ("Your Dasher has picked up your order!") and Dasher ("Food is ready at Chipotle — head to pickup").
+- **Analytics Pipeline**: writes to the data warehouse for SLA tracking, Dasher performance metrics, and restaurant prep-time accuracy analysis.
+- **Billing Service**: listens for `DELIVERED` events to capture the Stripe payment (pre-authorized at order placement) and initiate Dasher earnings credit.
+- **ETA Recalculation Service**: listens for `DASHER_PICKED_UP` events to compute and publish a revised delivery ETA based on real-time Dasher location and current traffic.
+
+### Real-time delivery tracking
+
+Once an order reaches `DASHER_PICKED_UP`, the customer's most important concern is: where is my food right now, and when will it arrive? The tracking system must deliver sub-10-second location freshness without overwhelming either the Dasher's mobile data or the server infrastructure.
+
+**Dasher location pipeline**: the Dasher app sends a location update via WebSocket every 4 seconds. The payload is minimal: `{ lat, lng, accuracy_m, timestamp, bearing }`. The Location Service receives this and performs two writes:
+1. `GEOADD dashers:{city_id} {lng} {lat} {dasher_id}` — updates the Dasher's position in the city geo set (used for dispatch lookups).
+2. If `dasher:{dasher_id}.status == ON_DELIVERY`, publish `{ dasher_id, order_id, lat, lng, timestamp }` to the `dasher-location-{order_id}` Kafka topic.
+
+**Customer push pipeline**: the Order Tracking Service consumes the `dasher-location-{order_id}` topic, partitioned by `order_id` so that all location events for a given order go to the same consumer instance. The consumer maintains an in-memory map of `order_id → [customer WebSocket connection]`. When a location event arrives, it pushes a `LOCATION_UPDATE` message directly to the customer's WebSocket. No polling. No database read. The round-trip from Dasher movement to customer map pin update is typically 2–4 seconds (4s send interval + sub-1s Kafka lag + sub-100ms push latency).
+
+**ETA recalculation**: every 30 seconds during an active delivery, the ETA Recalculation Service recomputes the estimated delivery time by calling the Routing Service with the Dasher's current position and the customer's delivery address. The revised ETA is pushed to the customer's WebSocket as an `ETA_UPDATE` event and written to `order:{order_id}.estimated_delivery_at` in Redis. The ML-based ETA model (trained on historical delivery patterns) reduces ETA error from ±15 minutes (naive straight-line distance estimate) to ±5 minutes by incorporating time-of-day, weather conditions, restaurant prep time variance, and neighborhood traffic density as features.
+
+### Group orders
+
+Group ordering introduces a pre-order coordination phase between the initial browsing intent and the actual order placement. The data model requires a separate coordination layer:
+
+```sql
+CREATE TABLE order_groups (
+  group_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  creator_user_id UUID NOT NULL,
+  restaurant_id  UUID NOT NULL REFERENCES restaurants(restaurant_id),
+  delivery_address JSONB NOT NULL,
+  deadline       TIMESTAMPTZ NOT NULL,
+  status         TEXT NOT NULL DEFAULT 'COLLECTING',
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE group_order_items (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  group_id       UUID NOT NULL REFERENCES order_groups(group_id),
+  user_id        UUID NOT NULL,
+  item_id        UUID NOT NULL,
+  quantity       SMALLINT NOT NULL DEFAULT 1,
+  customizations JSONB,
+  price_cents    INT NOT NULL,
+  added_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(group_id, user_id, item_id)
+);
+```
+
+When the creator sets a deadline, a scheduled job fires at `deadline` time: all `group_order_items` for the group are merged into a single restaurant order, payment is split (each participant's items charged to their own stored payment method via Stripe PaymentIntents), and the combined order is submitted through the standard `POST /api/v1/orders` flow. If one participant's payment fails, their items are removed from the group order and the remaining items proceed — the creator is notified that the group is incomplete.
+
+## Java integration
+
+### Part A — DasherDispatchService.java
+
+```java
+package com.doordash.dispatch;
+
+import io.lettuce.core.GeoArgs;
+import io.lettuce.core.GeoWithin;
+import io.lettuce.core.api.sync.RedisCommands;
+import org.springframework.stereotype.Service;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Service
+public class DasherDispatchService {
+
+    private final RedisCommands<String, String> redis;
+    private final RoutingService etaService;
+    private final DasherNotificationService notifier;
+
+    public DasherDispatchService(RedisCommands<String, String> redis,
+                                  RoutingService etaService,
+                                  DasherNotificationService notifier) {
+        this.redis    = redis;
+        this.etaService = etaService;
+        this.notifier = notifier;
+    }
+
+    public Optional<String> dispatchDasher(String orderId,
+                                           double restaurantLat,
+                                           double restaurantLng,
+                                           int remainingPrepMinutes,
+                                           String cityId) {
+        GeoArgs args = new GeoArgs()
+                .withDistance().withCoordinates()
+                .sortAscending().count(50);
+
+        List<GeoWithin<String>> candidates = redis.georadius(
+                "dashers:" + cityId, restaurantLng, restaurantLat,
+                8.0, GeoArgs.Unit.km, args);
+
+        List<ScoredDasher> ranked = candidates.stream()
+                .filter(c -> isAvailable(c.getMember()))
+                .map(c -> {
+                    double cLng = c.getCoordinates().getX().doubleValue();
+                    double cLat = c.getCoordinates().getY().doubleValue();
+                    int travel = etaService.getEtaMinutes(cLat, cLng,
+                            restaurantLat, restaurantLng);
+                    int score  = Math.abs(travel - remainingPrepMinutes);
+                    return new ScoredDasher(c.getMember(), score);
+                })
+                .sorted(Comparator.comparingInt(ScoredDasher::score))
+                .collect(Collectors.toList());
+
+        for (ScoredDasher sd : ranked) {
+            notifier.pushOffer(sd.dasherId(), orderId);
+            String response = pollForResponse(orderId, sd.dasherId(), 20_000);
+            if ("ACCEPTED".equals(response)) {
+                redis.hset("dasher:" + sd.dasherId(), "status", "ON_DELIVERY");
+                redis.hset("dasher:" + sd.dasherId(), "current_order_id", orderId);
+                redis.hset("order:" + orderId, "dasher_id", sd.dasherId());
+                return Optional.of(sd.dasherId());
+            }
+        }
+        return Optional.empty();
+    }
+
+    private boolean isAvailable(String dasherId) {
+        String status = redis.hget("dasher:" + dasherId, "status");
+        return "AVAILABLE".equals(status);
+    }
+
+    private String pollForResponse(String orderId, String dasherId, long timeoutMs) {
+        String key = "dispatch-response:" + orderId + ":" + dasherId;
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            String val = redis.get(key);
+            if (val != null) return val;
+            try { Thread.sleep(500); } catch (InterruptedException e) {
+                Thread.currentThread().interrupt(); break;
+            }
+        }
+        return "TIMEOUT";
+    }
+
+    private record ScoredDasher(String dasherId, int score) {}
+}
+```
+
+### Part B — OrderController.java
+
+```java
+package com.doordash.order;
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.web.bind.annotation.*;
+import io.lettuce.core.api.sync.RedisCommands;
+import java.util.Map;
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/api/v1")
+public class OrderController {
+
+    private final OrderRepository        orderRepo;
+    private final MenuItemRepository     menuRepo;
+    private final StripeService          stripe;
+    private final KafkaTemplate<String, Object> kafka;
+    private final RedisCommands<String, String> redis;
+    private final DeliveryFeeService     feeService;
+
+    public OrderController(OrderRepository orderRepo, MenuItemRepository menuRepo,
+                           StripeService stripe, KafkaTemplate<String, Object> kafka,
+                           RedisCommands<String, String> redis,
+                           DeliveryFeeService feeService) {
+        this.orderRepo  = orderRepo;   this.menuRepo = menuRepo;
+        this.stripe     = stripe;      this.kafka    = kafka;
+        this.redis      = redis;       this.feeService = feeService;
+    }
+
+    @PostMapping("/orders")
+    public ResponseEntity<OrderResponse> placeOrder(@RequestBody PlaceOrderRequest req) {
+        menuRepo.validateAllAvailable(req.items());
+
+        int subtotalCents  = menuRepo.computeSubtotal(req.items());
+        int deliveryFeeCents = feeService.compute(req.restaurantId(), req.deliveryAddress());
+        int serviceFeeCents  = (int)(subtotalCents * 0.15);
+        int totalCents       = subtotalCents + deliveryFeeCents + serviceFeeCents;
+
+        String chargeId = stripe.authorize(req.paymentMethodId(), totalCents,
+                req.idempotencyKey());
+
+        Order order = orderRepo.create(req, subtotalCents, deliveryFeeCents,
+                serviceFeeCents, totalCents, chargeId);
+
+        redis.hset("order:" + order.orderId(), "status", "PLACED");
+        kafka.send("order-placed", order.orderId(), order);
+
+        return ResponseEntity.ok(new OrderResponse(order.orderId(), "PLACED",
+                order.estimatedDeliveryAt(), totalCents));
+    }
+
+    @GetMapping("/orders/{orderId}/tracking")
+    public ResponseEntity<TrackingResponse> getTracking(@PathVariable String orderId) {
+        Map<String, String> state = redis.hgetall("order:" + orderId);
+        if (state == null || state.isEmpty())
+            return ResponseEntity.notFound().build();
+
+        String dasherId = state.get("dasher_id");
+        if (dasherId == null)
+            return ResponseEntity.ok(TrackingResponse.searching(state.get("status")));
+
+        double dasherLat = Double.parseDouble(state.get("dasher_lat"));
+        double dasherLng = Double.parseDouble(state.get("dasher_lng"));
+        return ResponseEntity.ok(TrackingResponse.withDasher(
+                state.get("status"), dasherId, dasherLat, dasherLng,
+                state.get("estimated_delivery_at")));
+    }
+}
+```
+
+## Tradeoffs: Dispatch timing strategies
+
+<TradeoffTable
+  columns={["Approach", "Dispatch Timing", "ETA Accuracy", "System Complexity", "Food Freshness"]}
+  rows={[
+    [
+      "Earliest Dasher dispatch (minimize wait time)",
+      "Dasher dispatched immediately on restaurant acceptance; arrives as fast as physically possible",
+      "Poor — no regard for kitchen timing; Dasher often waits 15-25 min at restaurant",
+      "Low — nearest available Dasher, simple distance sort",
+      "Poor — Dasher stands in restaurant; food cools while waiting in bag"
+    ],
+    [
+      "ETA-aware dispatch (minimize timing gap)",
+      "Dasher dispatched so arrival at restaurant matches predicted ready time within ±3 min",
+      "Good — timing gap minimized; Dasher arrives just as food comes out",
+      "Medium — requires per-candidate routing API calls; increases dispatch latency by ~5s",
+      "Good — food goes from kitchen to bag to customer with minimal wait time"
+    ],
+    [
+      "Batched dispatch (stack multiple orders per Dasher)",
+      "Dasher picks up 2-3 orders from nearby restaurants in one run; dispatch is deferred until batch is full",
+      "Moderate — stacking degrades ETA for later orders in the batch by 10-20 min",
+      "High — requires solving a variant of the vehicle routing problem per batch; combinatorial explosion",
+      "Moderate — first order in batch stays fresh; last order may arrive cold"
+    ],
+    [
+      "DoorDash actual (ETA-aware + ML prep time prediction)",
+      "ETA-aware dispatch with ML model predicting actual prep time (not restaurant-stated prep time)",
+      "Best — ML model reduces ETA error from ±15 min to ±5 min using prep time variance, day-of-week, weather",
+      "High — requires ML inference service in dispatch hot path; model must be refreshed on historical data",
+      "Best — timing gap minimized using real prep time prediction, not optimistic restaurant self-report"
+    ]
+  ]}
+/>
+
+<Pitfall>
+**Dispatching the nearest Dasher by raw distance without accounting for restaurant prep time.** At first glance, minimizing Dasher travel time to the restaurant sounds correct — get the Dasher there as fast as possible. But if the nearest Dasher arrives in 3 minutes and the kitchen has 25 minutes of prep time remaining, that Dasher waits 22 minutes standing in a restaurant lobby. This burns 22 minutes of the Dasher's earning potential (they could have taken another delivery), adds stress to the restaurant's front-of-house staff who must repeatedly tell the Dasher to wait, and guarantees that the food sits in a to-go bag for 22 minutes before being picked up — degrading temperature and quality. The correct dispatch objective is minimizing `|travel_time_to_restaurant - remaining_prep_time|`, not minimizing `travel_time_to_restaurant` in isolation. ETA-aware matching is not an optimization on top of the system; it is the core correctness property of the dispatch algorithm.
+</Pitfall>
+
+<Pitfall>
+**Storing all active Dasher locations in a single global Redis Geo set.** At 3.5 million active Dashers, a `GEORADIUS` query on a global set returns an enormous initial candidate set that must be filtered, and the query itself becomes slow because Redis must scan the entire sorted set structure. More practically: a customer in San Francisco should never trigger a dispatch candidate lookup that evaluates Dashers in Miami. Partition the geo set by `city_id` or by H3 hexagonal grid cell at an appropriate resolution (H3 resolution 4 covers metro areas well). The dispatch query becomes `GEORADIUS dashers:{city_id} ...` — bounded to the relevant geography, returning only candidates who could physically make the delivery, and fast because the set is orders of magnitude smaller than a global set.
+</Pitfall>
+
+<Curveball>
+**"Super Bowl Sunday: every Domino's and pizza restaurant in San Francisco gets 300 simultaneous orders in 5 minutes. How do your restaurant dispatch and Dasher matching systems handle the surge without food getting cold?"**
+
+The core problem is demand-supply imbalance: 300 orders × 20-minute prep time = restaurants are backed up 60+ minutes, but there may only be 200 available Dashers in the city. Several mechanisms help:
+
+First, **surge pricing** (higher delivery fees, higher Dasher pay multipliers) draws offline Dashers back online — this is a demand-shaping and supply-expansion tool that kicks in automatically when available Dashers per active order in a city falls below a threshold.
+
+Second, **dispatch delay for long-prep orders**: if a restaurant's estimated prep time is 45 minutes (overwhelmed kitchen), the Dispatch Service should not dispatch a Dasher immediately on order acceptance. Instead, it schedules dispatch for `(45 - avg_dasher_travel_time)` minutes later, preventing Dashers from stacking up at the restaurant.
+
+Third, **restaurant-level rate limiting**: the Merchant Portal can cap incoming orders per hour ("order pacing") to prevent the kitchen from being overwhelmed into quality collapse. DoorDash surfaces this to restaurants as a suggested setting, but restaurants can opt in voluntarily.
+
+Fourth, **ETA inflation**: the ML ETA model, trained on Super Bowl Sunday data from prior years, will naturally produce higher ETA estimates reflecting congested streets and overwhelmed kitchens — setting accurate customer expectations upfront reduces cancellation rates during surges.
+
+The failure mode to avoid is dispatching all 200 Dashers simultaneously to 200 different restaurants, leaving each Dasher waiting 40 minutes at the restaurant while 100 orders have no Dasher at all. Coordinated dispatch pacing with delayed trigger times is the answer.
+</Curveball>
+
+<Curveball>
+**"A restaurant tablet loses connectivity mid-order — they've accepted the order and set a prep time, but they can't mark the order as READY_FOR_PICKUP. The Dasher arrives at the restaurant. What does your system do?"**
+
+This is a real operational scenario that DoorDash handles regularly. Several detection and recovery mechanisms apply:
+
+**Connectivity detection**: the restaurant tablet maintains a WebSocket connection to the Restaurant Push Service with a 30-second heartbeat. When heartbeats are missed for 90 seconds, the Push Service marks the restaurant connection as `DISCONNECTED` and publishes a `restaurant-connectivity-lost` event. This event triggers an alert to DoorDash's Restaurant Operations team and suppresses new order routing to that restaurant.
+
+**Dasher at restaurant flow**: the Dasher app has a "restaurant is not responding" button. When pressed, the Dasher's location (verified to be within 100m of the restaurant's coordinates via geofencing) triggers a manual escalation flow. A DoorDash support agent is notified and can perform a server-side `FORCE_READY` state transition — overriding the restaurant's normal PATCH ready endpoint. This requires human verification (the agent may call the restaurant directly) to confirm the food is actually ready.
+
+**Dasher compensation**: if the Dasher waits more than 10 minutes beyond the original estimated ready time due to restaurant issues, DoorDash automatically credits a waiting-time payment to the Dasher's account, compensating for the lost earning time.
+
+**Preventive measure**: for restaurants with historically poor connectivity (flagged by frequent heartbeat failures), DoorDash's Merchant Operations team proactively suggests upgrading their internet connection or switching to the cellular-backup tablet model. Repeat offenders can have their restaurant status automatically degraded in search ranking.
+</Curveball>
+
+<Curveball>
+**"DoorDash wants to launch DashMart — DoorDash-owned convenience stores with guaranteed 15-minute delivery. How does this change your dispatch algorithm and inventory management compared to restaurant delivery?"**
+
+DashMart fundamentally changes two subsystems: inventory management and dispatch constraints.
+
+**Inventory management**: unlike restaurants (where DoorDash has no visibility into kitchen inventory), DashMart warehouses are DoorDash-owned infrastructure. Every item in a DashMart has a real-time inventory count in DoorDash's own database — updated on every order and every restock scan. This means the "is_available" problem is solved deterministically: no 86'ing lag, no POS integration ambiguity. The cart validation at checkout hits a live inventory count with optimistic locking (`UPDATE inventory SET count = count - 1 WHERE item_id = ? AND count > 0`) — if the decrement affects 0 rows, the item is out of stock and the order is rejected before payment. This is tighter than the restaurant flow, which only validates `is_available` (a boolean set manually) rather than actual count.
+
+**Dispatch for 15-minute guarantee**: a 15-minute total delivery time is extremely aggressive. Breaking it down: picking items in the warehouse takes 3-5 minutes, Dasher travel to customer takes 7-10 minutes. This leaves essentially no margin. The DashMart dispatch algorithm must pre-position Dashers (keeping 2-3 Dashers idle inside or immediately outside the DashMart at all times during operating hours) rather than reactively searching for available Dashers. This is a fundamentally different model — the Dasher pool for a DashMart location is dedicated and local, not drawn from the city-wide geo pool. The dispatch query becomes: `SELECT dasher_id FROM dashmart_standby WHERE dashmart_id = ? AND status = 'STANDBY' LIMIT 1` — a simple database lookup, not a geospatial search. This eliminates the ETA-aware matching problem entirely: the Dasher is already at the DashMart when the order arrives.
+
+**ETA guarantee enforcement**: when DoorDash guarantees 15-minute delivery, they must also back it up with a refund policy (late delivery = free order). This requires the ETA tracking system to flag orders approaching the SLA boundary and trigger an escalation — potentially dispatching a second Dasher if the primary is delayed.
+</Curveball>
+
+## Further reading
+
+- **DoorDash Engineering Blog: "Evolution of DoorDash's Dispatch System"** — The engineering team's public writeup on how they moved from a greedy nearest-Dasher model to an ETA-optimized dispatch algorithm, including the machine learning layer for prep time prediction.
+- **DoorDash Engineering Blog: "How DoorDash Standardized and Improved Microservices with gRPC"** — Covers the internal service mesh migration that enabled the low-latency inter-service communication required for real-time dispatch; particularly relevant for the Routing Service and Location Service interaction.
+- **H3: Uber's Hexagonal Hierarchical Geospatial Indexing System** — The H3 library (open-sourced by Uber) provides hierarchical hexagonal grid cells that work equally well for delivery dispatch as for ride-sharing; H3 resolution 7 (~1.2km cell edge) is a practical partition granularity for Dasher geo sets in dense urban markets.
+
+<RelatedQuestions items={[
+  { slug: "uber-ride-matching", title: "Design Uber Ride Matching", difficulty: "senior" },
+  { slug: "amazon-product-catalog", title: "Design Amazon's Product Catalog", difficulty: "senior" },
+  { slug: "airbnb", title: "Design Airbnb", difficulty: "senior" },
+]} />

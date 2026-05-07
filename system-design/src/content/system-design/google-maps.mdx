@@ -1,0 +1,459 @@
+---
+title: "Design Google Maps + Routing"
+slug: "google-maps"
+category: "search-maps"
+difficulty: "senior"
+estimatedReadMinutes: 22
+tags: ["geospatial", "tile-pyramid", "contraction-hierarchies", "dijkstra", "real-time-traffic", "s2-cells", "eta"]
+companyFlavors: ["Google Maps", "Apple Maps", "HERE", "OpenStreetMap", "Waze"]
+prerequisites: []
+relatedQuestions: ["yelp-nearby-places", "google-search", "typeahead-autocomplete"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Design the core systems behind Google Maps: a tile-based map rendering pipeline, a routing engine using Contraction Hierarchies for sub-second driving directions on billions of edges, and a real-time traffic ingestion system that continuously updates route weights."
+javaPackages: ["org.locationtech.jts:jts-core:1.19.0", "org.springframework.boot:spring-boot-starter-webflux:3.3.0", "redis.clients:jedis:5.1.3"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="google-maps" title="Design Google Maps + Routing" />
+
+<Tldr>
+- Map tiles are pre-rendered at zoom levels 0–22 (zoom 0 = whole world, zoom 22 = building-level). Tile pyramid: at zoom z, there are 4^z tiles. Zoom 18 alone = 68 billion tiles. All tiles cached at CDN edge nodes globally.
+- Routing graph: Earth's road network contains ~1 billion edges. Vanilla Dijkstra on 1B edges takes minutes per query. Contraction Hierarchies (CH) precomputes "shortcut" edges that skip low-importance nodes, reducing query time to milliseconds on the same graph.
+- Real-time traffic: hundreds of millions of devices send GPS pings every 15–30 seconds. A streaming pipeline aggregates pings into per-segment speed observations, updates edge weights in the routing graph, and triggers re-routing if a faster path emerges.
+- S2 cells (Google's spherical geometry library): decompose Earth's surface into a hierarchy of quadrilateral cells on a Hilbert space-filling curve. A cell at level 14 covers roughly 600 m². Used for geospatial indexing — mapping a GPS coordinate to the set of road segments it belongs to runs in O(1).
+- ETA = sum of (edge length / edge speed) along the chosen route, corrected by an ML model trained on historical completion times. Model features: time of day, day of week, live traffic observations, weather, and historical ETA error on geometrically similar routes. Google reports a range ("Arrive between 3:15 and 3:25"), not a point estimate.
+</Tldr>
+
+## Why maps is a different class of problem
+
+Most system design questions ask you to optimize one dominant variable: write throughput (Kafka), read latency (cache), or consistency (distributed lock). Google Maps is different because it is simultaneously three unrelated systems that happen to share a geographic coordinate space. The first is a **static tile serving pipeline** — pre-rendering rasterized images of the planet at 23 zoom levels and delivering them from CDN edge nodes in under 200 ms worldwide. The second is a **graph routing engine** — running shortest-path algorithms over a road network with a billion edges fast enough that a user never waits. The third is a **real-time stream processing pipeline** — ingesting hundreds of millions of GPS pings per minute from mobile devices, aggregating them into per-segment speed estimates, and feeding those estimates back into the routing graph continuously.
+
+These three subsystems interact but are architecturally independent. The tile pipeline is a batch ETL job that runs when map data changes. The routing engine is a query engine over an in-memory graph. The traffic pipeline is a streaming job that produces edge weight updates. Interviews that conflate them — treating "serving maps" and "computing routes" as one system — miss the opportunity to reason clearly about any of the three. Your first move in an interview is to name all three, scope which ones you'll design, and ask which matters most to the interviewer.
+
+The routing engine is usually the most interesting at the staff level, because it exposes a genuine algorithmic constraint: Dijkstra does not scale to a planetary road network. Solving that constraint — without moving to impractical hardware or compromising correctness — is what Contraction Hierarchies accomplish, and understanding CH at the conceptual level is the signal that separates senior from staff engineers on this problem.
+
+## Clarifying questions
+
+These eight questions establish the design space before any diagram is drawn.
+
+| Question | Ideal answer |
+|---|---|
+| Map display, routing, or both? | Both — but tile serving and routing are separate services; scope the deep dive |
+| Transport modes (driving, walking, transit, cycling)? | Driving as primary; walking and cycling as secondary; transit as a separate graph problem |
+| Is real-time traffic required? | Yes — route recommendations should reflect current road conditions, not just historical speed limits |
+| Global or regional coverage? | Global — Earth's full road network; implies geographic sharding of the routing graph |
+| ETA accuracy requirement? | Within 5% of actual travel time; measure accuracy on completed trips, not predicted speed |
+| Offline maps support? | Out of scope for this design — offline adds tile caching on-device and a local routing engine |
+| Turn-by-turn navigation vs. just a route? | Full turn-by-turn — the system must generate human-readable maneuvers, not just a waypoint list |
+| Mobile or web client? | Both — mobile sends GPS pings and receives tiles; web does not contribute traffic data |
+
+## Functional requirements
+
+- Display map tiles for any (latitude, longitude, zoom) triple; tile must load in under 200 ms globally
+- Compute a point-to-point route (fastest or shortest distance) for driving, walking, or cycling
+- Overlay real-time traffic conditions on both the map view and the routing computation
+- Calculate and display ETA with a confidence interval; re-calculate ETA as the user progresses along the route
+- Generate turn-by-turn navigation instructions (e.g., "In 300 m, turn right onto Market Street")
+- Support address search and geocoding: convert a free-text address to a canonical (lat, lng) coordinate and vice versa
+
+## Non-functional requirements
+
+- Map tile latency: p99 load time < 200 ms at CDN edge for cached tiles; < 2 s for uncached tile generation at origin
+- Route calculation latency: < 500 ms for any two points on Earth, including traffic weight application
+- ETA accuracy: within 5% of actual travel time on completed trips, measured across all route lengths
+- Traffic data freshness: road conditions reflected in routing within 5 minutes of a speed change occurring
+- Scale: 1 billion monthly active users, 100 million simultaneous navigating sessions at peak
+- Availability: 99.99% for tile serving and routing APIs; traffic ingestion can tolerate eventual consistency
+- Durability: road network and precomputed CH indexes survive region failures; replicated across at least three geographic regions
+
+## Capacity estimation
+
+<Capacity title="Back-of-envelope: tile storage, routing graph size, and traffic ping throughput">
+
+**Tile pyramid storage**
+
+At zoom level $z$, the world is divided into $4^z$ tiles. Summing across levels 0 through 18:
+
+$$
+\text{total tiles} = \sum_{z=0}^{18} 4^z = \frac{4^{19} - 1}{3} \approx 91 \text{ billion tiles}
+$$
+
+At an average of 20 KB per PNG tile (a conservative estimate for land tiles; ocean tiles compress to near zero):
+
+$$
+\text{tile storage} = 91 \times 10^9 \times 20 \text{ KB} \approx 1.8 \text{ PB}
+$$
+
+This is the pre-rendered tile corpus at 20 KB average. In practice, tiles at zoom 0–10 are tiny (the whole world fits in a few GB at low zoom); the storage is dominated by zoom 15–18 where per-tile detail is high. Tiles are stored in object storage (GCS/S3) and served via a globally distributed CDN. The CDN cache hit rate for popular tiles exceeds 99%, so origin storage throughput is not the bottleneck.
+
+**Road network graph**
+
+Earth's road network contains approximately 50 million kilometres of roads. Representing each road segment as a directed edge with 100 bytes of metadata (from/to node IDs, speed limit, road type, length, one-way flag):
+
+$$
+\text{graph RAM} = 1 \times 10^9 \text{ edges} \times 100 \text{ B} \approx 100 \text{ GB}
+$$
+
+100 GB fits on a single high-memory server (e.g., an r7g.16xlarge at 512 GB RAM) with room for the CH shortcut layer. In production the graph is sharded by geographic region — each shard covers a continent or large country. Routing within a shard is fully local; cross-shard routing requires a hierarchical "long-distance" layer.
+
+**Traffic GPS ping throughput**
+
+$$
+\text{active navigators} = 1 \times 10^9 \text{ MAU} \times 10\% = 100 \times 10^6
+$$
+
+$$
+\text{pings/sec} = \frac{100 \times 10^6 \text{ devices}}{30 \text{ s/ping}} \approx 3.3 \times 10^6 \text{ pings/sec}
+$$
+
+At 3.3 million pings per second, each carrying roughly 64 bytes (device ID, lat, lng, speed, heading, timestamp):
+
+$$
+\text{ingest bandwidth} = 3.3 \times 10^6 \times 64 \text{ B} \approx 200 \text{ MB/s}
+$$
+
+200 MB/s is comfortably within Kafka's throughput envelope. A cluster of 30–50 Kafka brokers with 6-way replication handles this with headroom for 3× burst.
+
+**CH preprocessing cadence**
+
+Full CH preprocessing of the global road network takes 4–24 hours depending on the algorithm implementation and hardware. Road network data (from OpenStreetMap or HERE) changes infrequently — roughly weekly for minor edits, monthly for significant topology changes. Preprocessing runs as an offline batch job. The result (the CH shortcut graph) is loaded into routing engine memory at startup and refreshed on a rolling basis. This means real-time road closures cannot be handled by CH alone — see the Curveball section.
+
+</Capacity>
+
+## API design
+
+| Method | Endpoint | Parameters | Response |
+|---|---|---|---|
+| `GET` | `/maps/tiles/{z}/{x}/{y}.png` | Zoom level, tile column, tile row | PNG image blob; `Cache-Control: public, max-age=86400` |
+| `GET` | `/directions` | `origin=lat,lng`, `destination=lat,lng`, `mode=driving` | Route with waypoints, total distance, ETA range, turn-by-turn instructions |
+| `GET` | `/traffic` | `bounds=ne_lat,ne_lng,sw_lat,sw_lng` | Traffic speed/condition overlay for the viewport |
+| `POST` | `/traffic/pings` | Batch of `[{deviceId, lat, lng, speedMs, heading, ts}]` | `202 Accepted`; processed asynchronously |
+| `GET` | `/geocode` | `address=<free-text string>` or `latlng=lat,lng` | `{lat, lng, formattedAddress, placeId}` |
+
+The tile endpoint is CDN-facing. The CDN key is the full path `/{z}/{x}/{y}` — the CDN returns cached tiles without hitting origin for the vast majority of requests. The `directions` endpoint talks directly to the Routing API service, which holds the CH graph in memory. The `traffic/pings` endpoint is an internal endpoint called by mobile SDKs — it writes to Kafka without blocking the client. Geocoding is a separate service backed by an inverted index over address tokens and place names; it is a distinct system design problem from routing.
+
+## Data model
+
+**Tile storage:** Tiles are keyed by `(z, x, y)` and stored as rasterized PNG blobs in object storage (GCS/S3). The key format is `tiles/{z}/{x}/{y}.png`. No relational structure is needed — the tile coordinate space is the natural key. Vector tiles (Mapbox Vector Tile format) are stored alongside raster tiles for clients that render on-device.
+
+**Road graph (per geographic shard):**
+
+```
+Edge {
+  edgeId:       uint64   // globally unique
+  fromNodeId:   uint64
+  toNodeId:     uint64
+  speedLimitMs: float32  // metres per second (m/s)
+  lengthMetres: float32
+  roadType:     enum     // motorway, trunk, primary, secondary, residential, path
+  oneWay:       bool
+  geometry:     bytes    // WKB-encoded LineString — stored separately from routing graph
+}
+
+Node {
+  nodeId:  uint64
+  lat:     float64
+  lng:     float64
+}
+```
+
+The routing graph in memory drops the `geometry` field — it is only needed for rendering. The in-memory routing graph stores adjacency lists keyed by `nodeId`, with edge weights expressed as travel time in seconds (derived from `lengthMetres / currentSpeedMs`).
+
+**Traffic state (Redis time-series):**
+
+```
+Key:   traffic:{segmentId}
+Value: {observedSpeedMs: float, confidence: float, updatedAt: unix_ts}
+TTL:   300s (5 minutes — stale observations expire automatically)
+```
+
+A sliding 5-minute window of GPS pings per segment is maintained by the Flink aggregation job. The result is written to Redis. The routing engine reads traffic state at query time to compute current edge weights. Segments with fewer than 5 observations in the window fall back to a historical speed model (time-of-day and day-of-week average speed, pre-computed per segment).
+
+**CH shortcuts (co-resident with road graph):**
+
+```
+Shortcut {
+  fromNode:       uint64
+  toNode:         uint64
+  contractedNode: uint64   // the node this shortcut bypasses
+  weight:         float32  // sum of the two original edge weights
+}
+```
+
+Shortcuts are stored in the same adjacency list format as real edges, distinguished by a flag. When unpacking a CH route to real waypoints, the contracted nodes are re-inserted recursively.
+
+## High-level architecture
+
+<Mermaid caption="Google Maps architecture: three independent subsystems — tile serving, routing, and traffic ingestion — sharing a geographic coordinate space" diagram={`graph LR
+  Client[Mobile / Web] --> CDN[CDN\nMap Tiles]
+  Client --> RoutingAPI[Routing API]
+  RoutingAPI --> CH[CH Routing Engine\nIn-memory graph]
+  RoutingAPI --> TrafficDB[(Traffic DB\nRedis time-series)]
+
+  Devices[GPS Devices] --> TrafficIngest[Traffic Ingest\nKafka]
+  TrafficIngest --> Aggregator[Segment Aggregator\nFlink Streaming]
+  Aggregator --> TrafficDB
+
+  OSM[Map Data\nOpenStreetMap / HERE] --> TileGen[Tile Generator\nMapnik / Valhalla]
+  TileGen --> TileStore[Tile Store\nGCS + CDN]`} />
+
+**Tile serving path:** The client requests `GET /maps/tiles/15/16384/10921.png`. The CDN checks its edge cache. On a hit (99%+ of the time for populated areas), the PNG is returned directly without touching origin. On a miss, the CDN fetches from GCS. GCS serves the pre-rendered tile. If a tile has not been pre-rendered (e.g., very high zoom over ocean), the Tile Generator produces it on-demand and stores it in GCS for future requests.
+
+**Routing path:** The client calls `GET /directions?origin=37.7749,-122.4194&destination=37.3382,-121.8863&mode=driving`. The Routing API service reads current traffic state for the relevant geographic region from Redis, builds a weight-adjusted in-memory edge snapshot, and invokes the CH bidirectional Dijkstra. The result is an ordered list of node IDs (the path), which is unpacked to real waypoints, decorated with turn-by-turn instructions, and returned with an ETA range.
+
+**Traffic ingestion path:** Mobile clients batch GPS pings and POST to `/traffic/pings` every 30 seconds. The Traffic Ingest service writes each ping as a Kafka message with topic `gps-pings`. A Flink streaming job consumes from Kafka, maps each GPS coordinate to the nearest road segment using the S2 cell index, computes median speed per segment over a 5-minute sliding window, and writes results to Redis. The routing engine's next query picks up the updated weights without any explicit invalidation signal.
+
+## Deep dives
+
+### Tile rendering pipeline
+
+Map data originates from OpenStreetMap (community-maintained) or commercial providers (HERE, TomTom). The raw data is a graph of nodes (points) and ways (ordered sequences of nodes) tagged with attributes (`highway=motorway`, `name=Market Street`, `building=yes`). Processing this into pixel-accurate tiles involves four stages.
+
+**Stage 1 — Data ingestion and preprocessing.** OSM data is imported into a PostGIS database. Geometric transformations convert geodetic coordinates (WGS-84 latitude/longitude) to the Web Mercator projection (EPSG:3857), which projects Earth onto a flat square — the mathematical basis for the tile pyramid. Labels, POIs, and administrative boundaries are extracted into separate layers.
+
+**Stage 2 — Style application.** A style file (analogous to CSS, using formats like CartoCSS or Mapbox GL Style) defines rules: at zoom 5, draw country outlines in gray at 1px; at zoom 12, draw street names in 11px Geist Regular; at zoom 17, draw building footprints filled with `#e8e0d8`. The style is applied by the rasterizer (Mapnik or similar) to produce pixel output.
+
+**Stage 3 — Rasterization.** Mapnik renders each tile as a PNG image at 256×256 pixels (or 512×512 for high-DPI displays). Tiles at low zoom levels (0–10) are rendered once and rarely change. Tiles at high zoom levels (15–18) are generated for every tile that intersects a populated region and re-generated when the underlying map data changes.
+
+**Stage 4 — Vector tiles (alternative).** Instead of rasterizing on the server, vector tiles (Mapbox Vector Tile format) send raw geometry and metadata to the client. The client's GPU renders the tile locally, allowing dynamic theming (dark mode, accessibility palettes), rotation, tilt, and fractional zoom without requesting new tiles. This is the architecture used by modern Maps clients. The trade-off: vector rendering requires a capable GPU on the device; older/low-end devices fall back to raster tiles.
+
+Pre-rendering covers zoom levels 0–14 globally and zoom 15–18 for populated areas (roughly 30% of Earth's land surface). Zoom 19–22 is rendered on-demand and cached aggressively because the addressable tile count at those zoom levels is vast.
+
+### Contraction Hierarchies routing
+
+Vanilla Dijkstra on a billion-edge graph runs in $O(E \log V)$ time. At 1 billion edges, this is approximately $10^9 \times 30$ operations — minutes per query on commodity hardware. That is unacceptable. A heuristic like A* with straight-line distance helps on city-scale graphs but degrades on long-distance queries where the heuristic provides little guidance. Contraction Hierarchies solve the problem differently: they precompute during an offline preprocessing phase and pay the cost once, amortising it across billions of queries.
+
+**Preprocessing: node contraction.** Every node in the road network is assigned an importance ranking based on metrics like edge difference (how many shortcut edges must be added if this node is removed), road class (motorways are more important than residential streets), and betweenness centrality (how many shortest paths pass through this node). Nodes are contracted in order of increasing importance.
+
+When a node $v$ is contracted, the algorithm examines all pairs of its neighbours $(u, w)$. If the shortest path from $u$ to $w$ passes exclusively through $v$ — i.e., there is no "witness path" of equal or shorter length that avoids $v$ — then a shortcut edge $(u, w)$ with weight $d(u,v) + d(v,w)$ is added to the graph. After contraction, $v$ is marked as contracted and removed from the active graph. This process runs bottom-up: least important nodes are contracted first, so contracting a node only involves its uncontracted neighbours.
+
+The result is a hierarchy: each shortcut edge represents a compressed path through contracted nodes. The full graph plus shortcuts is the CH graph. For typical road networks, the CH graph contains roughly 1.5–2× the edges of the original graph.
+
+**Query: bidirectional upward search.** A CH query runs a bidirectional Dijkstra with a critical constraint: the forward search from the source only relaxes edges going *upward* in the hierarchy (toward more important nodes), and the backward search from the destination only relaxes edges going upward from the destination's perspective. The two search frontiers meet somewhere in the hierarchy — at the meeting node, the shortest path is reconstructed.
+
+The query complexity is $O(n_s \log n_s + n_t \log n_t)$ where $n_s$ and $n_t$ are the sizes of the "search spaces" from source and target, which in practice are in the thousands rather than billions. Real-world query times are in the 1–10 ms range for continental-scale graphs.
+
+**Unpacking the path.** The CH route is a sequence of node IDs including shortcut edges. Each shortcut edge represents a bypassed contracted node. Unpacking recursively expands each shortcut back to the original edges, yielding the full path with all real waypoints. This unpacking step is fast (linear in the path length) and produces the turn-by-turn waypoint sequence.
+
+**Traffic integration.** CH is precomputed assuming static edge weights (speed limits). When traffic changes edge weights, there are two options: (1) re-run CH preprocessing from scratch — this takes hours and is not feasible in real time; (2) use a hybrid: keep the static CH structure but apply traffic multipliers at query time. If a segment's current speed is 40% of its speed limit (due to congestion), its edge weight at query time is `length / (speedLimit * 0.4)`. This breaks the strict CH correctness guarantee but in practice yields near-optimal routes. For more significant disruptions (road closures), a small set of edges can be "forbidden" during the query, and the CH bidirectional search avoids them.
+
+### Real-time traffic ingestion
+
+GPS pings from mobile apps arrive at 3.3 million per second globally. The pipeline must ingest, aggregate, and deliver segment-level speed estimates to the routing engine within 5 minutes of a road condition changing.
+
+**Ingestion layer.** Mobile clients (Android, iOS) batch pings and POST to the traffic ingestion endpoint. The ingest service writes each ping to Kafka with the topic `gps-pings-{region}`, partitioned by geographic region (a coarse S2 cell at level 4, covering roughly 500 km²). This partitioning ensures that all pings from the same region are processed by the same Flink task, keeping the segment aggregation stateful but not requiring cross-partition joins.
+
+**Segment mapping using S2 cells.** A GPS coordinate (lat, lng) must be mapped to a road segment ID. The S2 library decomposes Earth's surface into a hierarchy of cells indexed on a Hilbert curve, which preserves geographic locality — nearby points on Earth have nearby S2 cell IDs. For each Kafka partition (S2 level-4 cell), the Flink task maintains an in-memory S2 level-14 cell index that maps cell IDs to lists of road segments intersecting that cell. Mapping a GPS ping to its road segment is an O(1) lookup: compute the S2 cell ID at level 14 for the ping's coordinates, look up candidate segments, and pick the closest one using Euclidean distance from the GPS point to the segment's geometry.
+
+**Sliding window aggregation.** The Flink job maintains a 5-minute sliding window with 30-second slides. For each segment, it collects the observed GPS speeds of all pings mapped to that segment within the window. The aggregated metric is the **harmonic mean** of speeds (not arithmetic mean), which correctly handles the case where fast-moving and slow-moving vehicles are on the same segment — the harmonic mean weights slower observations more heavily, producing a more conservative speed estimate. If a segment has fewer than 5 pings in the window, the result is discarded and the historical speed model is used.
+
+**Writing to the routing engine.** Aggregated speed observations are written to Redis as `traffic:{segmentId}` with a 5-minute TTL. The routing engine reads from Redis at query time. To avoid thundering herd on Redis at query time (millions of concurrent route requests all reading thousands of segment weights), the routing engine maintains a local in-process cache of traffic weights, refreshed every 30 seconds by a background thread. This means traffic data in the routing engine is at most 30 seconds stale beyond the 5-minute Flink window, for a maximum end-to-end latency of 5 minutes 30 seconds.
+
+### ETA computation
+
+The naive ETA is the sum of `edgeLength / edgeSpeed` along the route edges. This is a reasonable baseline but underestimates real travel time for several reasons: it ignores intersection delay (stopping at traffic signals, yielding at merges), acceleration and deceleration at speed limit transitions, and systematic bias in GPS speed measurements.
+
+**Historical speed model.** For each road segment, a historical model stores the median observed speed broken down by hour of day (24 buckets) and day of week (7 buckets). This gives a 168-cell lookup table per segment. The historical model is the fallback when live GPS data is sparse. It is trained weekly from trip completion data — the actual travel time of completed navigating sessions is used as the ground truth to calibrate segment speeds.
+
+**Live traffic correction.** If a segment has a live traffic observation (median speed from the Flink aggregator), the routing engine blends the historical and live estimates: a weighted average with the live observation weighted by its confidence score (proportional to the number of pings in the window). A segment with 100 recent pings gets nearly 100% weight on the live observation; a segment with 5 pings gets 70% historical, 30% live.
+
+**ML-based ETA correction.** The blended speed-based ETA is the input feature to a gradient boosting model (Google uses a deep learning model in production) that predicts the delta between speed-based ETA and actual travel time. Features include: time of day, day of week, total route distance, number of intersections, road class distribution along the route, current traffic density in the region, historical ETA error on geometrically similar routes in the last 30 days, and weather. The model is trained on millions of completed trips and re-trained weekly. The output is a corrected ETA along with a confidence interval — the 10th and 90th percentile of the predicted arrival time distribution. This is what produces the "Arrive between 3:15 and 3:25" display rather than a single timestamp.
+
+## Java integration
+
+**Part A — Geospatial segment index using JTS R-tree:**
+
+```java
+package dev.pushkar.maps;
+
+import org.locationtech.jts.geom.*;
+import org.locationtech.jts.index.strtree.STRtree;
+import java.util.Comparator;
+import java.util.List;
+
+public final class RoadSegmentIndex {
+    private final STRtree rtree = new STRtree();
+    private final GeometryFactory gf = new GeometryFactory(new PrecisionModel(), 4326);
+
+    public void insert(RoadSegment segment) {
+        Coordinate[] coords = segment.coordinates();
+        Envelope env = gf.createLineString(coords).getEnvelopeInternal();
+        rtree.insert(env, segment);
+    }
+
+    @SuppressWarnings("unchecked")
+    public List<RoadSegment> queryNearby(double lat, double lng, double radiusMeters) {
+        double degRadius = radiusMeters / 111_000.0;
+        Envelope searchEnv = new Envelope(
+            lng - degRadius, lng + degRadius,
+            lat - degRadius, lat + degRadius);
+        return (List<RoadSegment>) rtree.query(searchEnv);
+    }
+
+    public RoadSegment nearestSegment(double lat, double lng) {
+        Point point = gf.createPoint(new Coordinate(lng, lat));
+        return queryNearby(lat, lng, 200)
+            .stream()
+            .min(Comparator.comparingDouble(seg -> seg.geometry().distance(point)))
+            .orElseThrow(() -> new IllegalStateException(
+                "No road segment within 200m of (%f, %f)".formatted(lat, lng)));
+    }
+}
+
+public record RoadSegment(
+    long id,
+    long fromNode,
+    long toNode,
+    Geometry geometry,
+    float speedLimitMs,
+    String roadType
+) {
+    public Coordinate[] coordinates() {
+        return geometry.getCoordinates();
+    }
+}
+```
+
+The JTS `STRtree` is a Sort-Tile-Recursive R-tree, an efficient spatial index for static datasets loaded at startup. After calling `insert` for all segments in a region, calling `rtree.build()` finalises the index. Subsequent `query` calls are O(log n + k) where k is the number of results. The `nearestSegment` method is used by the Flink traffic aggregation job to map a GPS ping to its road segment.
+
+**Part B — Directions controller with traffic-aware routing:**
+
+```java
+package dev.pushkar.maps;
+
+import org.springframework.web.bind.annotation.*;
+import java.time.Duration;
+import java.util.List;
+
+@RestController
+@RequestMapping("/directions")
+public class DirectionsController {
+    private final RoutingEngine engine;
+    private final TrafficService traffic;
+
+    public DirectionsController(RoutingEngine engine, TrafficService traffic) {
+        this.engine = engine;
+        this.traffic = traffic;
+    }
+
+    @GetMapping
+    public DirectionsResponse route(
+            @RequestParam double originLat,
+            @RequestParam double originLng,
+            @RequestParam double destLat,
+            @RequestParam double destLng,
+            @RequestParam(defaultValue = "driving") String mode) {
+
+        LatLng origin = new LatLng(originLat, originLng);
+        LatLng dest   = new LatLng(destLat, destLng);
+
+        EdgeWeightSnapshot weights = traffic.getCurrentWeights(origin, dest);
+        Route route = engine.route(origin, dest, TransportMode.of(mode), weights);
+        EtaEstimate eta = traffic.estimateEta(route);
+
+        return new DirectionsResponse(
+            route.waypoints(),
+            route.totalDistanceMeters(),
+            eta.lowerBound(),
+            eta.upperBound(),
+            route.turnByTurnInstructions()
+        );
+    }
+
+    public record DirectionsResponse(
+        List<LatLng> waypoints,
+        double totalDistanceMeters,
+        Duration etaLow,
+        Duration etaHigh,
+        List<String> instructions
+    ) {}
+}
+```
+
+The `traffic.getCurrentWeights(origin, dest)` call fetches an immutable `EdgeWeightSnapshot` — a copy of the current traffic-adjusted edge weights for the geographic bounding box of the query. The routing engine queries this snapshot, not a live mutable map, so there are no concurrent modification hazards during the Dijkstra traversal. A background thread in `TrafficService` refreshes the snapshot every 30 seconds from Redis. This pattern — immutable snapshot, background refresh — decouples query correctness from traffic update frequency.
+
+<TradeoffTable title="Routing algorithm comparison for road networks">
+
+| Algorithm | Query time | Preprocessing | Dynamic traffic | Best for |
+|---|---|---|---|---|
+| Dijkstra | Minutes (1B edges) | None | Easy — just rerun with updated weights | Small graphs, prototypes |
+| A* with Euclidean heuristic | Seconds | None | Easy | City-scale routing up to ~1M edges |
+| Contraction Hierarchies | Milliseconds | Hours (offline, weekly) | Moderate — apply weight multipliers at query time; full re-contract for topology changes | Production road routing at planetary scale |
+| Transit Node Routing | Sub-millisecond | Days | Hard — topology must be static | Long-distance highway routing where source and destination are far apart |
+
+</TradeoffTable>
+
+<Pitfall title="Storing road geometry in the routing graph">
+
+A common mistake is to include the full geometric coordinates of each road segment — a WKB-encoded LineString, potentially hundreds of coordinate pairs — in the in-memory routing graph. The routing graph needs only the fields that affect shortest-path computation: from/to node IDs, edge weight (travel time in seconds), and road class (for turn restriction rules). Geometry is only needed when rendering the route on the map, not during Dijkstra traversal.
+
+Storing geometry in the routing graph has two harmful consequences. First, it bloats the in-memory footprint. A 100 GB routing graph becomes 300–500 GB once full geometry is included. This either pushes you off a single machine onto a distributed setup or forces you to page segments in from disk during traversal — blowing the < 500 ms query SLA.
+
+Second, the CH preprocessing cost scales with graph size. Contracting a node requires computing witness paths through its neighbours; larger adjacency list entries slow every step of the preprocessing phase. Keep the routing graph as lightweight as possible: from/to node ID (8 bytes each), weight (4 bytes), distance in metres (4 bytes), road class (1 byte). Load geometry lazily from a separate segment geometry store only when unpacking a route for display.
+
+</Pitfall>
+
+<Pitfall title="Updating routing graph edge weights synchronously during a query">
+
+If a live traffic update arrives while a bidirectional Dijkstra is in flight, mutating the edge weight map concurrently can produce incorrect results — the forward and backward search spaces see different weight values for the same edge, potentially yielding a path that is suboptimal or geometrically inconsistent.
+
+The fix is **immutable weight snapshots**. The routing engine holds a reference to an `AtomicReference<EdgeWeightSnapshot>`. A background thread computes a new snapshot from Redis every 30 seconds and atomically swaps the reference. Each incoming routing query reads the current snapshot reference at the start of the query and uses it exclusively for the duration of the Dijkstra traversal — the snapshot is never mutated mid-query. New snapshots do not affect in-flight queries. The trade-off is that a query started just before a snapshot refresh uses traffic data that is up to 30 seconds older than the latest available; for the < 500 ms query budget, this is entirely acceptable.
+
+This pattern is a specific instance of the general "copy-on-write" or "epoch-based" concurrency approach: readers always see a consistent view; writers produce a new version atomically. It eliminates all locking in the hot query path at the cost of slightly stale data.
+
+</Pitfall>
+
+<Curveball question="A city blocks off 10 streets for a parade at 9 AM. These road closures need to be reflected in routing immediately. CH preprocessing takes 4 hours. How do you handle real-time road closures without re-running full CH preprocessing?">
+
+The key insight is that real-time closures are a **penalty** on specific edges, not a topology change that invalidates the full CH hierarchy. Two approaches work in practice.
+
+The first is **forbidden edge injection at query time**. The closed segments are tagged in a fast lookup set (Redis `SADD closure:{edgeId}` with a TTL). Before the CH bidirectional Dijkstra starts, the routing engine fetches the current closed-edge set for the query's bounding box. During traversal, any edge whose ID is in the closed set is treated as having infinite weight — effectively removed from the graph for this query. This preserves CH correctness as long as the closure set is small (< a few hundred edges). Waze and Google Maps handle city-scale events this way.
+
+The second approach is **partial re-contraction of the affected subgraph**. If a closure persists for more than a few hours (a multi-day construction zone, a permanent road removal), a targeted re-contraction of the affected geographic area can be completed in minutes, not hours, because only the local neighbourhood of the closed segment is affected. The re-contracted subgraph replaces the stale region in the CH index while the rest of the global hierarchy remains valid.
+
+For the parade scenario — known start and end time — the closure is scheduled in advance. The closures are pre-applied to the next CH preprocessing run that would complete before 9 AM, and reverted in the run after the parade ends. Scheduled events are trivial; unscheduled emergency closures use the forbidden-edge injection approach.
+
+</Curveball>
+
+<Curveball question="A user drives into a tunnel and loses GPS signal for 3 minutes. When they emerge, their phone shows them at a location 2 km from where the map thinks they should be. How do dead reckoning and map matching work to handle this?">
+
+While GPS signal is absent, the device must estimate its position from on-board sensors. This is **dead reckoning**: the device integrates the last known velocity vector (from GPS + accelerometer) and the elapsed time to project a position estimate forward. Car-grade dead reckoning also uses the wheel odometer and gyroscope to track speed and heading changes without GPS. Consumer phones use a simpler version: accelerometer + gyroscope + last GPS speed and heading. Dead reckoning error accumulates at roughly 2–5% of distance travelled, so after 2 km of tunnel the estimated position has an uncertainty ellipse of 40–100 m.
+
+When GPS is restored, the device has a raw GPS fix that may conflict with the dead-reckoned position. **Map matching** resolves this. Map matching is a Hidden Markov Model: the states are road segment positions (candidate locations on the road network), and the observations are raw GPS coordinates. At each GPS fix, the HMM computes the probability of each candidate segment given the GPS coordinate (based on GPS accuracy and distance to the segment) and the transition probability between consecutive candidates (based on shortest path distance and road connectivity). The Viterbi algorithm finds the most likely sequence of segments — the user's actual path through the road network.
+
+When the device re-acquires GPS after a tunnel, map matching reconciles the dead-reckoned position with the GPS fix and the known road topology. The algorithm considers all plausible exit points of the tunnel and picks the one that is consistent with the heading and speed at the point of exit. In practice, tunnels are tagged in the map data as single edges, so the matching candidates after a tunnel exit are constrained to the set of nodes at the tunnel's end — significantly reducing ambiguity.
+
+</Curveball>
+
+<Curveball question="You need to find the fastest route that passes through 5 waypoints in a specific sequence (e.g., package delivery). Finding the global optimum is NP-hard (Travelling Salesman). How do you solve this approximately in under 500 ms?">
+
+Sequential waypoint routing with a fixed order is not the Travelling Salesman Problem — TSP asks for the optimal ordering over all permutations. If the order is fixed (deliver to stop 1, then stop 2, then stop 3), the problem reduces to running 5 independent point-to-point CH queries (origin→stop1, stop1→stop2, stop2→stop3, stop3→stop4, stop4→destination) and concatenating the resulting route segments. Five CH queries at ~5 ms each complete in 25 ms — well within budget.
+
+The harder case is **optimal stop ordering**: given 5 delivery stops, find the permutation that minimises total travel time. With 5 stops there are $5! = 120$ orderings, and evaluating all 120 using CH queries (120 × 5 = 600 queries × 5 ms = 3 seconds) exceeds the 500 ms budget. The practical approach is a precomputed **all-pairs shortest-path matrix** over the 5 stops: compute the CH travel time for each directed pair — $5 \times 4 = 20$ queries, taking 100 ms. With the full 5×5 time matrix available, enumerate all 120 permutations in microseconds (pure computation on a 5×5 matrix) and pick the minimum-cost permutation. Total wall time: ~150 ms.
+
+For larger N (10+ stops), dynamic programming over the permutations (the Held-Karp algorithm) runs in $O(2^n \cdot n^2)$ — feasible for n ≤ 20. Beyond 20, use nearest-neighbour greedy insertion as a first pass, then apply 2-opt local search for improvement. For real delivery fleet routing (thousands of stops), this is a Vehicle Routing Problem — a separate and much deeper optimisation domain. For the interview context, demonstrating the all-pairs matrix trick and knowing the TSP complexity boundary is the signal.
+
+</Curveball>
+
+<RelatedQuestions items={[
+  { slug: "yelp-nearby-places", title: "Design Yelp / Nearby Places", difficulty: "mid" },
+  { slug: "google-search", title: "Design Google Search", difficulty: "staff" },
+  { slug: "typeahead-autocomplete", title: "Design Typeahead / Autocomplete", difficulty: "mid" },
+]} />
+
+## Further reading
+
+- [Contraction Hierarchies: Faster and Simpler Hierarchical Routing in Road Networks (Geisberger et al., 2008)](https://algo2.iti.kit.edu/documents/routeplanning/geisberger_dipl.pdf) — The original CH paper. Section 3 covers the preprocessing algorithm; Section 4 covers the bidirectional query. Required reading if you want to implement CH or reason about its correctness guarantees at depth.
+- [Google S2 Geometry Library](https://s2geometry.io/) — Official documentation for the S2 library covering cell hierarchy, Hilbert curve indexing, and the geospatial query API. The "S2 Cell Hierarchy" page explains the level-to-area mapping that underpins the traffic segment index.
+- [OpenStreetMap Data Model](https://wiki.openstreetmap.org/wiki/Elements) — The OSM wiki's description of nodes, ways, and relations — the three primitive types that make up all map data. Understanding the OSM data model is prerequisite to understanding how road network graphs are constructed from raw map data.
+- [Engineering Google Maps (Google I/O talks, various years)](https://www.youtube.com/results?search_query=google+maps+engineering+google+io) — Multiple I/O talks from Google engineers covering tile rendering at scale, the transition from raster to vector tiles, and how real-time traffic is ingested from Android location history. The 2013 talk on the vector tile transition is particularly detailed.
+- [Valhalla Open-Source Routing Engine](https://github.com/valhalla/valhalla) — An open-source routing engine used by Mapbox and others. Studying its graph structure, tile format, and routing algorithm implementation gives concrete grounding for the abstract concepts in this article. The `thor` library implements CH and other routing algorithms.

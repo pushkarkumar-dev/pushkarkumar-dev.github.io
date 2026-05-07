@@ -1,0 +1,495 @@
+---
+title: "Design an ML Model Serving Infrastructure"
+slug: "ml-inference-pipeline"
+category: "ai"
+difficulty: "staff"
+estimatedReadMinutes: 26
+tags: ["model-serving", "triton", "batching", "canary-deployment", "feature-store", "shadow-mode", "A/B-testing"]
+companyFlavors: ["Google", "Meta", "Uber", "Airbnb", "Netflix"]
+relatedQuestions: ["recommendation-engine", "feature-store", "fraud-detection"]
+publishedAt: "2025-01-07"
+updatedAt: "2025-01-07"
+summary: "Design a production ML serving platform that handles model versioning, online and batch inference, adaptive micro-batching, shadow-mode deployment, and canary rollouts with automatic rollback."
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+
+<Bookmark slug="ml-inference-pipeline" title="Design an ML Model Serving Infrastructure" />
+
+<Tldr>
+- **Separate model registry from serving infrastructure**: the registry stores artifacts and version metadata; serving infrastructure loads and runs them — decoupling the two lets you version, promote, and roll back models without touching serving code.
+- **Online serving via adaptive micro-batching**: queue arriving requests and flush when batch size reaches N or timeout T elapses; adaptive timeout shrinks at low QPS to preserve latency, grows at high QPS to maximize GPU utilization.
+- **Shadow mode before canary**: route a copy of live traffic to the candidate model asynchronously; compare outputs against production without affecting users — catches preprocessing bugs and feature schema mismatches that offline test sets miss entirely.
+- **Canary deployment in four stages (1% → 5% → 20% → 100%)**: use consistent hashing on `userId` for deterministic routing; automatic rollback triggers on error rate spike, p99 latency regression, or business metric decline — complete rollback in under 30 seconds.
+- **Feature freshness is the hidden bottleneck**: stale features from a lagging upstream pipeline cause silent accuracy degradation with no stack trace; monitor feature drift, null rates, and `updated_at` freshness per feature group, not just model latency.
+</Tldr>
+
+Shipping a model to production is one tenth of the work — keeping it running reliably is the other nine. ML inference infrastructure must handle model versioning, traffic shifting, hardware-aware batching, feature pipeline health, and silent accuracy degradation, all without the safety net that normal software engineering provides: there is no stack trace for a model that learned the wrong thing.
+
+The challenge is compounded by the fact that ML models are stateful artifacts embedded in a dynamic serving environment. A model trained on last month's data is serving today's users, whose behavior may have shifted. Features computed by an upstream pipeline may have changed schema, units, or freshness guarantees without any change to the serving code. A new model version may pass every offline evaluation metric yet fail catastrophically on live traffic because the tokenizer used during training differs subtly from the tokenizer used during serving. These failure modes are invisible to standard software monitoring — they surface only through business metric regressions or, worse, user complaints.
+
+This article designs a production ML serving platform that addresses each of these failure modes: a model registry decoupled from serving infrastructure, micro-batching with adaptive timeout for GPU efficiency, shadow mode for pre-production validation, and canary rollouts with automatic rollback for safe model promotion. The design scales to 100K online inference RPS and supports parallel batch scoring jobs across millions of records per hour.
+
+## Clarifying questions
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| What model types must be supported? | Classification, regression, ranking, and generative models (LLMs) | Generative models require token streaming and continuous batching; other types use standard batch inference — the architecture differs significantly |
+| What is the online latency SLA? | p99 < 50ms for sub-100MB models | Drives max batch wait timeout; a 50ms p99 budget leaves roughly 5ms for feature retrieval, 5ms for batching overhead, and 40ms for the forward pass |
+| What is the peak throughput requirement? | 100K inference RPS online; millions of records per hour for batch | Online serving drives GPU fleet sizing; batch jobs drive distributed compute (Spark or Ray) separately |
+| GPU or CPU inference? | Both — GPU for deep learning models, CPU for gradient boosted trees (XGBoost/LightGBM) | GPU inference requires batching to amortize kernel launch overhead; CPU inference scales horizontally with cores |
+| Online vs. batch inference — both required? | Yes — online for user-facing features, batch for offline scoring pipelines | Online requires sub-50ms with a feature store; batch can tolerate minutes and reads from data warehouse |
+| What is the largest model in the serving fleet? | 7B parameter LLM (FP16, ~14GB) up to 70B parameter models | Determines GPU memory requirements, whether model parallelism is needed, and whether speculative decoding applies |
+| Is multi-model serving on shared GPU memory required? | Yes — smaller models should share GPU memory | Requires model instance manager aware of GPU memory fragmentation; NVIDIA MPS or Triton's model instance groups |
+| How often are models deployed? | Multiple times per day per model family | Drives need for fast deployment pipeline (artifact push to live within 5 minutes) and rollback automation |
+| What triggers an automatic rollback? | Error rate spike, p99 latency regression, or business metric decline | Rollback controller must integrate with Prometheus for technical metrics and with the experiment platform for business metrics |
+| Is A/B testing across model versions required? | Yes — multiple model variants may run simultaneously per model family | Drives the consistent hashing requirement; users must be pinned to the same variant across requests |
+
+## Functional requirements
+
+- Serve model predictions with p99 latency under 50ms for online inference (sub-100MB models on GPU).
+- Batch inference for offline scoring jobs processing millions of records per hour from data warehouse tables.
+- Model versioning: deploy a new model version alongside the current production version with traffic split control.
+- Shadow mode: run a candidate model on a copy of live traffic without affecting user-facing predictions; log shadow outputs for comparison.
+- A/B testing: assign users to model variants deterministically via consistent hashing on `userId`; ensure the same user always receives the same model variant.
+- Automatic rollback: revert to the previous model version within 30 seconds when error rate, latency, or business metrics breach defined thresholds.
+- Feature pipeline health monitoring: alert on feature staleness, null rate spikes, and distribution drift before they silently degrade model accuracy.
+
+## Non-functional requirements
+
+- **Throughput**: 100K inference RPS at peak for online serving; batch jobs process millions of records per hour.
+- **Latency**: p99 < 50ms end-to-end for online serving of sub-100MB models; p50 < 20ms.
+- **Availability**: 99.99% uptime — prediction failures degrade product features gracefully rather than crashing the service; the fallback path returns a default prediction.
+- **Deployment speed**: a new model version is live and receiving traffic within 5 minutes of artifact push to the model registry.
+- **Rollback speed**: complete traffic reversion to the previous model version within 30 seconds of trigger.
+- **Observability**: per-request latency, per-model-version error rate, feature freshness, and prediction distribution are all observable in real time via Prometheus and Grafana.
+
+<Capacity title="ML Inference Capacity">
+
+**Online serving throughput**
+
+Inbound payload rate: $100{,}000 \text{ RPS} \times 2 \text{ KB} = 200 \text{ MB/s}$ of inbound request data.
+
+Model forward pass on GPU at batch size 32: $5 \text{ ms per batch}$.
+
+Effective per-GPU throughput: $\frac{32 \text{ requests}}{5 \text{ ms}} = 6{,}400 \text{ RPS per GPU}$.
+
+GPUs required to serve 100K RPS:
+
+$$\left\lceil \frac{100{,}000}{6{,}400} \right\rceil = 16 \text{ GPUs minimum}$$
+
+With 50% headroom for load spikes and rolling deployments: $16 \times 1.5 = 24 \text{ GPUs}$.
+
+**Micro-batching latency analysis**
+
+Serial serving (no batching): $0.15 \text{ ms per request} \times 32 \text{ sequential requests} = 4.8 \text{ ms total}$.
+
+Batched serving: $5 \text{ ms for all 32 requests simultaneously} \approx 0.156 \text{ ms per request}$.
+
+Batching trades a fixed overhead (wait time to fill the batch) for parallelism across 32 requests. At high QPS, the batch fills in under 1ms, so the overhead is negligible.
+
+$$\text{throughput gain from batching} = \frac{\text{batch size} \times \text{single-request throughput}}{1 + \text{batching overhead ratio}}$$
+
+At batch size 32, single-request throughput 200 RPS/GPU, and 10% overhead ratio:
+
+$$\frac{32 \times 200}{1 + 0.10} \approx 5{,}818 \text{ RPS per GPU}$$
+
+**GPU memory planning**
+
+NVIDIA H100 (80GB HBM3). A 7B-parameter model in FP16: $7 \times 10^9 \times 2 \text{ bytes} = 14 \text{ GB}$.
+
+Activations + KV cache + OS overhead: $\approx 10 \text{ GB}$.
+
+Available for model replicas: $80 - 10 = 70 \text{ GB}$, fitting $\lfloor 70 / 14 \rfloor = 5$ model replicas per H100.
+
+**Feature store retrieval budget**
+
+With a 50ms p99 SLA and 5ms model forward pass, feature retrieval must complete in: $50 - 5 - 5 = 40 \text{ ms}$ (5ms batching overhead, 5ms network/serialization).
+
+Redis p99 < 1ms for hot features; DynamoDB p99 < 10ms for cold features. Feature enrichment pipeline must complete within $\leq 10 \text{ ms}$ to leave headroom.
+
+</Capacity>
+
+## API design
+
+```text
+Online serving:
+POST /v1/predict
+  body: { modelId, version?, inputs: {feature_map}, requestId }
+  → { predictions: [...], modelVersion, latencyMs, requestId }
+
+POST /v1/predict/batch (async)
+  body: { modelId, version?, inputs: [{id, feature_map}], callbackUrl }
+  → { jobId } → async webhook when complete
+
+Batch job:
+POST /v1/batch-score
+  body: { modelId, inputTable: "s3://...", outputTable: "s3://...", partitions }
+  → { jobId, estimatedCompleteAt }
+
+Model registry:
+POST /v1/models/{modelId}/versions
+  body: { artifactUri, framework, metadata }
+  → { version, status: PENDING }
+
+PUT /v1/models/{modelId}/traffic
+  body: { weights: [{ version, percent }] }
+  → Traffic shift applied
+```
+
+The `version` field on `POST /v1/predict` is optional: omitting it routes to whichever version is designated production in the current traffic config. Specifying a version explicitly pins the request to that version — used by internal tooling and shadow comparison jobs. The `requestId` is caller-supplied and echoed back in the response; it flows through the entire serving stack and appears in prediction logs, enabling end-to-end tracing from the caller's application log to the GPU execution trace.
+
+The `PUT /v1/models/{modelId}/traffic` endpoint is the control plane lever for canary rollouts and rollback. The `weights` array must sum to 100. The rollback controller calls this endpoint automatically when metrics breach thresholds; humans call it manually for planned rollouts.
+
+## Data model
+
+```sql
+CREATE TABLE model_versions (
+    model_id        VARCHAR(100) NOT NULL,
+    version         VARCHAR(50) NOT NULL,
+    artifact_uri    VARCHAR(1000) NOT NULL,
+    framework       VARCHAR(50) NOT NULL,   -- pytorch, tensorflow, xgboost
+    status          VARCHAR(20) NOT NULL,   -- PENDING, STAGING, CANARY, PRODUCTION, DEPRECATED
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    deployed_at     TIMESTAMPTZ,
+    metrics         JSONB,                  -- offline evaluation metrics
+    PRIMARY KEY (model_id, version)
+);
+
+CREATE TABLE traffic_config (
+    model_id        VARCHAR(100) NOT NULL,
+    config_id       UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    weights         JSONB NOT NULL,  -- [{"version":"v2","percent":95},{"version":"v3","percent":5}]
+    shadow_version  VARCHAR(50),     -- shadow mode: run but don't serve
+    applied_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE prediction_log (
+    request_id      UUID PRIMARY KEY,
+    model_id        VARCHAR(100) NOT NULL,
+    model_version   VARCHAR(50) NOT NULL,
+    input_hash      VARCHAR(64),     -- for cache/dedup
+    prediction      JSONB NOT NULL,
+    latency_ms      INT NOT NULL,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+) PARTITION BY RANGE (created_at);
+```
+
+The `model_versions` table is the source of truth for all artifact metadata. The `status` column drives deployment automation: a CI/CD pipeline pushes an artifact URI and sets status to `PENDING`; the deployment service downloads the artifact, runs health checks, and transitions to `STAGING`; a human or automated gate transitions to `CANARY` when staging checks pass. The `metrics` JSONB column stores offline evaluation metrics (AUC, NDCG, precision@K) that are displayed in the model management UI and used as a pre-flight check before a version is eligible for canary.
+
+The `traffic_config` table uses a separate `shadow_version` column rather than encoding shadow in the `weights` array. Shadow mode is architecturally distinct from A/B testing: shadow traffic does not affect user-facing responses and should not count toward the percentage weights. Keeping shadow separate in the schema makes the intent unambiguous and prevents accidental inclusion of shadow traffic in A/B analysis.
+
+The `prediction_log` is partitioned by `created_at` (daily or weekly). Retaining prediction logs enables: (1) feature drift detection by comparing logged input distributions against training data; (2) label join — after ground truth arrives (e.g., did the user click? did the transaction complete?), the log is joined against outcomes to compute online model performance; (3) debugging canary regressions by replaying logged inputs through both model versions.
+
+## Architecture
+
+<Mermaid diagram={`flowchart TD
+    Client[Client Application] --> LB[Load Balancer]
+    LB --> Router[Model Router\nTraffic Splitter]
+    Router -->|95% traffic| ServerA[Model Server v2\nProduction]
+    Router -->|5% traffic| ServerB[Model Server v3\nCanary]
+    Router -->|shadow copy async| Shadow[Shadow Server v4\nSilent]
+    ServerA --> FS[Feature Store\nRedis + DynamoDB]
+    ServerB --> FS
+    Shadow --> FS
+    ServerA --> Registry[Model Registry\nArtifact Store]
+    ServerB --> Registry
+    Shadow --> Registry
+    ServerA --> Prom[Prometheus Metrics]
+    ServerB --> Prom
+    Shadow --> PredLog[Shadow Prediction Log]
+    Prom --> Alert[Alertmanager]
+    Alert --> Rollback[Rollback Controller]
+    Rollback --> Router
+    PredLog --> Compare[Comparison Job\nhourly]
+    Compare --> Promote[Canary Promotion\nDecision]
+    Registry --> Deploy[Deployment Service]
+    Deploy --> ServerA
+    Deploy --> ServerB
+    Deploy --> Shadow`} />
+
+The model router sits at the center of the serving path. It reads the current traffic config from Redis on a 1-second poll interval and routes each incoming request according to the weights. The rollback controller writes updated traffic weights to Redis within milliseconds of a trigger, and the router picks up the new config within 1 second — achieving the 30-second rollback SLA with substantial headroom.
+
+Each model server is a long-running process that has pre-loaded the model weights from the artifact store into GPU memory. Model loading is the slow path (30–60 seconds for large models); the serving path never touches the artifact store. The deployment service manages the lifecycle: it starts a new model server instance, waits for the health check to pass, then updates the router's traffic config to begin sending traffic.
+
+## Deep dive: Micro-batching
+
+Individual requests arrive stochastically — a Poisson process with rate equal to the current QPS. Serving them one at a time wastes GPU throughput: matrix multiplications (the dominant operation in neural network forward passes) are far more efficient on larger tensors because GPU kernel launch overhead is amortized across more work, and memory bandwidth is used more efficiently with wider tensor operands.
+
+Micro-batching queues arriving requests and forms a batch either when the batch reaches size N or when a timeout T elapses. The tuning trade-off is fundamental: a small T reduces added latency but wastes GPU capacity because batches are small; a large T maximizes GPU utilization but adds latency that may violate the SLA at low QPS.
+
+Adaptive batching resolves this by adjusting T based on observed QPS:
+
+```text
+At low QPS:  T = 1ms  (serve quickly, don't waste latency)
+At high QPS: T = 5ms  (fill batches efficiently, latency budget allows it)
+```
+
+The adaptive timeout is computed continuously: if the rolling 10-second average QPS is above 80% of the GPU's single-request throughput capacity, T increases by 0.5ms (up to the max of 5ms). If QPS drops below 50% of capacity, T decreases by 0.5ms (down to the min of 1ms). This hysteresis prevents oscillation.
+
+NVIDIA Triton Inference Server implements dynamic batching natively: set `max_queue_delay_microseconds` (the timeout) and `preferred_batch_size` (target batch size). Triton queues requests and forms batches that satisfy both constraints. Triton also supports sequence batching for RNN models and in-flight batching (continuous batching) for generative models — each requiring different configuration but sharing the same underlying queuing mechanism.
+
+For Transformer models, variable-length input sequences must be padded to a uniform length before batching. Naive padding to the longest sequence in the batch wastes computation: a batch where one sequence has 512 tokens and 31 sequences have 10 tokens pads all 31 short sequences to 512 tokens, multiplying computation by roughly 50×. Efficient packing (bin-packing sequences by length into sub-batches) reduces wasted padding computation by 30–50%. Triton exposes this as the `sequence_batching` policy with `max_sequence_idle_microseconds`.
+
+## Deep dive: Shadow mode deployment
+
+Shadow mode runs a new model version on a copy of live traffic without affecting user-facing responses. It is the most important pre-production validation step and the one most commonly skipped under deadline pressure.
+
+The implementation is straightforward in concept but requires careful attention to latency isolation:
+
+1. The model router duplicates every incoming request (or a configurable fraction — 5–10% is sufficient for statistical validity) to the shadow model server.
+2. The shadow model server runs inference asynchronously — the router does not wait for the shadow result before returning the production prediction to the client. Fire-and-forget.
+3. Shadow predictions are written to a separate `shadow_prediction_log` table, alongside the production prediction for the same input and the same `request_id`.
+4. A comparison job runs every hour: it joins production and shadow predictions on `request_id` and computes agreement rate, distribution similarity (KS test on prediction score distributions), and — when ground truth labels are available — per-version accuracy metrics.
+5. If the shadow model agrees with production on at least X% of requests (configurable; typically 90% for minor model updates, lower for major architecture changes) and shows improvement on held-out labels, it is eligible for promotion to canary.
+
+Shadow mode catches bugs that offline evaluation misses. The most common class of production incident for new model deployments is a preprocessing mismatch: the training pipeline uses one tokenizer or normalization function, and the serving code uses a slightly different one. On the offline test set (preprocessed identically to training), the model achieves 95% accuracy. On live traffic (preprocessed by the production serving code), the model receives garbled features and produces nonsense predictions. Shadow mode exposes this immediately: the comparison job flags near-zero agreement between production and shadow, triggering investigation before the shadow model ever receives user-facing traffic.
+
+The cost of shadow mode is real: running a shadow server requires 2× GPU capacity for the shadow period. This cost is mitigated by: (1) routing only 5–10% of traffic to the shadow server instead of 100%; (2) running the shadow server at lower priority on spot/preemptible instances since latency is not user-facing; (3) limiting the shadow period to 24–48 hours once statistical significance is achieved.
+
+## Deep dive: Canary rollout and automatic rollback
+
+Canary deployment shifts a small percentage of real traffic to the new model version, measures its behavior on live users, and progressively increases the percentage as confidence grows. The four-stage progression provides different statistical guarantees at each step.
+
+**Stage 1 (1%)**: At 1,000 RPS (1% of 100K), the canary receives 1,000 requests per second. This is enough to catch crashes, serialization errors, and obvious accuracy failures within minutes. Expected duration: 15–30 minutes.
+
+**Stage 2 (5%)**: At 5,000 RPS, the latency distribution for the canary becomes statistically meaningful. p99 latency computed from 5,000 RPS over 30 minutes has tight confidence intervals. Business metrics (click-through rate, conversion rate) require more traffic for significance. Expected duration: 1–2 hours.
+
+**Stage 3 (20%)**: At 20,000 RPS, there is sufficient volume for most business metrics to reach statistical significance within a few hours, assuming typical effect sizes of 0.5–1%. Expected duration: 4–8 hours.
+
+**Stage 4 (100%)**: Full rollout. Previous production version is marked `DEPRECATED` in the model registry after a 48-hour observation window.
+
+Traffic splitting implementation uses consistent hashing on `userId`. A user at the 1% canary stage always receives the canary model — not 1% of their requests routed to canary and 99% to production. This matters for A/B experiment integrity: if the same user sees different model outputs on different requests, behavioral signals are polluted. The hash function maps `userId` to a bucket in [0, 100); bucket < 5 (for 5% canary) routes to canary. The router reads the current percentages from Redis and recomputes bucket thresholds on every config poll.
+
+The rollback controller is a separate service that polls Prometheus metrics every 10 seconds and compares canary vs. production baseline:
+
+- **Error rate trigger**: if canary error rate exceeds production error rate by more than 0.1 percentage points (e.g., production is 0.05%, canary is 0.2%), rollback immediately.
+- **Latency trigger**: if canary p99 latency exceeds 2× the production p99 baseline, rollback immediately.
+- **Business metric trigger**: requires integration with the experiment platform (typically a t-test or sequential probability ratio test); trigger if a statistically significant regression of more than 1% is detected on the primary business metric.
+
+On rollback: the controller calls `PUT /v1/models/{modelId}/traffic` with weights shifting 100% back to the previous production version, pages the on-call engineer, and creates an incident ticket with the metric graph that triggered rollback attached. The entire sequence — metric breach detected, API call made, router config updated, traffic shifted — completes within 10 seconds of detection. Since the router polls Redis every 1 second, traffic is fully shifted within 11 seconds of the controller decision.
+
+## Deep dive: Feature pipeline health
+
+The silent killer in ML serving is not a crashing model or a slow GPU — it is features that exist in the schema but contain stale, null, or distributional-shift-afflicted values. Consider a feature called `user_7d_purchase_count`: the Kafka consumer that computes this feature from the transaction stream lags by 3 hours because of an upstream Kafka broker failure. For three hours, every user's `user_7d_purchase_count` reads as zero. The model receives this zero value, interprets every user as a non-purchaser, and adjusts its predictions accordingly. Conversion rates drop. Revenue falls. No exception is thrown. No alert fires — unless you are explicitly monitoring feature health.
+
+**Feature freshness monitoring**: each feature group in the feature store has a declared `expected_update_cadence` (e.g., 5 minutes for streaming features, 1 hour for hourly aggregations, 24 hours for daily features). The feature health service tracks the `updated_at` timestamp per feature group and alerts if any group's freshness exceeds 2× its expected cadence. This alert fires before the stale values propagate to enough predictions to be visible in business metrics.
+
+**Feature null rate monitoring**: a null rate above 5% for a non-nullable feature triggers an alert. Null rates are computed continuously over a rolling 5-minute window from a sample of logged feature values. A sudden spike from 0.1% to 20% null rate on a key feature is a clear signal of upstream pipeline failure.
+
+**Feature distribution drift detection**: hourly, the feature monitoring job computes the KL divergence (or Population Stability Index for bounded features) between the current hour's feature value distribution and the 7-day rolling baseline. A PSI above 0.2 indicates significant distribution shift and triggers investigation. This catches scenarios where the feature pipeline is technically healthy (no nulls, fresh timestamps) but the upstream data has changed semantically — for example, a data engineering change altered the join key for a purchase history feature, causing it to return different users' data.
+
+**Prediction distribution monitoring**: a canary model that is technically correct (no errors, acceptable latency) but producing a shifted prediction distribution is a signal that something is wrong. If the production model scores 30% of users above 0.8 (high purchase propensity) and the canary scores 60% of users above 0.8, either the canary is better (unlikely to shift by 2×) or it has a calibration bug. Monitoring prediction score distributions alongside technical metrics catches this class of bug.
+
+## Python integration — Part A: ModelServer
+
+```python
+import asyncio
+import numpy as np
+import time
+import logging
+from collections import deque
+from typing import List, Dict, Any
+from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class PendingRequest:
+    request_id: str
+    inputs: Dict[str, Any]
+    future: asyncio.Future
+    enqueued_at: float = field(default_factory=time.monotonic)
+
+class ModelServer:
+    def __init__(self, model, feature_store, max_batch_size: int = 32,
+                 max_wait_ms: float = 5.0):
+        self.model = model
+        self.features = feature_store
+        self.max_batch = max_batch_size
+        self.max_wait = max_wait_ms / 1000.0
+        self.queue: deque[PendingRequest] = deque()
+        self.lock = asyncio.Lock()
+
+    async def predict(self, request_id: str, inputs: Dict) -> Dict:
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        req = PendingRequest(request_id=request_id, inputs=inputs, future=future)
+        async with self.lock:
+            self.queue.append(req)
+            if len(self.queue) >= self.max_batch:
+                await self._flush_batch()
+        return await future
+
+    async def _flush_batch(self):
+        batch, items = [], []
+        while self.queue and len(batch) < self.max_batch:
+            req = self.queue.popleft()
+            enriched = await self.features.get_features(req.inputs)
+            batch.append(enriched)
+            items.append(req)
+
+        if not batch:
+            return
+
+        try:
+            predictions = self.model.predict_batch(np.array(batch))
+            for req, pred in zip(items, predictions):
+                req.future.set_result({"prediction": pred.tolist(),
+                                       "request_id": req.request_id})
+        except Exception as e:
+            for req in items:
+                if not req.future.done():
+                    req.future.set_exception(e)
+
+    async def run_batch_loop(self):
+        while True:
+            await asyncio.sleep(self.max_wait)
+            async with self.lock:
+                if self.queue:
+                    oldest_age = time.monotonic() - self.queue[0].enqueued_at
+                    if oldest_age >= self.max_wait:
+                        await self._flush_batch()
+```
+
+The `run_batch_loop` coroutine is started once per `ModelServer` instance via `asyncio.create_task`. It handles the timeout-based flush: even if the queue never reaches `max_batch`, requests will be served once they have waited `max_wait` seconds. The age check on `self.queue[0].enqueued_at` prevents the timeout from restarting on a fresh batch — only batches that have genuinely been waiting too long are flushed. The `asyncio.Lock` ensures that the batch-flush path and the incoming-request path do not race.
+
+## Python integration — Part B: ModelRouter
+
+```python
+import hashlib
+import redis
+import json
+import logging
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+class ModelRouter:
+    """Routes requests to model versions based on traffic config from Redis."""
+
+    def __init__(self, redis_client: redis.Redis, servers: dict,
+                 shadow_server=None):
+        self.redis = redis_client
+        self.servers = servers          # {"v2": ModelServer, "v3": ModelServer}
+        self.shadow = shadow_server
+
+    def get_version_for_request(self, model_id: str, user_id: str) -> str:
+        config_raw = self.redis.get(f"traffic:{model_id}")
+        if not config_raw:
+            return "production"
+
+        config = json.loads(config_raw)
+        weights = config.get("weights", [{"version": "production", "percent": 100}])
+
+        bucket = int(hashlib.md5(user_id.encode()).hexdigest(), 16) % 100
+        cumulative = 0
+        for entry in weights:
+            cumulative += entry["percent"]
+            if bucket < cumulative:
+                return entry["version"]
+        return weights[-1]["version"]
+
+    async def route(self, model_id: str, user_id: str,
+                    request_id: str, inputs: dict) -> dict:
+        version = self.get_version_for_request(model_id, user_id)
+        server = self.servers.get(version)
+        if server is None:
+            raise ValueError(f"No server for model {model_id} version {version}")
+
+        result = await server.predict(request_id, inputs)
+
+        if self.shadow is not None:
+            asyncio.create_task(
+                self._run_shadow(request_id, inputs, result["prediction"])
+            )
+        return result
+
+    async def _run_shadow(self, request_id: str, inputs: dict, prod_pred):
+        try:
+            shadow_result = await self.shadow.predict(f"shadow-{request_id}", inputs)
+            logger.info("shadow_compare request_id=%s prod=%s shadow=%s",
+                        request_id, prod_pred, shadow_result["prediction"])
+        except Exception as e:
+            logger.warning("Shadow inference failed: %s", e)
+```
+
+The `ModelRouter` uses MD5 as the hash function for bucket assignment — not for security but for consistent, fast bucket assignment. MD5 produces a uniform distribution across [0, 100), ensuring that traffic splits are accurate at scale. The `asyncio.create_task` call for shadow inference is the key concurrency primitive: it fires off the shadow prediction without awaiting the result, so the client's response is not delayed by shadow latency. Shadow failures are logged as warnings, not errors — shadow infrastructure degradation must never affect production serving.
+
+<TradeoffTable title="Model Serving Frameworks Compared">
+
+| Framework | Multi-framework | Dynamic Batching | GPU Support | Ops Complexity | Best For |
+|---|---|---|---|---|---|
+| Custom FastAPI server | Only what you implement | Manual (must write batching logic) | Via PyTorch/TF directly | Low initial, high at scale | Prototypes, simple models, teams that need full control of request handling |
+| TensorFlow Serving | TensorFlow and TensorFlow Lite only | Built-in (batching config file) | Yes (TF GPU backend) | Medium — GRPC/REST, config management | Pure TF shops; models already in SavedModel format; teams using TFX pipeline |
+| Triton Inference Server | PyTorch, TF, ONNX, TensorRT, XGBoost, custom backends | Built-in dynamic and sequence batching | Excellent — first-class TensorRT integration | High — model config files, ensemble pipelines, BLS scripts | High-throughput GPU serving, multi-model ensembles, LLM serving with vLLM backend |
+| Ray Serve | Any Python (PyTorch, TF, sklearn, custom) | Via DeploymentHandle composition | Yes (via underlying framework) | Medium — Ray cluster management, autoscaling config | Multi-model pipelines, Python-native teams, online+batch unification on one platform |
+
+</TradeoffTable>
+
+<Pitfall title="Deploying a model without shadow testing against live traffic">
+Offline test sets are not representative of live traffic distribution. A model that achieves 95% accuracy on the test set may have a feature preprocessing bug — a different tokenization function, a normalization applied in a different order, or a categorical encoding that maps to different integer indices than training — that only manifests when the serving code processes live data. Shadow mode catches this before it reaches users. The comparison job will report near-zero agreement between the shadow model and the production model, immediately flagging the preprocessing mismatch for investigation.
+
+Skipping shadow mode to ship faster is the single most common cause of model rollback incidents in production ML systems. The canonical failure pattern is: offline metrics look good, canary is approved without shadow validation, canary reaches 20% traffic, business metrics crater, rollback is triggered, and a postmortem reveals a one-line preprocessing difference between the training pipeline and the serving code. Shadow mode adds 24–48 hours to the deployment timeline. Rollback incidents cost significantly more in engineering time, user trust, and revenue impact.
+</Pitfall>
+
+<Pitfall title="Treating prediction latency as a pure model optimization problem">
+Feature retrieval time often dominates over model forward-pass time, and optimizing in the wrong layer wastes significant engineering effort. A 3ms model forward pass preceded by 45ms of feature store reads gives a 48ms total latency. Optimizing the model architecture to reduce forward-pass time to 1ms (an aggressive target for any meaningful model) saves only 2ms — leaving a 46ms total. The model is not the bottleneck.
+
+Caching pre-computed user features in Redis with a 30-second TTL reduces feature retrieval from 45ms to under 1ms for cache hits, saving 44ms and pushing p99 latency well within the 50ms SLA. Profile the full request path — feature retrieval, feature serialization/deserialization, network round trips to the feature store, model forward pass, and response serialization — before committing to any optimization strategy. In most production ML systems, the feature retrieval pipeline is the dominant latency contributor, and Redis caching of pre-computed feature vectors is the highest-leverage optimization available.
+</Pitfall>
+
+<Curveball title="Your model is a 70B-parameter LLM. Latency is 4 seconds per request. How do you make it serve 10K RPS?">
+You do not serve 10K RPS with a 70B parameter model in the conventional sense — at 4 seconds per request, serving 10K concurrent requests requires enough GPU capacity to have 40,000 requests in flight simultaneously, which at 140GB per model replica (70B × 2 bytes FP16) would require an impractical number of GPUs. The real question is: which combination of techniques reduces the effective latency and increases GPU utilization enough to make 10K RPS economically feasible?
+
+**Speculative decoding** pairs the 70B model with a smaller draft model (7B). The draft model generates 4–8 candidate tokens in parallel; the 70B model verifies them in a single forward pass. On average, 3–4 tokens are accepted per verification pass, reducing the number of 70B forward passes by 3–4×. This is the highest-leverage latency reduction for auto-regressive generation.
+
+**Quantization to INT4 or INT8** reduces the model memory footprint from 140GB (FP16) to 35GB (INT4). An H100 with 80GB can now host two 35GB model replicas instead of zero FP16 replicas, providing 4× more batching room on the same hardware. INT4 quantization (with techniques like GPTQ or AWQ) typically degrades model quality by 1–2% on standard benchmarks — acceptable for most applications.
+
+**Continuous batching (PagedAttention)** via vLLM allows multiple sequences to share the same GPU memory dynamically during generation. Unlike static batching (which requires all sequences in a batch to finish together), continuous batching evicts completed sequences and admits new ones in real time. This keeps GPU utilization near 100% even with variable-length outputs, which is the dominant inefficiency in auto-regressive serving.
+
+**Semantic caching**: if two requests are semantically near-identical (e.g., "What is the capital of France?" and "Tell me the capital of France"), serve the cached response. Embedding the request and doing approximate nearest-neighbor search in a vector store (FAISS or Redis with vector search) with a similarity threshold catches 10–30% of traffic as cache hits in many production LLM applications, dramatically reducing the effective load on the GPU fleet.
+
+Accept that serving 10K RPS with a 70B model requires a farm of 100+ H100 GPUs and careful capacity planning. The economics only work at scale — which is why LLM serving is typically offered as a centralized platform service rather than deployed per-team.
+</Curveball>
+
+<Curveball title="How do you handle a model that requires 10 different feature sources and the feature pipeline for one of them goes down?">
+Feature unavailability is a production reality, and the correct response is never to crash the prediction or return an error to the caller. The goal is graceful degradation: return a prediction that is less accurate than normal, clearly flagged as degraded, so the calling system can decide how to handle it.
+
+**Imputation strategy 1 — serve last known value from cache**: the feature store caches recent feature values for each entity. If the live feature pipeline for `user_purchase_history` is unavailable, serve the last cached value with a staleness annotation. The prediction is slightly stale but structurally valid. Implement this with a Redis fallback read on feature retrieval timeout: if the primary feature store returns an error or times out after 10ms, fall back to a Redis cache keyed by `entity_id:feature_group` with a TTL of 30 minutes.
+
+**Imputation strategy 2 — population mean imputation**: for each feature, pre-compute the population mean (or median, or mode for categorical features) offline and store it in a config file loaded by the serving container at startup. If the live value is unavailable, substitute the population mean. The model receives a valid value; it loses individual-level signal for that feature but retains signal from all other features. Pre-compute means per cohort (e.g., per country, per user segment) for better imputation accuracy.
+
+**Imputation strategy 3 — fall back to a simpler model**: if one or more features in the primary model's feature set are unavailable, the serving layer can route to a secondary model that was trained without those features. This requires maintaining a feature-subset model in the registry — an engineering investment that pays off when the missing features are high-cardinality lookup features that frequently experience pipeline failures.
+
+The key principle: the prediction endpoint must never return an HTTP 500 due to a feature pipeline failure. Return `{ "prediction": ..., "degraded": true, "degraded_features": ["user_purchase_history"] }` in the response body. The calling system can decide whether to show the degraded prediction or fall back to a hard-coded default. Monitor the `degraded` flag rate in Prometheus — a sustained elevation signals a feature pipeline outage that requires immediate investigation.
+</Curveball>
+
+<Curveball title="The ML team wants to run 20 different A/B experiments simultaneously. How do you avoid experiment interference?">
+Running 20 experiments simultaneously with naive random assignment is statistically dangerous. If 20% of users are in experiment A and 20% of users are in experiment B, the two experiments' user populations overlap. Users in the overlap experience both treatments simultaneously. When experiment A shows a 2% lift, you cannot tell whether the lift is from A's treatment or from an interaction effect with B's treatment. This is experiment interference, and it invalidates the statistical analysis of both experiments.
+
+**The experiment layer (orthogonal design)** solves this by organizing experiments into mutually exclusive layers. Within a layer, each user is assigned to at most one experiment. Across layers, experiments are independent — a user can be in experiment A (layer 1: retrieval model) and experiment B (layer 2: ranking model) simultaneously, because A and B modify different parts of the serving stack and their effects are independent.
+
+In practice: define layers corresponding to serving stack components. Layer 1: feature retrieval experiments. Layer 2: model architecture experiments. Layer 3: post-processing and ranking experiments. Within each layer, user IDs are hashed to experiment buckets, and the bucket assignment for layer 1 is independent of the bucket assignment for layer 2 (use different hash seeds: `hash(user_id + "layer1") % 100` vs. `hash(user_id + "layer2") % 100`).
+
+For the model serving infrastructure, this means the model router must support hierarchical routing: first assign the user to a layer-1 experiment (which may route to a different feature retrieval configuration), then assign to a layer-2 experiment (which routes to a different model version), and so on. Each layer's routing is an independent traffic config in Redis.
+
+With 20 experiments across 3 layers (e.g., 6 in layer 1, 8 in layer 2, 6 in layer 3), and each experiment requiring 5% of traffic for statistical power, the total traffic consumed is: $6 \times 5\% = 30\%$ in layer 1, leaving 70% as the control group. Each layer independently runs at 30–40% experiment traffic, which is achievable. The orthogonal design ensures that no user sees interactions between layer-1 and layer-2 experiments that confound the analysis.
+</Curveball>
+
+## Further reading
+
+The deepest technical references for ML serving infrastructure are spread across company engineering blogs and academic venues. NVIDIA's Triton Inference Server documentation covers dynamic batching, sequence batching, and ensemble pipelines in exhaustive detail — the `max_queue_delay_microseconds` and `preferred_batch_size` parameters are the primary tuning levers for micro-batching, and the documentation's performance tuning guide explains the trade-offs clearly. vLLM's PagedAttention paper (Kwon et al., 2023) is the foundational reference for continuous batching in LLM serving, explaining how paging the KV cache eliminates memory fragmentation and enables near-100% GPU utilization for auto-regressive generation. Ray Serve's architecture blog describes how the actor-per-replica model provides fault isolation and horizontal scaling for Python-native model serving, and why the DeploymentHandle composition API enables multi-model pipelines without custom routing code. For real-world ML platform design at scale, Uber's Michelangelo paper (Hermann et al., 2017) remains the canonical reference: it describes the complete ML lifecycle from feature store through model training to online serving, and the shadow mode and canary deployment patterns described in this article were pioneered in Michelangelo's production deployment. Uber's "Lessons from Building Real-time ML Systems" talk from their engineering conference covers the specific failure modes — stale features, preprocessing mismatches, and silent accuracy degradation — that motivated the feature health monitoring design described in the deep dive above. Airbnb's ML platform engineering blog covers the shadow mode pattern in the context of their search ranking infrastructure, describing how they use shadow mode to validate preprocessing parity between training and serving before any model version is promoted to canary.
+
+<RelatedQuestions items={[
+  { slug: "recommendation-engine", title: "Design a Recommendation Engine", difficulty: "staff" },
+  { slug: "feature-store", title: "Design a Feature Store", difficulty: "staff" },
+  { slug: "fraud-detection", title: "Design a Fraud Detection System", difficulty: "staff" },
+]} />

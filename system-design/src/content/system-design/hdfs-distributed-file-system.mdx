@@ -1,0 +1,539 @@
+---
+title: "Design a Distributed File System (HDFS)"
+slug: "hdfs-distributed-file-system"
+category: "storage"
+difficulty: "staff"
+estimatedReadMinutes: 24
+tags: ["hdfs", "namenode", "datanode", "block-replication", "rack-awareness", "ha-namenode", "fsimage", "edit-log"]
+companyFlavors: ["Apache HDFS", "Google GFS", "Facebook Tectonic", "Azure Data Lake", "AWS EMR"]
+prerequisites: ["consistent-hashing", "distributed-locking-service"]
+relatedQuestions: ["s3-object-storage", "distributed-kv-store", "dropbox-google-drive"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Design a distributed file system in the style of HDFS and GFS — covering NameNode/DataNode architecture, block replication with rack awareness, NameNode HA using Quorum Journal Manager, and the write-once-read-many access model that enables MapReduce-style workloads at petabyte scale."
+javaPackages: ["org.apache.hadoop:hadoop-client:3.3.6", "org.springframework.boot:spring-boot-starter:3.3.0"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="hdfs-distributed-file-system" title="Design a Distributed File System (HDFS)" />
+
+<Tldr>
+- **NameNode/DataNode split**: NameNode is a single coordinator that holds the entire file system namespace in RAM (~200 bytes per file/block). DataNodes are storage nodes that hold actual data blocks and send heartbeats every 3 seconds.
+- **Block size 128 MB** (not 4 KB like a local FS) — large blocks minimize NameNode metadata overhead and maximize sequential read throughput for analytics workloads. This is intentionally bad for small files.
+- **Rack awareness**: first replica on the local rack, second on a different rack, third on the same rack as the second — this minimizes cross-rack traffic while surviving a full rack failure.
+- **NameNode HA with Quorum Journal Manager (QJM)**: Active NN writes the edit log to 3+ JournalNodes (Paxos-based). Standby NN tails the edit log and keeps its namespace in sync. Failover completes in under 30 seconds.
+- **Write-once-read-many**: HDFS is optimized for batch reads (Spark, MapReduce), not random writes. Appends are supported (HBase WAL uses this), but arbitrary block updates are not.
+</Tldr>
+
+## The HDFS design philosophy
+
+HDFS was not designed to be a general-purpose file system. It was designed to support a specific programming model — MapReduce — where the key insight is "move computation to data, not data to computation." In a traditional distributed system, a compute node fetches data from a storage server across the network, processes it, and writes results back. At petabyte scale, the network becomes the bottleneck before the disks or CPUs do. HDFS inverts this: because the NameNode knows exactly which DataNode holds each block, the JobTracker (or YARN ResourceManager in modern Hadoop) schedules computation tasks on the same physical nodes that store the input blocks. The network is used only when data locality cannot be achieved — rack-local is the fallback, and cross-rack is the last resort. This data locality principle is the reason HDFS uses large 128 MB blocks: fewer blocks means fewer scheduling decisions, and each compute task processes a large contiguous chunk of data from local disk with sequential I/O — the fastest I/O pattern possible.
+
+The write-once-read-many (WORM) model is the second foundational choice. HDFS does not support in-place block updates: once a block is written, its bytes are immutable. This simplicity enables several aggressive read optimizations. The NameNode never needs to track write locks on blocks. DataNodes never need to handle concurrent writers. The client can safely cache block locations returned by the NameNode for the lifetime of a read — they will not change. Appends are supported because they only extend the last block of a file, but they are not a general-purpose write interface. Systems that need random write access — relational databases, OLTP workloads — do not belong on HDFS; they belong on Ceph, HDFS with HBase, or a proper block store.
+
+The "small files problem" is the sharpest illustration of HDFS's opinionated design. Every file in HDFS — regardless of size — occupies at least one block's worth of metadata in the NameNode's heap (an INode record of approximately 150–200 bytes), plus one block record per 128 MB of file data. A 10 KB log file consumes the same NameNode RAM as a 10 KB slice of a 10 TB Parquet file. If you store 1 billion 10 KB log files, you consume 200 GB of NameNode RAM and generate 1 billion nearly-empty blocks — 127.99 MB of wasted block space each. The NameNode becomes the bottleneck, GC pauses lengthen as the heap fills, and read throughput collapses because MapReduce must schedule billions of tasks (one per block). The canonical solutions — SequenceFiles, HAR archives, or simply not putting small files in HDFS — are compensations for the fact that HDFS was never designed for this access pattern. Recognizing which workloads belong in HDFS versus object storage versus a local FS is the first conversation you should have at the design table.
+
+## Clarifying questions
+
+Lock down these eight questions before sketching any architecture. Each one gates a design decision that will significantly change the system shape.
+
+| Question | Ideal answer | Why it matters |
+|---|---|---|
+| What is the dominant access pattern — sequential reads for analytics, or random access for OLTP? | Sequential read-heavy, analytics (Spark/MapReduce) | Sequential reads drive the 128 MB block size choice and data locality scheduling; random access would require a different architecture (Ceph, or HBase on top of HDFS) |
+| What is the file size distribution — mostly large files or many small files? | Mostly large (GBs to TBs), occasional small config/metadata files | Millions of small files exhaust NameNode RAM and require a mitigation strategy (SequenceFiles, HAR); large files are the native happy path |
+| What replication factor is required? | 3× by default; critical data at 5× | Drives raw storage capacity planning and the rack-aware placement policy — 3× is the minimum to survive a rack failure with rack-aware placement |
+| Is NameNode HA required? | Yes — no single point of failure in production | Determines whether you deploy Active/Standby NN with QJM, or accept the legacy Secondary NameNode checkpoint model (not a hot standby) |
+| Is the cluster multi-rack or multi-datacenter? | Multi-rack within a single datacenter | Multi-rack enables rack-aware placement; multi-datacenter adds DistCp replication complexity and consistency trade-offs |
+| What workloads run on top of HDFS? | Spark batch jobs, Hive queries, occasional HBase WAL appends | Spark and Hive drive large-block sequential reads; HBase WAL requires append semantics, which HDFS supports since version 0.21 |
+| Is POSIX compliance required? | No — HDFS semantics are sufficient | Full POSIX compliance (e.g., mmap, mandatory locks, O_DIRECT) is not supported; tools that require POSIX must use a FUSE mount (hdfs-fuse) with significant performance overhead |
+| What is the expected namespace size — number of files and directories? | Up to 500 million files/directories | NameNode RAM is the binding constraint: 500M × 200 bytes = 100 GB RAM just for inodes; drives NameNode hardware selection |
+
+## Functional requirements
+
+- **POSIX-like file operations**: `create`, `read`, `append`, `rename`, `delete`, `mkdirs`, `listStatus` — no in-place random writes
+- **Directory hierarchy**: a full tree namespace (`/user/pushkar/data/events/2026-05-07/`) maintained exclusively in NameNode memory
+- **Configurable replication factor**: per-file replication (default 3), adjustable at creation time or retroactively via `setReplication`
+- **Rack-aware block placement**: the default policy places 3 replicas to survive a full rack failure using at most 1 cross-rack write hop
+- **Block-level checksums**: every 512-byte chunk within a block has a CRC-32C checksum stored in a `.meta` file alongside the data block; DataNodes verify checksums on read and report corruption to the NameNode
+- **Block reports**: on startup and periodically (every 6 hours), each DataNode sends the NameNode a complete inventory of all blocks it holds — the NameNode uses this to reconstruct the block-to-DataNode mapping after a restart
+
+## Non-functional requirements
+
+- **Storage scale**: petabyte-scale; 100+ DataNodes × 30 TB each = 3+ PB raw capacity per cluster
+- **Namespace scale**: up to 1 billion files and directories in a single cluster before NameNode RAM becomes a hard constraint
+- **NameNode in-memory namespace**: ~200 bytes per INode → 1 billion files = 200 GB RAM; the NameNode must be provisioned with a correspondingly large heap (e.g., 256 GB RAM server)
+- **Replication**: 3× by default; under-replicated blocks must be detected and re-replicated within minutes of a DataNode failure
+- **Read throughput**: ~1 GB/sec sustained sequential read per DataNode from spinning disk; NVMe DataNodes can sustain 3–5 GB/sec
+- **NameNode failover**: Active/Standby with QJM achieves failover in under 30 seconds; the cluster remains readable during failover and writable within 30 seconds
+- **Durability**: a committed write is durable across 3 independent nodes and 2 independent racks by default; a single node or rack failure does not cause data loss
+
+## Capacity estimation
+
+<Capacity title="NameNode RAM, storage sizing, and heartbeat load for a 1B-file, 1 PB cluster">
+
+**NameNode RAM for namespace**
+
+Each file or directory occupies one INode in NameNode heap memory. The INode record includes the name, permissions, timestamps, replication factor, and an array of block IDs — approximately 150–200 bytes per record in the HDFS INodeFile representation.
+
+$$
+\text{NameNode RAM} = 1 \times 10^9\ \text{files} \times 200\ \frac{\text{bytes}}{\text{inode}} = 200\ \text{GB}
+$$
+
+This is the minimum heap requirement just for the namespace — before accounting for the block-to-DataNode mapping, JVM overhead, or GC headroom. A production NameNode for a billion-file cluster requires a 256–512 GB RAM server with a tuned G1 or ZGC garbage collector to avoid stop-the-world pauses.
+
+**Block metadata overhead**
+
+Each file contributes one INode plus one block record per 128 MB of file data. Each block record stores the block ID, generation stamp, and a list of DataNode locations — approximately 50 bytes per block record.
+
+$$
+\text{blocks for 1 PB} = \frac{1\ \text{PB}}{128\ \text{MB}} = \frac{10^{15}\ \text{bytes}}{128 \times 10^6\ \text{bytes}} \approx 7.8 \times 10^6\ \text{blocks}
+$$
+
+$$
+\text{block map RAM} = 7.8 \times 10^6 \times 50\ \text{bytes} \approx 390\ \text{MB}
+$$
+
+Block map RAM is negligible compared to the INode table — the NameNode RAM bottleneck is driven by the number of files, not the volume of data.
+
+**Raw storage with 3× replication**
+
+$$
+\text{raw storage needed} = 1\ \text{PB user data} \times 3 = 3\ \text{PB}
+$$
+
+With 100 DataNodes at 30 TB each:
+
+$$
+\text{cluster raw capacity} = 100 \times 30\ \text{TB} = 3{,}000\ \text{TB} = 3\ \text{PB}
+$$
+
+This exactly meets a 3× replication requirement for 1 PB of user data. In practice, reserve 15–20% headroom for replication traffic, compaction, and DataNode imbalance:
+
+$$
+\text{usable capacity} = 3\ \text{PB} \times 0.80 = 2.4\ \text{PB} \Rightarrow \text{supports}\ 800\ \text{TB user data at } 3\times
+$$
+
+Scale to 125 DataNodes to comfortably hold 1 PB user data with replication headroom.
+
+**Heartbeat load on NameNode**
+
+DataNodes send a heartbeat to the NameNode every 3 seconds to confirm they are alive. Each heartbeat is a lightweight RPC (~100 bytes). With 100,000 DataNodes in a very large cluster:
+
+$$
+\text{heartbeats/sec} = \frac{100{,}000\ \text{DataNodes}}{3\ \text{s}} \approx 33{,}333\ \text{RPCs/sec}
+$$
+
+The NameNode processes these on a single JVM thread pool. At 100 DataNodes (a typical medium cluster), the load is a trivial 33 RPCs/sec. At 10,000 DataNodes (a large Hadoop cluster), it reaches 3,333 RPCs/sec — still manageable on a single high-end NameNode, but approaching the threshold where batching heartbeats becomes important.
+
+</Capacity>
+
+## API design
+
+HDFS does not expose an HTTP REST API by default. The client communicates with the NameNode via a custom RPC protocol (Hadoop IPC, built on Protocol Buffers) and streams block data directly to/from DataNodes over a raw TCP pipeline. The logical API surface:
+
+```
+// Metadata operations (client → NameNode RPC)
+HdfsFileStatus create(String path, short replication, long blockSize)
+LocatedBlocks getBlockLocations(String path, long offset, long length)
+void append(String path)
+boolean rename(String src, String dst)
+boolean delete(String path, boolean recursive)
+boolean mkdirs(String path, FsPermission permission)
+DirectoryListing listStatus(String path, byte[] startAfter)
+void setReplication(String path, short replication)
+void complete(String path, String clientName, ExtendedBlock lastBlock)
+
+// Block streaming (client → DataNode TCP, no NameNode involvement)
+// Write: client opens TCP connection to DN1, sends block header + data stream
+// DN1 pipelines to DN2 which pipelines to DN3; acks propagate back to client
+// Read: client opens TCP connection to nearest DN and reads block bytes directly
+
+// WebHDFS (HTTP REST façade, optional)
+GET    /webhdfs/v1/{path}?op=OPEN&offset=0&length=65536
+PUT    /webhdfs/v1/{path}?op=CREATE&replication=3&blocksize=134217728
+POST   /webhdfs/v1/{path}?op=APPEND
+DELETE /webhdfs/v1/{path}?op=DELETE&recursive=true
+GET    /webhdfs/v1/{path}?op=LISTSTATUS
+GET    /webhdfs/v1/{path}?op=GETFILESTATUS
+```
+
+The separation of metadata (NameNode RPC) from data (DataNode TCP) is the defining characteristic of the HDFS API. The NameNode never sees a single byte of user data — it only assigns block IDs and returns DataNode addresses. The client then talks directly to the DataNodes. This is why the NameNode is not a throughput bottleneck for data reads: a cluster of 1,000 DataNodes can serve 1,000 parallel data streams with zero NameNode involvement after the initial `getBlockLocations` call.
+
+## Data model
+
+**NameNode in-memory namespace (INode tree)**
+
+The NameNode maintains a tree of INode objects that mirrors the file system directory hierarchy. Every directory and file is an INode:
+
+```
+INodeDirectory {
+  id:          long            // unique inode ID
+  name:        byte[]          // just the last path component, not the full path
+  parent:      INodeDirectory
+  children:    Map<byte[], INode>  // children indexed by name
+  permissions: FsPermission    // user/group/other rwx bits
+  modTime:     long
+  accessTime:  long
+}
+
+INodeFile extends INode {
+  replicationFactor: short
+  preferredBlockSize: long     // 128 MB default
+  blockIds:          long[]    // ordered list of block IDs for this file
+  header:            long      // packed permissions + replication + blocksize
+}
+```
+
+The entire namespace — every directory and file path — lives in RAM. Path resolution is an in-memory tree walk: `/user/pushkar/data/events/` traverses four INodeDirectory nodes. There is no disk I/O during normal path lookups.
+
+**Block-to-DataNode mapping (also in NameNode RAM)**
+
+```
+BlocksMap: Map<BlockId, BlockInfo>
+
+BlockInfo {
+  blockId:         long
+  generationStamp: long      // monotonically increasing; used to detect stale replicas
+  numBytes:        long
+  datanodes:       DatanodeStorageInfo[]  // ordered list of replica locations
+}
+```
+
+This map is rebuilt from DataNode block reports on every NameNode startup — it is not persisted to disk. After a NameNode restart, the NameNode enters **safe mode**: it waits until it has received block reports from enough DataNodes to account for a configurable percentage of the expected blocks (default 99.9%) before exiting safe mode and accepting writes.
+
+**FsImage and Edit Log (NameNode persistence)**
+
+```
+FsImage:  point-in-time serialized snapshot of the entire INode tree
+          stored at: ${dfs.namenode.name.dir}/current/fsimage_<txid>
+
+EditLog:  append-only journal of every namespace mutation since the last FsImage
+          stored at: ${dfs.namenode.name.dir}/current/edits_<start>-<end>
+          mutations: mkdir, create, append, rename, delete, setReplication, ...
+
+Startup sequence:
+  1. Load most recent FsImage into RAM  (bulk deserialization)
+  2. Replay all EditLog segments since that FsImage (in txid order)
+  3. Rebuild BlocksMap from DataNode block reports (safe mode)
+  4. Begin serving requests
+```
+
+**DataNode on-disk layout**
+
+```
+${dfs.datanode.data.dir}/
+  current/
+    BP-<blockPoolId>/
+      current/
+        finalized/
+          subdir0/subdir0/
+            blk_<blockId>          # raw block bytes
+            blk_<blockId>.meta     # CRC-32C checksums (512-byte granularity)
+        rbw/                       # replica-being-written (incomplete blocks)
+```
+
+DataNodes do not maintain any metadata about which file a block belongs to — that association lives exclusively in the NameNode. A DataNode sees only opaque block files and their checksums.
+
+## High-level architecture
+
+<Mermaid caption="HDFS cluster topology: Client talks to NameNode for metadata (block locations) and directly to DataNodes for data. The Active NameNode writes every mutation to a quorum of JournalNodes. The Standby NameNode tails the JournalNodes continuously to keep its namespace current. ZKFC monitors both NameNodes and triggers automatic failover via ZooKeeper." diagram={`graph TB
+  Client[HDFS Client] --> NN[Active NameNode]
+  Client --> DN1[DataNode 1\nRack A]
+  Client --> DN2[DataNode 2\nRack B]
+  Client --> DN3[DataNode 3\nRack B]
+  NN <-->|namespace sync| SNN[Standby NameNode]
+  NN <-->|edit log writes| JN1[JournalNode 1]
+  NN <-->|edit log writes| JN2[JournalNode 2]
+  NN <-->|edit log writes| JN3[JournalNode 3]
+  SNN <-->|edit log tailing| JN1
+  SNN <-->|edit log tailing| JN2
+  SNN <-->|edit log tailing| JN3
+  DN1 -->|heartbeat + block report| NN
+  DN2 -->|heartbeat + block report| NN
+  DN3 -->|heartbeat + block report| NN
+  NN <-->|leader election| ZK[ZooKeeper]
+  SNN <-->|leader election| ZK`} />
+
+<Mermaid caption="HDFS write pipeline for a 3-replica write. The NameNode assigns block IDs and returns the ordered DataNode pipeline. The client writes to DN1 which forwards to DN2 which forwards to DN3. Acks propagate back up the chain. Once all three acks reach the client, the block is committed and the client requests the next block allocation." diagram={`sequenceDiagram
+  autonumber
+  participant C as Client
+  participant NN as NameNode
+  participant DN1 as DataNode 1\n(Rack A)
+  participant DN2 as DataNode 2\n(Rack B)
+  participant DN3 as DataNode 3\n(Rack B)
+
+  C->>NN: create("/data/events.parquet", rep=3)
+  NN-->>C: OK — begin writing block 1001
+  C->>NN: addBlock(file, block=1001)
+  NN-->>C: pipeline=[DN1, DN2, DN3]
+  C->>DN1: write block 1001 header (pipeline=[DN2,DN3])
+  DN1->>DN2: forward header (pipeline=[DN3])
+  DN2->>DN3: forward header (pipeline=[])
+  C->>DN1: stream block data (128 MB)
+  DN1->>DN2: pipeline data
+  DN2->>DN3: pipeline data
+  DN3-->>DN2: ACK
+  DN2-->>DN1: ACK
+  DN1-->>C: ACK — block 1001 complete
+  C->>NN: complete(file, lastBlock=1001)`} />
+
+## Deep dives
+
+### Write path
+
+When a client creates a new file, the sequence of events is more involved than a typical client-server write. The client calls `create()` on the NameNode, which creates the INodeFile in the namespace and marks the file as "under construction" — a special state that locks the file against concurrent writers (HDFS allows only one writer per file at a time). The client then calls `addBlock()` to request a new block allocation. The NameNode runs the block placement policy, selects a pipeline of DataNodes, increments a block ID counter, records the new block in the BlocksMap as `UNDER_CONSTRUCTION`, and returns the pipeline list to the client.
+
+The client opens a TCP connection to DN1 (the first node in the pipeline) and sends a block write header that includes the full downstream pipeline: `[DN2, DN3]`. DN1, upon receiving this header, opens its own TCP connection to DN2 with pipeline `[DN3]`, and DN2 opens a connection to DN3 with an empty pipeline. This chain is established before any data bytes flow. Once all three connections are open, the client streams block data to DN1 in packets (typically 64 KB each). DN1 buffers each packet, forwards it to DN2, and writes it to local disk simultaneously. DN2 does the same toward DN3. Once a packet is acknowledged by all downstream nodes, the ack propagates back up the chain to the client.
+
+After the last packet of the block is acknowledged, the client calls `addBlock()` again for the next block. When all blocks are written, the client calls `complete()` on the NameNode, which transitions the file from "under construction" to "closed" — making it readable by other clients. Pipeline writes minimize cross-rack traffic: only one hop (DN1 → DN2) crosses rack boundaries; the DN2 → DN3 hop stays within Rack B. A naïve client-to-three-nodes fan-out would generate three cross-rack writes per block instead of one.
+
+### Rack-aware placement policy
+
+The default HDFS rack-awareness policy for a replication factor of 3 follows a specific algorithm that balances write efficiency against fault tolerance:
+
+1. **Replica 1**: place on the same node as the writer, if the writer is a DataNode (e.g., a Spark executor co-located on a DataNode). If the writer is not a DataNode (an off-cluster client), place on a randomly chosen DataNode in the local rack, or any random DataNode if the client has no rack affinity.
+2. **Replica 2**: place on a DataNode in a **different rack** from replica 1. This is the one cross-rack write. It ensures that no single rack failure can destroy all replicas.
+3. **Replica 3**: place on a **different DataNode in the same rack as replica 2**. This avoids a second cross-rack write while ensuring that if the rack containing replica 1 fails entirely, there are still 2 replicas on a separate rack.
+
+The result: 2 of 3 replicas survive any single rack failure (replicas 2 and 3 are on Rack B; replica 1 is on Rack A — either rack can fail independently). Only 1 cross-rack hop occurs during the write pipeline (DN1 on Rack A → DN2 on Rack B). Read locality: when a Spark task is scheduled on Rack A, it reads from replica 1 (rack-local). If Rack A is down, it reads from replicas 2 or 3 on Rack B. The placement policy is a configurable interface (`BlockPlacementPolicy`) — production clusters at companies like ByteDance and Facebook extend it to be datacenter-aware for geo-redundant deployments.
+
+### NameNode HA with Quorum Journal Manager
+
+Without HA, the NameNode is a catastrophic single point of failure: if it crashes, the cluster is entirely unavailable for reads and writes until the NameNode restarts and replays its edit log — a process that can take 30+ minutes for a large namespace. The legacy "Secondary NameNode" checkpoint mechanism is frequently misunderstood as a hot standby. It is not. The Secondary NameNode periodically merges FsImage and EditLog to prevent the EditLog from growing unboundedly, but it is not running a live copy of the namespace and cannot take over instantly.
+
+The Quorum Journal Manager (QJM) provides true Active/Standby HA. The architecture has three components:
+
+**JournalNodes** (typically 3 or 5, always an odd number) form a Paxos quorum. The Active NameNode writes every namespace mutation (mkdir, create, rename, delete) as an edit record to all JournalNodes. A write is considered committed when a quorum (at least `(N/2)+1`, so 2 of 3) JournalNodes acknowledge it. This is the same quorum logic as Raft/Paxos: as long as a majority of JournalNodes are alive, the edit log is durable and available.
+
+**Standby NameNode** continuously tails the JournalNodes, reading committed edit records and applying them to its own in-memory namespace. This is not batch synchronization — it happens on a short poll interval (typically 1 second). The Standby's namespace lags the Active's by at most a few seconds. DataNodes send block reports and heartbeats to both the Active and Standby simultaneously, so the Standby's BlocksMap is also fully populated — the Standby is a fully warm replica that can serve reads immediately upon failover.
+
+**ZooKeeper Failover Controller (ZKFC)** runs as a sidecar process on each NameNode host. ZKFC monitors the local NameNode via a health check RPC. If the Active NN stops responding, ZKFC deletes the Active's ZooKeeper lock node. The Standby's ZKFC detects the lock deletion and initiates failover. Before the Standby becomes Active, ZKFC executes **fencing**: it attempts to kill the old Active via SSH kill or STONITH (Shoot The Other Node In The Head) to prevent split-brain — two NameNodes both believing they are Active and writing to the edit log simultaneously. Only after successful fencing does the Standby accept its new role and begin serving write traffic. Typical failover end-to-end: 5–30 seconds depending on the health check timeout and fencing method.
+
+### The small files problem
+
+The small files problem is not merely a performance inconvenience — at sufficient scale, it makes the cluster operationally unmanageable. Consider a log ingestion pipeline writing 1 KB log files at 100,000 files/minute. After one week, that is 1 billion files. NameNode RAM consumption: 200 GB for inodes alone, before block map entries. The NameNode JVM runs full GC pauses that stop all namespace operations for seconds at a time. Listing a directory with 1 million files (`listStatus`) returns 1 million INode records serialized over RPC — the NameNode's single RPC handler thread is saturated during the scan. A MapReduce job over this data generates 1 billion map tasks (one per block) — the scheduler overhead exceeds the actual computation time.
+
+The three principal mitigations:
+
+**SequenceFiles** aggregate many small records into one large file using a key-value binary format. A SequenceFile of 10 million log records stored as `(filename, bytes)` pairs takes one HDFS block and one INode. MapReduce reads SequenceFiles efficiently by splitting them at record boundaries. The downside is that individual records are not independently accessible — you must read a full block to find a specific record. Hive and Spark support SequenceFile as a native input format, so the change is transparent to analytic queries.
+
+**HAR (HDFS Archive) files** pack an existing directory of small files into a single `.har` archive that is stored as a normal HDFS file. HAR maintains an index file mapping original file paths to byte offsets within the archive. This dramatically reduces NameNode INode count — thousands of original files become 3 HDFS files (index, master index, data). The caveat: HAR files cannot be appended to, and reading a single file from a HAR requires a seek into the archive — suitable for cold archival data, not active ingestion pipelines.
+
+**Object storage offload**: for small files that are not accessed in bulk MapReduce patterns — images, configuration files, per-event JSON blobs — the correct architectural answer is to not use HDFS at all. S3 or HDFS-compatible object stores (like MinIO or Azure ADLS) handle billions of small objects natively without a centralized namespace service. Reserve HDFS for what it was designed for: large sequential files consumed by batch analytics engines.
+
+## Java integration
+
+### Part A — HDFS client write and read
+
+```java
+package dev.pushkar.hdfs;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.FSDataOutputStream;
+import org.apache.hadoop.fs.FSDataInputStream;
+import java.io.InputStream;
+import java.net.URI;
+
+@Component
+public class HdfsService implements AutoCloseable {
+    private final FileSystem fs;
+
+    public HdfsService(@Value("${hdfs.uri}") String hdfsUri) throws Exception {
+        Configuration conf = new Configuration();
+        conf.set("fs.defaultFS", hdfsUri);
+        // Enable short-circuit reads when client runs on a DataNode:
+        // the client reads directly from the local disk instead of going through
+        // the DataNode's TCP server — eliminates a loopback copy for rack-local reads
+        conf.setBoolean("dfs.client.read.shortcircuit", true);
+        conf.set("dfs.domain.socket.path", "/var/lib/hadoop-hdfs/dn_socket");
+        // Retry up to 3 times on block write errors before failing the block
+        conf.set("dfs.client.block.write.retries", "3");
+        // Use hedged reads: fire a second read request to a different replica
+        // after 500ms if the first hasn't responded — reduces p99 read latency
+        conf.setLong("dfs.client.hedged.read.threadpool.size", 10);
+        conf.setLong("dfs.client.hedged.read.threshold.millis", 500);
+        this.fs = FileSystem.get(new URI(hdfsUri), conf);
+    }
+
+    public void write(String hdfsPath, InputStream data, short replication) throws Exception {
+        Path path = new Path(hdfsPath);
+        // Create with explicit replication factor and 128 MB block size.
+        // Buffer size 65536 is the client-side write buffer before flushing to the pipeline.
+        try (FSDataOutputStream out = fs.create(
+                path,
+                true,           // overwrite if exists
+                65536,          // buffer size
+                replication,    // replication factor
+                128 * 1024 * 1024L)) {  // 128 MB block size
+            data.transferTo(out);
+            // hflush() flushes to DataNode buffers — readable by other clients.
+            // hsync() additionally flushes to DataNode disk — durable on all replicas.
+            out.hsync();
+        }
+    }
+
+    public byte[] read(String hdfsPath) throws Exception {
+        Path path = new Path(hdfsPath);
+        // open() calls getBlockLocations() on the NameNode and returns a stream
+        // that reads blocks directly from DataNodes in order
+        try (FSDataInputStream in = fs.open(path, 65536)) {
+            return in.readAllBytes();
+        }
+    }
+
+    public void moveToArchive(String srcPath, String archivePath) throws Exception {
+        // rename() is a metadata-only operation on the NameNode — O(1), no data movement
+        fs.rename(new Path(srcPath), new Path(archivePath));
+    }
+
+    public org.apache.hadoop.fs.FileStatus[] listDir(String dirPath) throws Exception {
+        return fs.listStatus(new Path(dirPath));
+    }
+
+    @Override
+    public void close() throws Exception { fs.close(); }
+}
+```
+
+The `hsync()` call after writing is a critical correctness detail. `hflush()` flushes buffered data to the DataNode process but does not guarantee disk persistence — the data is readable by other clients but may be lost if the DataNode crashes before writing to disk. `hsync()` blocks until the data is durably written to disk on all replica DataNodes and is the equivalent of `fsync()` in a local file system. For a production data ingestion pipeline, always call `hsync()` at the end of each logical record boundary — failing to do so means accepting that a DataNode crash can cause partial data loss even though the write appeared to succeed.
+
+### Part B — Spring Boot HDFS data ingestion service
+
+```java
+@Service
+@Slf4j
+public class DataIngestionService {
+    private final HdfsService hdfs;
+
+    public DataIngestionService(HdfsService hdfs) {
+        this.hdfs = hdfs;
+    }
+
+    @Scheduled(cron = "0 0 2 * * *") // 2 AM daily
+    public void ingestDailyBatch() throws Exception {
+        String date = LocalDate.now().format(DateTimeFormatter.ISO_DATE);
+        String hdfsPath = "/data/events/" + date + "/events.parquet";
+
+        log.info("Starting daily batch ingest to HDFS: {}", hdfsPath);
+        try (InputStream events = fetchDailyEvents()) {
+            // Replication factor 3: survives 2 DataNode failures or 1 full rack failure
+            hdfs.write(hdfsPath, events, (short) 3);
+        }
+        log.info("Ingest complete for {}. Triggering Spark job.", date);
+        triggerSparkJob(hdfsPath);
+    }
+
+    private void triggerSparkJob(String inputPath) throws Exception {
+        // Spark reads directly from HDFS using the hadoop-client library.
+        // spark-submit submits the job to YARN; YARN schedules tasks on nodes
+        // co-located with HDFS blocks for data locality.
+        var cmd = List.of(
+            "spark-submit",
+            "--class", "dev.pushkar.jobs.DailyAggregation",
+            "--master", "yarn",
+            "--deploy-mode", "cluster",
+            "--conf", "spark.yarn.maxAppAttempts=2",
+            "--conf", "spark.hadoop.dfs.client.read.shortcircuit=true",
+            "jobs/daily-agg.jar",
+            inputPath
+        );
+        Process proc = new ProcessBuilder(cmd)
+            .redirectErrorStream(true)
+            .start();
+        int exitCode = proc.waitFor();
+        if (exitCode != 0) {
+            throw new RuntimeException("spark-submit failed with exit code " + exitCode);
+        }
+        log.info("Spark job submitted successfully for input: {}", inputPath);
+    }
+
+    private InputStream fetchDailyEvents() {
+        // Implementation fetches from upstream data source (Kafka, S3, API, etc.)
+        throw new UnsupportedOperationException("implement per your source");
+    }
+}
+```
+
+<TradeoffTable title="Distributed file and object storage architecture comparison">
+
+| System | Block size | Consistency | Random write | Best for |
+|---|---|---|---|---|
+| **HDFS** | 128 MB | Strong (NameNode is the authority for all metadata; no split-brain with QJM) | No — write-once-read-many; appends supported | Batch analytics (Spark, MapReduce, Hive); sequential reads at petabyte scale |
+| **GFS / Colossus** | 64 MB (GFS); variable (Colossus) | Relaxed — append-only with at-least-once semantics; concurrent appenders supported | No — append-only | Google-internal workloads: Bigtable WAL, YouTube video storage, search index files |
+| **S3** | Any — multipart minimum 5 MB per part | Eventual for list operations (historically); strong read-after-write for GET since 2020 | No — objects are immutable; overwrite creates a new version | Object storage, media files, data lake landing zone; best for small-to-medium files that don't fit HDFS |
+| **Ceph (RADOS)** | 4 MB (RADOS objects) | Strong — CRUSH algorithm with primary OSD as write authority | Yes — supports random block writes via RBD (RADOS Block Device) | General-purpose: OpenStack Cinder volumes, Kubernetes PVs, mixed read/write workloads |
+
+</TradeoffTable>
+
+<Pitfall title="Treating the Secondary NameNode as a hot standby">
+
+The Secondary NameNode (SNN) is one of the most persistently misunderstood components in Hadoop. Its name implies a backup NameNode that can take over immediately if the primary fails. It cannot. The SNN's sole function is checkpointing: it periodically downloads the current FsImage and in-progress EditLog from the primary NameNode, merges them into a new FsImage, and uploads it back. This prevents the EditLog from growing unboundedly. The SNN does not maintain a live copy of the namespace in RAM — it runs the merge operation and then sits idle until the next checkpoint cycle (typically every hour or every 1 million transactions).
+
+If the primary NameNode crashes when the SNN is in use (not QJM HA), recovery requires: stopping the cluster, copying the SNN's latest checkpoint to the primary NameNode's data directory, restarting the primary (which replays any edits since the last checkpoint), and waiting for DataNodes to re-report their blocks in safe mode. Total downtime: 30 minutes to 2 hours depending on namespace size. In early Hadoop deployments this was accepted; in any production system built after 2013 (when QJM HA was introduced in Hadoop 2.0), deploying without Active/Standby HA and QJM is a critical infrastructure risk. Always deploy QJM HA. The SNN should not appear in any modern production architecture diagram.
+
+</Pitfall>
+
+<Pitfall title="Storing millions of small files directly in HDFS">
+
+HDFS block size and NameNode metadata overhead are intentionally tuned for large files. Every file — regardless of size — occupies one INode record in NameNode RAM (~200 bytes) and produces at least one block (128 MB allocation for even a 1-byte file at the storage layer). If you ingest 100 million small files (a common pattern in log pipelines, IoT telemetry, or per-event JSON writes), the consequences compound:
+
+First, NameNode RAM: $100 \times 10^6 \times 200\ \text{bytes} = 20\ \text{GB}$ consumed just for INodes, plus block map entries. On a 200 GB NameNode heap this leaves little headroom and pushes GC pressure into territory where stop-the-world pauses become frequent — pausing all metadata operations for multiple seconds at a time.
+
+Second, storage efficiency: a 1 KB log file allocated to a 128 MB HDFS block wastes 127.999 MB of raw disk capacity (replicated 3×, so actually 384 MB wasted per 1 KB file). One hundred million such files waste 38.4 PB of raw storage for 100 GB of actual data.
+
+Third, MapReduce/Spark job overhead: one task is spawned per block. One hundred million blocks means one hundred million map tasks — the YARN scheduler overhead alone exceeds the compute cost of the actual job. The pattern fails catastrophically at scale. The fix is upstream aggregation: buffer incoming records into SequenceFiles or Parquet files of at least 512 MB before writing to HDFS. Never write a file to HDFS that is smaller than one block unless you have an explicit, well-understood reason to do so.
+
+</Pitfall>
+
+## Curveballs
+
+<Curveball question="The Active NameNode's JVM GC pause lasts 45 seconds (Full GC on a 200 GB heap). The ZKFC triggers a failover. But the Standby NameNode's namespace is 10 seconds behind — it hasn't finished replaying the edit log. What happens when Standby becomes Active? Are any writes lost?">
+
+This scenario tests understanding of the QJM durability contract versus the namespace lag between Active and Standby. The 10-second lag means the Standby's in-memory namespace does not reflect the last 10 seconds of the Active's edit log entries. However, those edit records were already durably committed to the JournalNode quorum before the ZKFC triggered failover — the Active NN only acknowledges a client write after 2 of 3 JournalNodes confirm the edit. So the edits exist in the JournalNodes; the Standby simply hasn't applied them yet.
+
+When the Standby becomes the new Active, it does not immediately start serving requests. It first completes the edit log catchup: it reads the remaining uncommitted-to-Standby-namespace edits from the JournalNodes and applies them, bringing its namespace fully current. This "tail catch-up" typically takes a few seconds for a 10-second lag. Only after the namespace is current does the new Active begin accepting client write requests. In practice, the failover SLA is: ZKFC detection time (5–10s) + Standby tail catch-up (2–5s) + Standby block report wait (minimal, since Standby already received block reports) = 10–30 seconds total. No writes are lost — the QJM durability guarantee holds — but clients whose writes were in-flight during the GC pause and were not yet acknowledged by the old Active will receive a connection error and must retry. Retry logic in the HDFS client library handles this transparently: the client re-fetches the NameNode address from ZooKeeper and retries the RPC.
+
+</Curveball>
+
+<Curveball question="You have 100 DataNodes. A network switch failure isolates 30 of them from the NameNode and the rest of the cluster. Some blocks have all 3 replicas on those 30 nodes. How does HDFS detect and recover from this, and how long does it take?">
+
+Detection happens via heartbeat timeout. DataNodes send a heartbeat every 3 seconds. The NameNode marks a DataNode as "stale" after 30 seconds without a heartbeat (configurable via `dfs.heartbeat.interval` and `dfs.namenode.heartbeat.recheck-interval`) and as "dead" after 10 minutes by default (`dfs.namenode.heartbeat.recheck-interval * 2`). After the switch failure, the NameNode begins marking the 30 isolated DataNodes as stale within 30 seconds and dead within 10 minutes.
+
+Upon marking DataNodes dead, the NameNode scans its BlocksMap for blocks whose replica count has fallen below the target replication factor (3). Blocks with all 3 replicas on the 30 isolated nodes are now at replication factor 0 from the NameNode's perspective (it cannot reach any replica). These blocks are queued as "under-replicated" in the NameNode's replication work queue. The NameNode instructs the 70 remaining DataNodes to create new replicas — selecting source DataNodes that hold a replica of the block and target DataNodes for the new copies.
+
+Re-replication throughput is limited by `dfs.namenode.replication.max-streams` (default 2 streams per DataNode) to avoid saturating the cluster's network. With 70 DataNodes × 2 streams = 140 concurrent re-replication streams, each streaming ~128 MB blocks at ~100 MB/sec, the cluster handles ~14 GB/sec of re-replication. For the worst case where all 30 nodes had distinct blocks (30 nodes × 30 TB each = 900 TB affected), full re-replication takes roughly 900 TB / 14 GB/sec ≈ 18 hours. In practice, with 3× replication most blocks have at least one replica on the healthy 70 nodes — only blocks with all 3 replicas in the 30-node partition are truly unavailable, a smaller fraction. When the partition heals, the NameNode detects the DataNodes rejoining via heartbeat resume and rebalances over-replicated blocks back down to the target factor.
+
+</Curveball>
+
+<Curveball question="A Spark job is reading a 10 TB dataset from HDFS while another Spark job is simultaneously writing 10 TB to the same cluster. What is the contention model — are they competing for NameNode CPU, DataNode disk I/O, or network bandwidth?">
+
+All three, but at different layers and with different severity. The most important point is that the NameNode is not a data throughput bottleneck for either job after initial metadata operations complete. The Spark reader calls `getBlockLocations()` once per file to get block locations — a burst of NameNode RPC calls at job startup, then zero NameNode involvement during the actual read. The Spark writer calls `addBlock()` once per 128 MB written — at 10 TB total, that is roughly 80,000 `addBlock()` calls spread over the write duration. If both jobs run 1,000 tasks each, the NameNode handles at most a few thousand concurrent RPC connections — well within its capacity (the NameNode RPC server is multi-threaded with a configurable pool, default 10–100 threads). NameNode CPU becomes a concern only if both jobs are doing intensive metadata operations like recursive `listStatus` over millions of files simultaneously.
+
+The real contention is between DataNode disk I/O and network bandwidth. DataNode disks are shared between incoming write pipeline traffic (from the writing Spark job) and outgoing read streams (to the reading Spark job). On a DataNode with spinning disks, sequential reads and sequential writes can both run near-disk-bandwidth (~200 MB/sec for a typical 7200 RPM drive), but mixing them causes head seeks that degrade both. A DataNode serving simultaneous read and write streams on the same spinning disk will see read throughput drop from ~200 MB/sec to ~50–80 MB/sec due to seek contention. NVMe DataNodes eliminate this — they handle mixed read/write at full hardware bandwidth for each independently.
+
+Network bandwidth is the binding constraint in large clusters. If 70 DataNodes are reading and writing simultaneously at 1 GB/sec each, the top-of-rack switches see 70 GB/sec of aggregate traffic. A 10 Gbps uplink switch (common in pre-2018 deployments) saturates quickly. Modern rack switches at 100 Gbps or 400 Gbps per port handle this comfortably. The cluster network architecture — fat-tree vs. leaf-spine — determines how much bandwidth is available between racks and whether cross-rack replication (the one cross-rack hop in the write pipeline) compounds the congestion. In the interview, explicitly call out whether the cluster has oversubscribed ToR switches — that is the most common real-world HDFS performance bottleneck that the question is probing for.
+
+</Curveball>
+
+<RelatedQuestions items={[
+  { slug: "s3-object-storage", title: "Design S3-like Object Storage", difficulty: "staff" },
+  { slug: "distributed-kv-store", title: "Design a Distributed KV Store", difficulty: "staff" },
+  { slug: "dropbox-google-drive", title: "Design Dropbox / Google Drive", difficulty: "senior" },
+]} />
+
+## Further reading
+
+- [The Google File System](https://static.googleusercontent.com/media/research.google.com/en//archive/gfs-sosp2003.pdf) — Ghemawat, Gobioff, Leung, SOSP 2003. The paper that HDFS is directly based on. Read sections 3 (Architecture), 4.1 (Namespace Management and Locking), 4.2 (Replica Placement), and 4.3 (Creation, Re-replication, Rebalancing). The design decisions in GFS — large chunk size, single master, write-once semantics, write pipeline — map almost 1:1 to HDFS design choices made 3 years later.
+- [HDFS Architecture Guide](https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html) — Apache Hadoop official documentation. The definitive reference for HDFS data flow, rack awareness, safe mode, balancer, and secondary NameNode vs. HA NameNode. Required reading before any HDFS production deployment.
+- [Facebook Tectonic: Exabyte-Scale Distributed File System](https://www.usenix.org/conference/fast21/presentation/pan) — Pan et al., USENIX FAST 2021. Facebook's successor to HDFS — a multi-tenant, disaggregated storage system that separates metadata (a distributed KV store) from storage (a shared object store). Tectonic solves the small files problem and the NameNode memory bottleneck by sharding metadata across a stateless metadata service backed by ZippyDB. Essential reading for understanding how the next generation of distributed file systems moves beyond the single-NameNode model.
+- [Hadoop: The Definitive Guide, 4th Edition](https://www.oreilly.com/library/view/hadoop-the-definitive/9781491901687/) — Tom White, O'Reilly 2015. Chapters 3 (HDFS), 4 (YARN), and 10 (Setting Up a Hadoop Cluster) provide the most thorough practical treatment of HDFS operations, tuning, and failure modes. Chapter 3's coverage of the read and write data flow — with sequence diagrams — is the clearest explanation of the pipeline write mechanism available outside of reading the source code.

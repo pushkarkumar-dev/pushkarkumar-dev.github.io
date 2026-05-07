@@ -1,0 +1,448 @@
+---
+title: "Design Typeahead / Autocomplete"
+slug: "typeahead-autocomplete"
+category: "search-maps"
+difficulty: "mid"
+estimatedReadMinutes: 16
+tags: ["trie", "prefix-cache", "redis", "personalization", "debouncing", "top-k", "search-suggestion"]
+companyFlavors: ["Google Search", "Twitter", "Amazon", "LinkedIn", "YouTube"]
+prerequisites: []
+relatedQuestions: ["google-search", "yelp-nearby-places", "top-k-trending"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Design a typeahead suggestion service that returns top-K search completions in < 50ms — covering trie sharding, prefix caching in Redis, personalization layer, and the data pipeline that keeps suggestions fresh from query logs."
+javaPackages: ["redis.clients:jedis:5.1.3", "org.springframework.boot:spring-boot-starter-webflux:3.3.0", "com.github.ben-manes.caffeine:caffeine:3.1.8"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="typeahead-autocomplete" title="Design Typeahead / Autocomplete" />
+
+<Tldr>
+- Don't store a trie in a single process — at web scale (100M unique prefixes) the trie is too large. Shard by prefix (first character or first 2 characters) and cache top-K completions per prefix in Redis.
+- Cache the result set, not the trie: store `prefix → [suggestion1, suggestion2, ..., suggestionK]` in Redis. The trie is the offline data structure used to build this cache — not the serving layer.
+- Debounce on the client: fire the API call after 100–200ms of typing idle, not on every keystroke. Reduces server load by 5–10×.
+- Frequency matters more than recency: "how to make pasta" searched 10M times > "how to make cronuts" searched 10K times yesterday. Weight suggestions by total query frequency, not just recent frequency.
+- Personalization: blend global top-K with user's recent searches. Personal suggestions (recent queries, location-based) appear above global suggestions but only if they match the prefix.
+</Tldr>
+
+## The latency constraint
+
+The 50ms p99 budget is not arbitrary — it is grounded in conversion data. Amazon measured that every 100ms of additional latency reduces mobile conversions by roughly 8%. Typeahead fires on every keystroke, which means a single word typed at normal speed generates 4–6 API calls in under two seconds. If a user types "pizza" (5 characters), that is potentially 5 API calls in about 2 seconds. Each one must return in under 50ms or the dropdown either lags visibly or flickers as stale results are replaced — both experiences teach the user to stop trusting the widget. The practical consequence is brutal: the serving path must be entirely read-only, pre-computed, and cache-first. There is no time for a database join, a trie traversal over 100M nodes, or any synchronous compute path beyond a single cache lookup and a small merge operation.
+
+This constraint eliminates most naive approaches immediately. A live SQL `LIKE 'pizza%'` query takes 100–300ms on a warm index. An in-process trie traversal over 100M nodes takes 5–20ms but requires the trie to be in-process on every serving node, which means 1+ GB of memory per pod and a complex rebuild mechanism. The only architecture that survives the latency budget at scale is a precomputed prefix-to-suggestions mapping stored in Redis, served by a stateless reactive API tier that does nothing more than look up the prefix and blend in personalization. Every other design decision flows from this constraint.
+
+## Clarifying questions
+
+Eight questions to ask before drawing any boxes. The answers collapse a large design space down to a concrete architecture.
+
+| Question | Ideal answer to probe for | Why it matters |
+|---|---|---|
+| How many unique queries exist (what is the prefix space)? | 100M+ unique queries across all users | Determines whether a single-machine trie is feasible or whether Redis sharding is necessary |
+| How many suggestions should be returned per prefix (K)? | 5–10 is typical; 25 is a ceiling | Directly controls Redis value size and response payload |
+| Are suggestions language- or locale-specific? | Yes — English "pizza" vs Spanish "pizza" should have separate suggestion sets | Prefix keys must include locale: `suggest:en:{prefix}` |
+| Is personalization required? | Yes for logged-in users; anonymous users get global top-K | Adds a personal-layer Redis SET per user and a blend step on the serving path |
+| How often should suggestions update — real-time or hourly? | Hourly freshness is acceptable for most; trending queries need faster refresh | Drives pipeline complexity; real-time requires Flink; hourly allows Spark batch |
+| Must inappropriate content be filtered? | Yes — blocklist required | Adds a filter step; blocklist must propagate to all serving nodes quickly |
+| What is the search domain — web queries, product names, or usernames? | Each domain has different cardinality and ranking signals | Product name autocomplete can use sales rank; web query autocomplete uses global query frequency |
+| Mobile vs. web — what is the network latency budget? | Mobile networks add 20–80ms; total RTT budget is different | On mobile, the client debounce should be longer (200ms) and the response payload smaller |
+
+## Functional requirements
+
+The core functionality the system must deliver:
+
+- **Top-K suggestions**: given any prefix string, return the top-K most-relevant completions, ranked by query frequency descending
+- **Frequency-weighted ranking**: suggestions are ordered by how often the query has been searched globally, not by recency or alphabetical order
+- **Freshness**: suggestions reflect query logs from the past hour or less; a new trending query must surface in typeahead within 60 minutes
+- **Content filtering**: no suggestion may contain terms on the blocklist (profanity, illegal content, PII-adjacent patterns)
+- **Personalization**: for authenticated users, blend the user's own recent searches into the top of the suggestion list when they match the current prefix
+
+## Non-functional requirements
+
+Concrete numbers to design toward:
+
+- **Query throughput**: 10M queries/sec at the search box level; each query generates ~5 prefix lookups = **50M prefix lookups/sec**
+- **Latency**: p99 < 50ms end-to-end; p50 < 10ms; served from Redis + optional L1 in-process cache
+- **Suggestion freshness**: < 1 hour from the time a query is logged to the time it can appear in suggestions
+- **Availability**: 99.99% on the read path (Redis + API tier); the rebuild pipeline can tolerate hourly batch failures without affecting serving
+- **Prefix space**: 100M unique prefixes up to length 10; suggestions precomputed for each
+
+## Capacity estimation
+
+<Capacity title="Back-of-envelope: 100M prefixes, top-10 suggestions, 10M QPS">
+
+**Redis storage for precomputed prefix cache**
+
+$$
+100{,}000{,}000 \; \text{prefixes} \times 10 \; \text{suggestions/prefix} \times 20 \; \text{bytes/suggestion} = 20 \; \text{GB}
+$$
+
+A single Redis cluster with 32 GB memory covers the full prefix space with headroom. At $0.30/GB-hr on managed Redis, that is under $3/hr for the serving layer.
+
+**Query log throughput**
+
+$$
+10{,}000{,}000 \; \text{queries/sec} \times 100 \; \text{bytes/query} = 1 \; \text{GB/sec of raw query log}
+$$
+
+This requires Kafka with at least 10 partitions at 100 MB/sec each. Retaining 24 hours of logs: $1 \; \text{GB/s} \times 86{,}400 \; \text{s} = 86.4 \; \text{TB}$ — use Kafka tiered storage with 24h hot retention and object storage (S3) for the tail.
+
+**Offline trie memory (rebuild job, not serving)**
+
+$$
+100{,}000{,}000 \; \text{unique terms} \times 10 \; \text{avg chars/term} \times 1 \; \text{byte/char} \approx 1 \; \text{GB}
+$$
+
+A single Spark executor with 8 GB heap is more than sufficient. The trie is built and walked offline; it never touches the serving path.
+
+**Cache hit ratio**
+
+Precomputing every prefix up to length 10 covers the vast majority of real queries. Google internal data suggests that over 99% of search prefixes are 10 characters or fewer. With precomputation up to length 10, the Redis cache hit ratio is 99%+. The remaining 1% (very long prefixes) can fall back to a prefix truncation: take the first 10 characters and serve the suggestions for that prefix.
+
+</Capacity>
+
+## API design
+
+Three endpoints cover all client and internal needs:
+
+```
+GET  /suggestions?q=<prefix>&limit=10&userId=<userId>
+     → 200 OK
+     {
+       "prefix": "piz",
+       "suggestions": [
+         { "text": "pizza near me", "score": 9823410, "type": "global" },
+         { "text": "pizza dough recipe", "score": 7234100, "type": "global" },
+         { "text": "pizza hut hours", "score": 5021000, "type": "global" },
+         { "text": "pizza delivery", "score": 4810200, "type": "recent" }
+       ]
+     }
+
+POST /queries/log  (internal — called after a user submits a completed search)
+     Body: { "queryText": "pizza near me", "timestamp": 1746614400000,
+             "userId": "u_xyz", "sessionId": "s_abc", "locale": "en" }
+     → 202 Accepted
+
+POST /suggestions/rebuild  (internal — triggers offline cache rebuild)
+     Body: { "locale": "en", "force": false }
+     → 202 Accepted
+```
+
+The `GET /suggestions` is the hot path. It must be non-blocking end-to-end: the reactive Spring Boot controller dispatches to a bounded thread pool, the Redis call is synchronous but fast (< 1ms), and the response is returned before any GC pause or connection pool wait can inflate latency. The `userId` parameter is optional — omit it for anonymous users who receive global suggestions only.
+
+## Data model
+
+**Redis hash: prefix → suggestions**
+
+```
+Key:   suggest:{locale}:{prefix}
+       e.g. suggest:en:piz
+Type:  String (serialized JSON array)
+Value: [{"text":"pizza near me","score":9823410},{"text":"pizza dough recipe","score":7234100},...]
+TTL:   none (rebuilt hourly; old values replaced atomically)
+```
+
+**Redis sorted set alternative for dynamic scoring**
+
+```
+Key:     szuggest:{locale}:{prefix}
+         e.g. szuggest:en:piz
+Type:    ZSET
+Members: suggestion text strings
+Score:   query frequency (higher = more popular)
+Access:  ZREVRANGE suggest:en:piz 0 9 → top 10 suggestions
+```
+
+The ZSET approach trades ~2× memory for flexibility: scores can be updated without rebuilding the full prefix cache. For most deployments the precomputed JSON string is simpler and more memory-efficient. Use ZSET when you need sub-hourly score updates without a full pipeline run.
+
+**Query log (Kafka)**
+
+```
+Topic:     query-logs
+Partition: hash(queryText) % num_partitions
+Schema:
+  {
+    queryText:  string   // normalized lowercase, stripped
+    timestamp:  int64    // epoch millis
+    userId:     string   // hashed for privacy
+    sessionId:  string
+    locale:     string   // BCP 47: "en", "es", "zh-Hans"
+    completed:  boolean  // true if user submitted; false if abandoned
+  }
+```
+
+Only `completed = true` queries are included in the frequency aggregation. Abandoned prefix stubs (user typed "piz" and deleted it) inflate counts without indicating genuine intent.
+
+**Frequency table (Spark output → Postgres or BigQuery)**
+
+```sql
+CREATE TABLE query_frequency (
+  query_text   text     NOT NULL,
+  locale       text     NOT NULL,
+  count        bigint   NOT NULL,
+  last_updated timestamptz NOT NULL,
+  PRIMARY KEY (query_text, locale)
+);
+CREATE INDEX ON query_frequency (locale, count DESC);
+```
+
+**Personal history (Redis SET per user)**
+
+```
+Key:   personal:{userId}
+Type:  List (LPUSH + LTRIM to maintain order and bound size)
+Value: ["pizza near me", "pasta carbonara recipe", "best ramen nyc"]
+TTL:   30 days
+Max:   10 entries (LTRIM to 10 after each LPUSH)
+```
+
+Using a Redis List (not SET) preserves insertion order so the most recent query is at the head. This matters for display — recent-first ordering feels more useful than alphabetical.
+
+## High-level architecture
+
+<Mermaid caption="Typeahead serving path (left) and suggestion refresh pipeline (right)" diagram={`graph LR
+  User[User Typing] --> Client[Browser / App\\nDebounce 150ms]
+  Client --> API[Suggest API\\nReactive Spring Boot]
+  API --> Redis[(Redis\\nsuggest:en:prefix → top-K)]
+  API --> Personal[Personal Layer\\npersonal:userId]
+  Redis --> API
+  Personal --> API
+  API --> Client
+
+  SearchLog[Completed Search Logs] --> Kafka[Kafka\\nquery-logs topic]
+  Kafka --> Aggregator[Spark Hourly Job\\ncount per query_text]
+  Aggregator --> FreqDB[(Frequency Table\\nPostgres / BigQuery)]
+  FreqDB --> TrieBuilder[Trie Builder\\nOffline Spark Job]
+  TrieBuilder --> Redis`} />
+
+The architecture cleanly separates the serving path from the refresh pipeline. The serving path is entirely read-only: client debounces, API looks up Redis, blends personal layer, returns. The refresh pipeline is entirely async: Kafka buffers query logs, Spark aggregates hourly, the trie builder generates the full prefix cache, and the result is pushed to Redis atomically. No serving request ever blocks on a write, and no write ever disrupts the serving path.
+
+## Deep dives
+
+### Trie vs Redis prefix cache
+
+A trie is a tree where each node represents a character. Traversal from the root to a node at depth L spells out a prefix of length L; the subtree rooted at that node contains all completions. Complexity is O(L + result_set_size) per lookup — faster than a hash map for long shared-prefix families. The trie is the right data structure for building and exploring the prefix space offline.
+
+The problem is serving it live. A trie for 100M unique terms with average depth 10 requires roughly 1 GB of RAM. That cost must be paid on every serving pod. With 100 serving pods, that is 100 GB of duplicated in-process state. Worse, updating the trie on every new query requires either a global lock (latency spike) or an immutable rebuild with atomic swap (feasible offline, but complex to trigger in real-time). The trie also does not distribute naturally: if you shard it by prefix, a request for "pizza" must go to a specific shard, and if that shard is hot (because all prefixes starting with 'p' hit it), you have a hotspot.
+
+The cleaner production pattern: use the trie exclusively offline. Build it once per rebuild cycle, walk every node to compute top-K completions using a DFS with a priority queue (min-heap of size K, evict the lowest-scoring candidate whenever a better one is found), and write `prefix → [top-K suggestions]` into Redis. The serving layer never sees the trie; it only sees the flat key-value store. The trie's elegance is preserved where it belongs — in the batch computation.
+
+### Prefix cache update pipeline
+
+The rebuild pipeline has four stages, each designed to be fault-tolerant and idempotent.
+
+**Stage 1 — Ingest**: Completed search queries flow into Kafka with the schema described above. The Kafka topic is partitioned by `hash(queryText)` so all occurrences of the same query land on the same partition — this makes frequency counting in Stage 2 a single-pass operation within each partition.
+
+**Stage 2 — Frequency aggregation**: A Spark job runs hourly. It reads the past 7 days of query logs (weighted: more recent days get higher weight — a simple time-decay multiplier applied before aggregation) and produces a frequency table: `(queryText, locale) → weighted_count`. The 7-day window balances freshness with statistical stability. A query that appeared once 6 days ago but not since should not outrank a query that appeared 1000 times in the past 24 hours.
+
+**Stage 3 — Trie build and top-K extraction**: Another Spark job loads the frequency table, builds an in-memory trie, and runs a DFS. At each node, it maintains a min-heap of the top-K completions seen in the subtree. When it reaches a leaf (a full query term), it pushes `(query, frequency)` into the heap; if the heap exceeds K it pops the minimum. After the DFS, each internal node has the top-K completions for its prefix. This DFS runs in O(total_nodes × K) time — for 100M nodes and K=10, that is about 1B operations, which completes in under 10 minutes on a 16-core Spark executor.
+
+**Stage 4 — Atomic Redis update**: The Spark job writes to Redis using a pipeline of `SET suggest:{locale}:{prefix} {json_value}` commands, batched into groups of 1000 for network efficiency. Atomicity matters: if the job writes half the prefixes and then crashes, clients would see a mix of old and new suggestions for different prefixes. The pattern to avoid this is a two-phase write: write all new keys under a staging namespace (`suggest_next:en:{prefix}`), then execute a Lua script that renames all `suggest_next:*` keys to `suggest:*` atomically within a single Redis transaction. Since `RENAME` is O(1), the cutover is instantaneous.
+
+### Personalization
+
+The personal layer is intentionally shallow. Storing and ranking a full user query history at 10M QPS would require a dedicated user-history service with its own read path, caching, and consistency guarantees. The simpler approach works well in practice: maintain a Redis List of the user's last 10 completed queries (`personal:{userId}`), updated on every search submission with a 30-day TTL.
+
+On suggestion request: retrieve the personal list (one Redis `LRANGE` call), filter to entries that start with the current prefix (O(10) string comparisons, negligible), prepend the matching entries (up to 3) to the global suggestion list, and truncate to K total. Personal entries are tagged with `"type": "recent"` in the response so the client can render a visual indicator (a clock icon, a "Recent" label).
+
+Three edge cases are worth calling out. First, if the user has searched for something that is now on the blocklist, suppress it from personalization too — do not let personal history bypass content filtering. Second, if the personal list entry exactly duplicates a global suggestion, deduplicate: prefer the personal entry's position (higher in the list) but do not show it twice. Third, for locales with right-to-left scripts (Arabic, Hebrew), prefix matching must be character-aware — ensure the stored queries are normalized to NFC Unicode before comparison.
+
+### Filtering inappropriate content
+
+A Redis SET holds the normalized blocklist — a few hundred to a few thousand banned terms. Before returning suggestions, the serving path calls `SISMEMBER blocklist {normalized_term}` for each suggestion candidate. Since blocklist lookups are O(1) in a Redis SET and the suggestion list is at most K=10 items, the filter adds at most 10 Redis round-trips. In practice, batch this into a single `SMISMEMBER blocklist term1 term2 ... term10` call (available in Redis 6.2+) to reduce it to one round-trip.
+
+For variations — "dr-ugs", "dr.ugs", "drugs" — normalize the suggestion before the blocklist check: strip non-alphanumeric characters, lowercase, apply a phonetic or edit-distance pass for common obfuscations. The normalization function runs in-process (no network hop) before the blocklist check.
+
+Blocklist updates propagate to all serving pods immediately via Redis Pub/Sub: a blocklist admin service publishes to a `blocklist:updates` channel, and each serving pod's subscriber invalidates its local blocklist cache. This ensures a newly added term is filtered within seconds rather than waiting for a pod restart or a periodic cache refresh.
+
+## Java integration
+
+**Part A — Redis-backed suggestion service with L1 in-process cache**
+
+```java
+package dev.pushkar.autocomplete;
+
+import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.Jedis;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import java.util.List;
+import java.util.ArrayList;
+
+@Service
+public class AutocompleteService {
+
+    private final JedisPool jedis;
+    private final Cache<String, List<String>> l1Cache; // in-process for ultra-hot prefixes
+
+    public AutocompleteService(JedisPool jedis) {
+        this.jedis = jedis;
+        this.l1Cache = Caffeine.newBuilder()
+            .maximumSize(10_000)       // top 10K prefixes in RAM
+            .expireAfterWrite(java.time.Duration.ofSeconds(30))
+            .build();
+    }
+
+    public List<String> suggest(String prefix, String userId, int limit) {
+        String normalized = prefix.toLowerCase().strip();
+        if (normalized.isBlank()) return List.of();
+
+        // L1 cache: skip Redis hop for the top 10K most-requested prefixes
+        List<String> cached = l1Cache.getIfPresent(normalized);
+        if (cached != null) return blend(cached, getPersonal(userId, normalized), limit);
+
+        try (Jedis j = jedis.getResource()) {
+            String raw = j.get("suggest:en:" + normalized);
+            if (raw == null) {
+                // Truncate to 10 chars and retry (handles very long prefixes)
+                String truncated = normalized.length() > 10
+                    ? normalized.substring(0, 10) : normalized;
+                raw = j.get("suggest:en:" + truncated);
+            }
+            if (raw == null) return List.of();
+            List<String> global = deserialize(raw);
+            l1Cache.put(normalized, global);
+            return blend(global, getPersonal(userId, normalized), limit);
+        }
+    }
+
+    private List<String> getPersonal(String userId, String prefix) {
+        if (userId == null || userId.isBlank()) return List.of();
+        try (Jedis j = jedis.getResource()) {
+            return j.lrange("personal:" + userId, 0, 9).stream()
+                .filter(q -> q.startsWith(prefix))
+                .limit(3)
+                .toList();
+        }
+    }
+
+    private List<String> blend(List<String> global, List<String> personal, int limit) {
+        var result = new ArrayList<>(personal);
+        global.stream()
+            .filter(g -> !personal.contains(g))
+            .limit(limit - personal.size())
+            .forEach(result::add);
+        return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<String> deserialize(String raw) {
+        // In production: use Jackson or Gson with proper type reference
+        return com.fasterxml.jackson.databind.ObjectMapper
+            .readValue(raw, new com.fasterxml.jackson.core.type.TypeReference<List<String>>() {});
+    }
+}
+```
+
+The L1 Caffeine cache is the key production detail here. Redis at 1ms round-trip × 50M prefix lookups/sec would require 50K Redis connections — clearly infeasible. Caffeine's in-process cache handles the top 10K most-requested prefixes (which by Zipf's law account for the overwhelming majority of traffic) with sub-microsecond latency and zero network overhead. The 30-second TTL ensures that when the Redis cache is rebuilt hourly, the in-process cache catches up within 30 seconds rather than immediately — an acceptable staleness window given the 1-hour freshness requirement.
+
+**Part B — Reactive Spring Boot controller**
+
+```java
+@RestController
+@RequestMapping("/suggestions")
+public class SuggestionController {
+
+    private final AutocompleteService svc;
+
+    public SuggestionController(AutocompleteService svc) {
+        this.svc = svc;
+    }
+
+    @GetMapping
+    public Mono<SuggestionResponse> suggest(
+            @RequestParam String q,
+            @RequestParam(defaultValue = "10") int limit,
+            @RequestParam(required = false) String userId) {
+        return Mono.fromCallable(() -> svc.suggest(q, userId, limit))
+            .map(suggestions -> new SuggestionResponse(q, suggestions))
+            .subscribeOn(Schedulers.boundedElastic());
+    }
+
+    record SuggestionResponse(String prefix, List<String> suggestions) {}
+}
+```
+
+`Mono.fromCallable` wraps the blocking Redis call and dispatches it onto the `boundedElastic` scheduler — a thread pool sized for blocking I/O. This keeps the Netty event loop free for I/O multiplexing and prevents one slow Redis round-trip from stalling all in-flight requests. In a fully reactive deployment, replace Jedis with Lettuce's reactive API (`ReactiveRedisTemplate`) to avoid even the `boundedElastic` hop and run entirely on the event loop.
+
+<TradeoffTable title="Autocomplete serving strategy comparison">
+
+| Strategy | Latency | Freshness | Memory | Complexity |
+|---|---|---|---|---|
+| In-process trie (live serving) | < 1ms | Stale (redeploy to update) | High (1 GB+ per pod) | Medium |
+| Redis prefix cache (precomputed) | 1–5ms | Hourly refresh | Medium (20 GB cluster) | Low |
+| Elasticsearch prefix query | 10–30ms | Minutes | High | Low |
+| Database LIKE query | 100ms+ | Real-time | None | Very low |
+
+</TradeoffTable>
+
+The Redis prefix cache wins on the critical dimensions for typeahead: latency is low enough (1–5ms) to fit within the 50ms budget with room for network overhead, and the complexity is low enough that the rebuild pipeline can be owned by a small team. Elasticsearch is a reasonable alternative if the search platform already runs it — the prefix completion suggester is well-documented and battle-tested — but adding Elasticsearch solely for typeahead adds significant operational overhead. Database `LIKE` queries are suitable only for low-traffic internal tools where the < 100ms latency is acceptable.
+
+<Pitfall title="Serving suggestions from a live trie in-process">
+
+A trie for 100M queries consumes over 1 GB of heap on every serving pod. More critically, updating it as new queries arrive requires either a global read-write lock (which serializes all reads during the update, spiking p99 latency) or an immutable double-buffered trie with atomic pointer swap (which doubles memory usage during the rebuild window and is complex to implement correctly under concurrent reads).
+
+The operationally correct pattern is to use the trie exclusively offline — in the Spark rebuild job — and push its output (the precomputed prefix-to-suggestions mapping) to Redis. The serving path then has no state to manage, no locks to acquire, and no memory penalty per pod. The trie's computational advantage (efficient prefix traversal) is fully captured in the offline pipeline, and the Redis cache provides the serving speed.
+
+</Pitfall>
+
+<Pitfall title="Firing an API call on every keystroke">
+
+A user typing "pizza delivery" (14 characters) fires 14 API calls in roughly 2 seconds if there is no debounce. At 10M concurrent active typists, that is 140M API calls/sec instead of the baseline 10M QPS — a 14× amplification. Worse, most of those intermediate calls (for "p", "pi", "piz") are immediately superseded and their responses are discarded. The work done is pure waste.
+
+Two client-side mechanisms eliminate this. First, debounce the API call: only fire when typing has been idle for 150ms. If the user is actively typing, no call is sent. A user typing "pizza delivery" at 80 WPM generates 14 keystrokes in ~1.6 seconds — with a 150ms debounce, only 1–2 API calls are fired (after each pause in typing). Second, cancel in-flight requests when a new keystroke arrives: in browsers, use `AbortController` to cancel the previous `fetch` before issuing the new one. This prevents an earlier response (for "piz") from overwriting a later response (for "pizza") if the network reorders them. Both mechanisms together reduce server load by 5–10× on realistic typing patterns.
+
+</Pitfall>
+
+<Curveball question="A celebrity tweets a typo and millions of people search for it. This new query needs to appear in typeahead within 10 minutes, but your rebuild pipeline runs hourly. How do you handle viral query spikes with sub-hour freshness?">
+
+The hourly batch pipeline is designed for steady-state freshness, not for viral events. The fix is a lightweight real-time override layer that sits alongside the batch system without replacing it.
+
+When a query crosses a frequency threshold (e.g., 100K occurrences in the past 5 minutes, detected by a Flink streaming job on the Kafka query-log topic), a "hot term" event is emitted to a separate hot-terms topic. A small hot-term injector service consumes this topic and directly writes the new suggestion into Redis for the relevant prefixes — no full trie rebuild required. It only updates the prefixes that the new query is a completion for: if the viral query is "covfefe news", it writes to `suggest:en:c`, `suggest:en:co`, `suggest:en:cov`, `suggest:en:covf`, and so on (up to 10 characters). That is at most 10 Redis `SET` operations per viral query, completing in under 50ms.
+
+The edge case is eviction: inserting the hot term may displace an existing top-K suggestion. The hot-term injector fetches the existing suggestion list for each prefix, appends the new term, re-sorts by combined score (using a pre-estimated count from the Flink job), and overwrites the Redis entry. The result is that viral queries surface in typeahead within 5–10 minutes of their spike, while the hourly batch rebuild continues to maintain long-term accuracy for the full prefix space.
+
+</Curveball>
+
+<Curveball question="You need to support typeahead in 50 languages. How do you structure your Redis key space and trie builder to handle character sets like Chinese, where prefix matching works very differently from English?">
+
+The Redis key space is straightforward: include the locale in every key — `suggest:{locale}:{prefix}` — and run one trie builder per locale. The Chinese case is where the interesting complexity lives.
+
+In alphabetic languages (English, Spanish, French), prefix matching is character-by-character and the trie branching factor is small (26 for ASCII, ~100 for extended Latin). In Chinese, users type using a romanized input method editor (Pinyin) and see character suggestions. The "prefix" the user types is Pinyin — "pizza" in Chinese is typed as "bishasheng" — but the stored query might be the Chinese characters "比萨饼" or the Pinyin romanization or both. This means you need two separate trie structures per Chinese locale: one keyed on Pinyin prefixes (for type-to-suggest), and one on Chinese character prefixes (for copy-paste scenarios). The suggestion display value is always the final Chinese character form.
+
+For languages written in non-Latin scripts (Arabic, Devanagari, Thai), the same principle applies: normalize the query to a canonical Unicode form (NFC) before ingesting into the frequency table, and build the prefix cache in the native script. Prefix matching in Arabic works right-to-left at the word level but the data structure is still a left-to-right character trie over the UTF-8 byte sequence — the trie does not need to understand language semantics, only byte sequences.
+
+The operational cost of 50 locales is roughly linear: 50 frequency tables, 50 trie builders (parallelized in Spark), and 50 × 20 GB = 1 TB of Redis storage if all locales are similarly sized. In practice, 5–6 major locales (en, zh, es, ar, pt, fr) account for 80% of query volume; smaller locales get much smaller frequency tables and correspondingly smaller Redis footprints.
+
+</Curveball>
+
+<Curveball question="A user types their email address in the search box. Your query log captures it. Now you need to ensure email addresses are never surfaced as suggestions to other users. How do you sanitize PII from the query log before it enters the suggestion pipeline?">
+
+PII sanitization must happen at the earliest possible point in the pipeline — ideally before the query is written to Kafka, not after. A post-hoc approach (scrubbing the frequency table downstream) risks a race condition where a brief PII leak occurs between ingest and scrubbing.
+
+The architecture: add a synchronous sanitization step inside the `POST /queries/log` handler, before the Kafka produce call. The sanitizer applies a suite of pattern matchers: RFC 5322 email regex, E.164 phone number pattern, credit card Luhn check, and a regex for common US SSN formats. If the query matches any pattern, it is dropped entirely — not written to Kafka at all. The endpoint still returns `202 Accepted` to the client (logging failures should be silent to users).
+
+A second defense layer runs in the Spark aggregation job: any query term appearing fewer than 5 times globally is excluded from the frequency table. Most PII (a specific person's email address) appears exactly once — the k-anonymity floor of 5 occurrences prevents rare one-off queries from becoming suggestions regardless of whether the first layer missed them.
+
+The third layer is a blocklist-based approach for known PII patterns: add regex entries to the suggestion blocklist (the same Redis SET used for content filtering). The blocklist filter applies before serving, so even if a PII query somehow reached the Redis cache through a gap in the first two layers, it would be filtered at read time. Together these three layers form a defense-in-depth strategy: drop at ingest, floor at aggregation, filter at serve.
+
+</Curveball>
+
+<RelatedQuestions items={[
+  { slug: "google-search", title: "Design Google Search", difficulty: "staff" },
+  { slug: "yelp-nearby-places", title: "Design Yelp / Nearby Places", difficulty: "mid" },
+  { slug: "top-k-trending", title: "Design a Top-K Trending System", difficulty: "senior" },
+]} />
+
+## Further reading
+
+- [How Google's Autocomplete Works](https://blog.google/products/search/how-google-autocomplete-works-search/) — Google's own explanation of the signals (query frequency, recency, personalization, filtering) that drive autocomplete predictions; useful for understanding how production systems balance these factors at planetary scale
+- [Redis Sorted Sets documentation](https://redis.io/docs/data-types/sorted-sets/) — The official reference for `ZADD`, `ZREVRANGE`, `ZREMRANGEBYRANK`, and `ZRANGEBYLEX`; the `ZRANGEBYLEX` command in particular enables prefix-based range queries directly in Redis without a separate precomputed cache, at the cost of losing score-based ranking
+- [Elasticsearch Completion Suggester](https://www.elastic.co/guide/en/elasticsearch/reference/current/search-suggesters.html#completion-suggester) — Elasticsearch's built-in prefix completion suggester uses an FST (finite state transducer) stored in memory for sub-millisecond prefix lookups; a viable alternative to Redis for teams already operating an Elasticsearch cluster, though it trades memory for operational simplicity

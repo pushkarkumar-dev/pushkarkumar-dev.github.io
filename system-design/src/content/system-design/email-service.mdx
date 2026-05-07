@@ -1,0 +1,659 @@
+---
+title: "Design an Email Service"
+slug: "email-service"
+category: "social"
+difficulty: "senior"
+estimatedReadMinutes: 22
+tags: ["smtp", "email", "anti-spam", "dkim", "spf", "threading", "search", "deliverability"]
+companyFlavors: ["Gmail", "Outlook", "Yahoo Mail", "ProtonMail"]
+prerequisites: ["notification-system", "web-crawler", "distributed-unique-id-generator"]
+relatedQuestions: ["notification-system", "slack", "whatsapp-messenger"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design a Gmail-scale email service: SMTP ingestion, anti-spam pipeline, conversation threading, full-text search, and the deliverability engineering that keeps your IP reputation clean at 15 billion emails per day."
+javaPackages:
+  - "org.springframework.boot:spring-boot-starter-mail:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "org.springframework.data:spring-data-elasticsearch:5.3.0"
+  - "org.springframework.data:spring-data-cassandra:4.3.0"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="email-service" title="Design an Email Service" />
+
+<Tldr>
+- **Inbound path**: MX record routes external MTAs to your SMTP servers (port 25); each message passes an anti-spam pipeline — SPF/DKIM/DMARC cryptographic checks followed by an ML classifier — before the raw RFC 5322 body lands in S3, metadata lands in Cassandra, and a Kafka consumer indexes the body into Elasticsearch for full-text search
+- **Outbound path**: clients call POST /v1/messages/send; after validation and rate limiting the message is published to a Kafka "outbound-smtp" topic; SMTP relay workers dequeue, choose an IP from the appropriate reputation pool, and attempt delivery; soft bounces retry with exponential backoff; hard bounces suppress the address immediately
+- **Conversation threading**: at ingestion, check the In-Reply-To and References headers against a Cassandra message index; if any referenced Message-ID matches, inherit that thread_id; otherwise fall back to a normalized Subject hash combined with the participant set; every message in a thread shares the same thread_id so a single Cassandra partition read returns the entire conversation
+- **Full-text search**: Elasticsearch sharded by user_id modulo 1000 — each user's mail stays within a single shard (privacy boundary); subject is boosted 2× over body; a Kafka consumer indexes messages in near-real-time with a 5-second refresh interval; queries support phrase match, date range, label filter, and has-attachment boolean
+- **Deliverability**: new IPs warm up from 1K emails/day doubling weekly; transactional and marketing email run on separate IP pools so a bad bulk campaign cannot poison receipt rates for password reset flows; bounce rate must stay below 2% and complaint rate below 0.08% to maintain reputation with receiving domains
+</Tldr>
+
+## The scale of the problem
+
+Email is the oldest internet application still running at planetary scale. Gmail alone serves 1.8 billion active users, delivers roughly 15 billion emails per day, and provides each user 15 GB of free storage — a total provisioned quota of 27 petabytes, with active data sitting around 8 petabytes after accounting for typical utilization rates. At 15 billion emails per day the inbound ingestion rate is approximately 173,000 messages per second sustained, with peaks during business hours in each timezone stacking on top of each other. That is an order of magnitude higher throughput than most messaging systems discussed in system design interviews, and the messages are not small: a typical email with an inline image attachment is 100–500 KB, and the 25 MB attachment limit means the tail of the distribution is substantial.
+
+What makes email qualitatively harder than, say, a direct-messaging system like WhatsApp or Slack is the adversarial nature of the medium. Email is an open standard — any server in the world can attempt to deliver a message to your MX record. There is no authentication by default; anyone can forge a From: address claiming to be paypal.com or your-bank.com. Spam, phishing, and malware delivery are not edge cases — at Gmail scale, roughly 99.9% of inbound email traffic is spam or malware, and the spam filter is what keeps inboxes usable. Running a spam pipeline that achieves 99.9% recall (catching spam) with fewer than 0.1% false positives (legitimate mail misclassified) on 173,000 messages per second — and doing it in under 200ms per message — is a genuine distributed ML systems problem, not a toy classifier.
+
+The third dimension of difficulty is **deliverability** — the ability of your outbound emails to actually reach recipients' inboxes rather than their spam folders or being rejected at the SMTP level. Receiving domains like Gmail and Outlook maintain reputation scores for every IP address and domain that sends them mail. If your IP sends a bad campaign, you get blocked or throttled for days. Warming up a new IP from zero to full volume requires weeks of careful ramping. Managing this for a platform where thousands of customers send millions of emails means operating dedicated IP pools, feedback loops, bounce processing, and real-time reputation dashboards — a discipline called deliverability engineering that has no parallel in closed messaging systems.
+
+## Clarifying questions
+
+Eight questions you must answer before sketching any architecture. Email has more hidden complexity per clarifying answer than almost any other system design topic.
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| Is both inbound and outbound email in scope? | Yes — receive from external MTAs and send to external recipients | Inbound is an SMTP server + spam pipeline; outbound is a relay fleet + IP reputation management; they are architecturally separate subsystems |
+| What is the attachment size limit? | 25 MB per message, matching Gmail's limit | Drives object storage key layout, multipart MIME parsing, virus scanning SLA, and whether you need chunked upload from client to API |
+| What spam filtering approach is acceptable? | Multi-stage: IP blocklists + cryptographic auth (SPF/DKIM/DMARC) + ML classifier | Rule-based alone cannot catch novel phishing; ML alone has too many false positives on day one; the combination gives defense in depth |
+| What threading model? | Header-based (In-Reply-To / References), with Subject-hash fallback | Determines whether threading is lossless (every client that sets RFC headers is grouped correctly) or approximate (cross-client threads may split) |
+| What is the full-text search depth? | All mail, not just the last 30 days | Driving factor for Elasticsearch cluster size and index retention policy; "all mail" means petabytes of warm index data |
+| How many mailboxes? | 1.8 billion users, each with one primary mailbox | Determines sharding strategy — no single Cassandra partition or Elasticsearch index can hold all mail; must shard by user_id |
+| Are email aliases and forwarding in scope? | Aliases yes (multiple addresses to one mailbox); forwarding out of scope for now | Alias resolution must happen at SMTP RCPT TO validation time, not at delivery time, to avoid accepting mail for unknown addresses |
+| Enterprise features (shared mailboxes, delegation)? | Out of scope; design for consumer Gmail-like product | Removes OAuth delegation, shared inbox ACLs, and admin audit logging from scope — simplifies data model significantly |
+
+## Functional requirements
+
+- **Send email**: a user or application POSTs a message with recipients, subject, body, and attachments; the system delivers it to external SMTP servers
+- **Receive email**: the system accepts SMTP connections from external MTAs, validates the sender, runs spam filtering, and delivers the message to the recipient's inbox
+- **Conversation threading**: messages in the same conversation are grouped into threads and displayed together; the thread list shows the most recent message and a count of participants
+- **Folder and label management**: inbox, sent, drafts, trash, and spam are system folders; users can create custom labels and apply multiple labels to any message
+- **Full-text search**: users can search all their mail by keyword, sender, recipient, date range, or presence of an attachment; results return in under 1 second at p99
+- **Attachment storage and download**: attachments up to 25 MB are stored durably and retrievable by the recipient; virus scanning is performed before delivery
+- **Spam filtering**: inbound messages are scored for spam probability; high-confidence spam is delivered to the spam folder rather than inbox; users can report missed spam or false positives
+
+## Non-functional requirements
+
+- **Scale**: 1.8 billion users; 15 billion emails per day inbound; 15 GB free storage quota per user totaling 27 PB provisioned
+- **Throughput**: ~173,000 inbound emails per second sustained; peak ~2× sustained at business hour overlap
+- **Send latency**: p99 end-to-end delivery (our SMTP → external recipient's inbox) under 5 seconds for transactional mail
+- **Search latency**: p99 full-text search response under 1 second including result snippets
+- **Spam recall**: 99.9% of spam caught (false negative rate below 0.1%); false positive rate below 0.01% (legitimate mail misclassified)
+- **Availability**: 99.99% for inbound mail acceptance — a lost inbound email is unrecoverable; outbound may retry but must not lose durably queued messages
+- **Durability**: 11-nines durability for message bodies stored in S3; Cassandra metadata replicated across three availability zones
+
+<Capacity title="Email Service Capacity Estimates">
+
+**Inbound throughput:**
+
+$$\frac{15{,}000{,}000{,}000 \text{ emails/day}}{86{,}400 \text{ s/day}} \approx 173{,}611 \text{ emails/s}$$
+
+**Total storage quota:**
+
+$$1.8 \times 10^9 \text{ users} \times 15 \text{ GB/user} = 27 \text{ PB total quota}$$
+
+At ~30% utilization: $27 \text{ PB} \times 0.30 \approx 8 \text{ PB}$ active body data in S3.
+
+**Cassandra metadata storage** (headers, labels, thread_id, ~2 KB per message row):
+
+$$15 \times 10^9 \text{ emails/day} \times 365 \times 10 \text{ yr} \times 2 \text{ KB} = 109 \text{ PB raw}$$
+
+Cassandra 3× replication + LZ4 compression (~4× ratio): $\approx \frac{109 \text{ PB} \times 3}{4} \approx 82 \text{ PB}$. In practice Gmail-equivalent would use tiered compaction and aggressive TTL on trash/spam to reduce this to ~27 PB active.
+
+**Elasticsearch index** (hot window: last 30 days, body avg 10 KB extracted text):
+
+$$15 \times 10^9 \text{ emails/day} \times 30 \text{ days} \times 10 \text{ KB} = 4.5 \text{ PB raw}$$
+
+After Lucene compression (~3× ratio): $\approx 1.5 \text{ PB}$ per 30-day hot window. Older mail on warm/cold Elasticsearch tiers with force-merged segments.
+
+**Outbound SMTP bandwidth** at peak (2× average, avg 100 KB per email):
+
+$$173{,}611 \text{ emails/s} \times 2 \times 100 \text{ KB} = 34 \text{ GB/s peak egress}$$
+
+This requires hundreds of SMTP relay pods across multiple data centers with outbound bandwidth provisioned accordingly.
+
+</Capacity>
+
+## API design
+
+The system exposes both an internal REST API (for clients and microservices) and external SMTP endpoints (for the internet's mail infrastructure).
+
+**Internal REST API:**
+
+```text
+POST   /v1/messages/send
+       Body: { to: string[], cc: string[], bcc: string[],
+               subject: string, body: string, bodyType: "text"|"html",
+               attachments: [{ filename: string, s3Key: string, size: number }] }
+       Returns: { messageId: string, status: "queued" }
+
+GET    /v1/messages
+       Query: folder=inbox|sent|trash|spam|label:{labelName}
+              cursor={opaqueCursor}  (encodes last seen message_id)
+              count=50 (max 100)
+       Returns: { messages: MessageSummary[], nextCursor: string | null }
+
+GET    /v1/messages/{messageId}
+       Returns: { message: FullMessage (headers + body + attachment refs) }
+
+GET    /v1/threads/{threadId}/messages
+       Returns: { messages: FullMessage[], participantCount: number }
+
+GET    /v1/search
+       Query: q=string, fromDate=ISO8601, toDate=ISO8601,
+              hasAttachment=bool, fromAddr=string, cursor=string
+       Returns: { hits: SearchHit[], totalEstimate: number, nextCursor: string | null }
+
+PATCH  /v1/messages/{messageId}/labels
+       Body: { add: string[], remove: string[] }
+       Returns: { labels: string[] }
+
+DELETE /v1/messages/{messageId}
+       Moves to trash; permanent delete after 30-day TTL
+```
+
+**External SMTP endpoints:**
+
+Port 25 — inbound MX receiver: accepts connections from any internet MTA delivering mail addressed to your domain. TLS via STARTTLS required for any non-local sender. The RCPT TO phase validates that the recipient address (or alias) exists; rejecting unknown addresses with a 550 here prevents accepting mail you cannot deliver and protects against dictionary attacks.
+
+Port 587 — authenticated submission: used by email clients (Outlook, Thunderbird, mobile apps) to send outbound mail from authenticated users. Requires SASL authentication (username/password or OAuth2 bearer token). TLS mandatory.
+
+Port 465 — implicit TLS submission: identical to 587 but wraps the entire session in TLS from the first byte rather than upgrading via STARTTLS. Preferred for new clients because it eliminates the STARTTLS downgrade attack vector.
+
+## Data model
+
+**messages table (Cassandra)**
+
+Partition key `(user_id, folder)` — all messages in a user's inbox are co-located on the same Cassandra partition, allowing efficient range scans by message_id (the clustering key). Pagination uses the clustering key directly as a cursor without a secondary index.
+
+```sql
+CREATE TABLE messages (
+    user_id       uuid,
+    folder        text,
+    message_id    timeuuid,        -- clustering key DESC; embeds timestamp
+    thread_id     uuid,
+    from_addr     text,
+    to_addrs      list<text>,
+    subject       text,
+    body_s3_key   text,            -- s3://bucket/messages/{user_id}/{message_id}/body.eml
+    has_attachment boolean,
+    labels        list<text>,
+    received_at   timestamp,
+    is_read       boolean,
+    spam_score    float,
+    size_bytes    int,
+    PRIMARY KEY ((user_id, folder), message_id)
+) WITH CLUSTERING ORDER BY (message_id DESC)
+  AND compaction = {'class': 'TimeWindowCompactionStrategy',
+                    'compaction_window_unit': 'DAYS',
+                    'compaction_window_size': 7};
+```
+
+**threads table (Cassandra)**
+
+Partition key `(user_id, thread_id)` — fetching the full thread is a single partition read. The `latest_message_at` column is denormalized here and updated on every new message insertion so the threads list can sort without touching the messages table.
+
+```sql
+CREATE TABLE threads (
+    user_id            uuid,
+    thread_id          uuid,
+    latest_message_id  timeuuid,
+    subject_normalized text,
+    participant_addrs  set<text>,
+    last_message_at    timestamp,
+    message_count      counter,
+    label_summary      list<text>,
+    PRIMARY KEY ((user_id, thread_id), latest_message_id)
+) WITH CLUSTERING ORDER BY (latest_message_id DESC);
+```
+
+**message bodies (S3)**
+
+Raw RFC 5322 MIME messages stored at `s3://mail-bodies/{user_id}/{message_id}/body.eml`. Attachments are extracted at ingestion and stored separately at `s3://mail-attachments/{user_id}/{message_id}/{filename}` to allow per-attachment virus scanning and independent access. S3 Intelligent-Tiering moves infrequently accessed messages to cheaper storage classes automatically.
+
+**search index (Elasticsearch)**
+
+Index name pattern: `mail_{shard_id}` where `shard_id = user_id % 1000`. Each index contains all messages for the users mapped to that shard. This is a privacy boundary — no cross-user queries are possible because users are never mixed in a single shard's query path.
+
+```json
+{
+  "mappings": {
+    "properties": {
+      "message_id":    { "type": "keyword" },
+      "user_id":       { "type": "keyword" },
+      "thread_id":     { "type": "keyword" },
+      "from_addr":     { "type": "text", "analyzer": "email_analyzer",
+                         "fields": { "keyword": { "type": "keyword" } } },
+      "to_addrs":      { "type": "text", "analyzer": "email_analyzer" },
+      "subject":       { "type": "text", "analyzer": "standard",
+                         "boost": 2.0 },
+      "body_text":     { "type": "text", "analyzer": "standard",
+                         "store": false },
+      "labels":        { "type": "keyword" },
+      "received_at":   { "type": "date" },
+      "has_attachment":{ "type": "boolean" },
+      "size_bytes":    { "type": "integer" }
+    }
+  }
+}
+```
+
+**smtp_queue (Kafka topic "outbound-smtp")**
+
+```json
+{
+  "messageId": "01J3K...",
+  "fromAddr": "alice@example.com",
+  "toAddrs": ["bob@gmail.com"],
+  "bodyS3Key": "messages/user-uuid/msg-uuid/body.eml",
+  "priority": "transactional",
+  "retryCount": 0,
+  "scheduledAt": "2025-01-15T14:23:00Z",
+  "ipPoolId": "transactional-us-east"
+}
+```
+
+Kafka topic partitioned by recipient domain's first two characters — this groups messages to the same receiving domain onto the same partition, which lets SMTP relay workers maintain persistent connections per domain rather than re-establishing TCP+TLS for every message.
+
+## System architecture
+
+<Mermaid diagram={`flowchart TD
+    subgraph Inbound["Inbound Path"]
+        ExtMTA["External MTA"] -->|"SMTP port 25"| MXReceiver["MX Receiver\n(SMTP Server fleet)"]
+        MXReceiver -->|"RCPT TO validation"| AliasDB["Alias / User DB\n(PostgreSQL)"]
+        MXReceiver --> AuthCheck["SPF / DKIM /\nDMARC Check"]
+        AuthCheck --> SpamPipeline["Anti-Spam Pipeline\n(IP blocklist → content hash\n→ URL reputation → ML classifier)"]
+        SpamPipeline -->|"spam_score > 0.8"| SpamFolder["Spam folder\n(Cassandra + S3)"]
+        SpamPipeline -->|"spam_score ≤ 0.8"| IngestService["Ingest Service"]
+        IngestService --> S3Body["S3\nbody.eml"]
+        IngestService --> CassandraMeta["Cassandra\nmetadata"]
+        IngestService --> KafkaIndex["Kafka\nemail-indexed"]
+        KafkaIndex --> ESConsumer["Elasticsearch\nIndexer"]
+        IngestService --> PushNotif["Push Notification\nService"]
+    end
+
+    subgraph Outbound["Outbound Path"]
+        Client["Email Client"] -->|"POST /v1/messages/send"| SendAPI["Send API\n(validation + rate limit)"]
+        SendAPI --> KafkaOut["Kafka\noutbound-smtp"]
+        KafkaOut --> RelayWorker["SMTP Relay\nWorker fleet"]
+        RelayWorker -->|"choose IP pool"| IPPool["IP Pool Manager\n(transactional / bulk)"]
+        IPPool --> ExtRecipient["External Recipient\n(Gmail, Outlook, ...)"]
+        RelayWorker -->|"soft bounce"| RetryQ["Retry Queue\n(exponential backoff)"]
+        RelayWorker -->|"hard bounce"| Suppress["Suppression List\n(PostgreSQL)"]
+        ExtRecipient -->|"feedback loop"| FBLProcessor["FBL Processor\n(complaint handling)"]
+    end
+`} />
+
+## Deep dives
+
+### SMTP protocol and infrastructure
+
+SMTP is a text protocol defined in RFC 5321. When an external mail server wants to deliver a message to alice@yourdomain.com, it first performs a DNS MX record lookup for yourdomain.com to discover the authoritative mail exchangers. MX records carry a priority value — lower is higher priority — so you can run multiple receiver clusters across regions with defined failover order. Traffic is naturally load-balanced across MX hosts because sending MTAs randomize their choice among hosts with equal priority and fall back to lower-priority hosts when higher-priority ones time out.
+
+The SMTP handshake sequence matters because each phase is an opportunity to reject bad senders early and cheaply. The connection phase: the receiver presents its hostname in the 220 banner. The EHLO phase: the client identifies itself with its own hostname; the receiver advertises supported extensions including STARTTLS, SIZE, and AUTH. The STARTTLS negotiation happens here; you should reject unauthenticated connections or downgrade-attack-vulnerable sessions. The MAIL FROM phase: the sending server declares the envelope sender address (the "return path" — different from the header From: address, which is what users see). The RCPT TO phase: one call per recipient; this is where you validate that the address exists in your system and has not exceeded storage quota. Rejecting here with a 550 tells the sending MTA the address is invalid; it will bounce back to the sender and not retry. Accepting here with a 250 commits you to delivering the message. The DATA phase: the full RFC 5322 message including headers and body is transmitted. Once you respond 250 to end of DATA, you have accepted delivery responsibility and must not lose the message.
+
+At 173,000 messages per second you need a fleet of SMTP receiver pods behind DNS round-robin on your MX records. Each pod is stateless — it receives one connection, processes it, and writes the outcome to Kafka. Horizontal scaling is straightforward because there is no shared state between receiver pods. The bottleneck is typically the anti-spam pipeline latency, not network throughput — design the pipeline to respond within 200ms so that SMTP connections do not hold threads for long periods.
+
+### Anti-spam pipeline
+
+The pipeline is multi-stage and eliminates the vast majority of spam at cheap early stages so the expensive ML classifier only sees a small fraction of traffic.
+
+**Stage 1 — IP reputation blocklists.** Before accepting the DATA phase, query real-time block lists (Spamhaus ZEN, SURBL, Barracuda) against the sender's IP address. These lists are maintained by the anti-spam community and cover known spam-sending IPs, compromised hosts, and open relays. A Bloom filter in local memory (refreshed every 15 minutes from Redis) gives sub-millisecond lookup without a network round trip. Reject at MAIL FROM with a 550 for hard-listed IPs; accept with caution for greylisted IPs and mark for deeper inspection.
+
+**Stage 2 — Cryptographic authentication.** SPF (Sender Policy Framework, RFC 7208) checks whether the sending IP is authorized to send mail for the envelope sender's domain by querying a TXT record at the sender's domain. A sending server not in the authorized IP set gets a SOFTFAIL or FAIL result. DKIM (DomainKeys Identified Mail, RFC 6376) verifies the cryptographic signature in the DKIM-Signature header against the sender domain's public key (published as a DNS TXT record). A valid signature proves message integrity — the body and signed headers have not been modified in transit. DMARC (RFC 7489) ties SPF and DKIM together: it requires that at least one of them aligns with the RFC 5322 From: header domain, and the domain owner's DMARC policy dictates what to do on failure — none (monitor), quarantine (spam folder), or reject. Implementing all three correctly eliminates spoofing of authenticated domains entirely.
+
+**Stage 3 — Content fingerprinting.** After accepting the DATA phase, extract a normalized hash of the message body (strip whitespace variations, decode base64, normalize Unicode). Compare against a Redis set of known-spam hashes maintained by your abuse team. This catches bulk campaigns where the same message is sent to millions of recipients with minor obfuscations. False positive rate is effectively zero because hashes are manually curated.
+
+**Stage 4 — URL reputation.** Extract all URLs from the message body (text and HTML parts). Check them against Google Safe Browsing API and your internal phishing URL database. Newly registered domains (age under 30 days from WHOIS) get elevated suspicion scores. Short URLs are expanded via HEAD request before checking. This stage catches the majority of phishing emails because they almost always include a malicious link.
+
+**Stage 5 — ML classifier.** Feed surviving messages to a gradient boosting model (LightGBM in practice — fast inference, handles sparse features) with features including: TF-IDF similarity to known spam corpus, sender reputation score (historical spam rate per sending domain/IP), header anomaly score (missing standard headers, unusual Received: chains), body-to-image ratio, link-to-text ratio, and language model perplexity (spam often uses unusual language patterns). The model outputs a probability score 0–1. Threshold 0.8 → spam folder. Threshold 0.95 → reject during SMTP session with a 550 (rare, only for high-confidence malware). The model is retrained weekly on user-reported spam/ham signals collected through the "Report spam" / "Not spam" buttons. Feature extraction and model inference together take 50–150ms, which fits comfortably within the 200ms pipeline SLA.
+
+**Stage 6 — Behavioral signals.** If the sender domain or IP has sent messages in the last hour with a bounce rate above 5% or a complaint rate above 0.1%, apply a temporary deferral — respond to the DATA phase with a 451 "Try again later." This is gentler than a 550 reject (which tells the sender the address does not exist) and causes legitimate MTAs to retry after their queue delay. It effectively rate-limits aggressive spam campaigns by forcing them to retry, burning time and capacity.
+
+### Conversation threading
+
+Email threading is deceptively complex because it must work across different email clients, each with slightly different interpretations of RFC 2822 threading headers. The algorithm runs at ingest time and assigns a thread_id before writing to Cassandra.
+
+**Primary algorithm — header-based threading.** The In-Reply-To header contains exactly one Message-ID that this message is replying to. The References header contains an ordered list of all Message-IDs in the chain (the full ancestry). At ingestion: (1) extract all Message-IDs from In-Reply-To and References; (2) query the Cassandra `message_thread_index` table (a secondary lookup table keyed by message_id → thread_id) for any of these Message-IDs; (3) if any match is found, use that thread_id; (4) if multiple distinct thread_ids are found (two threads being merged by a reply that spans both), choose the thread with the older first message and update all messages from the smaller thread to use the merged thread_id via a background reconciliation job.
+
+**Fallback algorithm — subject-based threading.** If no matching Message-IDs are found in the index (the message is a reply to an external email, or the client did not set threading headers), normalize the subject by: stripping Re:, Fwd:, RE:, FW:, AW:, Antwort: prefixes (all common localized variations); trimming leading/trailing whitespace; lower-casing; removing sequential duplicate words. Combine the normalized subject with the sorted set of participant email addresses and hash with SHA-256. If any message in the last 7 days has the same normalized hash, join that thread. Otherwise create a new thread_id using the distributed ID generator (Snowflake format — encodes timestamp, node ID, sequence).
+
+The `message_thread_index` table is a lightweight Cassandra table with partition key `message_id` (the RFC 5322 Message-ID header value) and columns `thread_id`, `user_id`. It is written at ingestion alongside the main messages table. Because RFC 5322 Message-IDs must be globally unique (generated by the sending MTA), collision is negligible in practice.
+
+### Full-text search
+
+The search subsystem is one of the most expensive components of an email service and the one most likely to require significant upfront capacity planning. At Gmail scale, the search corpus is effectively all email ever received by 1.8 billion users — petabytes of indexed text that must be searchable in under a second.
+
+**Sharding strategy.** Index sharding by `user_id % 1000` gives 1000 logical shards, each backed by a primary Elasticsearch index with 1 physical shard (no intra-index sharding). This is a critical design decision: because email is private, queries never span users. A user's search query is satisfied entirely within their shard's physical node. There are no cross-shard scatter-gather queries to aggregate. This makes search latency nearly independent of cluster size — adding shards does not increase query latency.
+
+**Index configuration.** Each index uses a custom analyzer for email addresses (the `email_analyzer`): tokenize on @ and . separators, apply lowercase filter, and add an edge n-gram filter for prefix matching (so "al" matches "alice@example.com"). The subject field uses the standard analyzer with a 2× boost. The body_text field sets `store: false` because we never retrieve the full body from Elasticsearch — we only use it for scoring and highlighting, and the full body is fetched from S3 separately. This roughly halves the index size.
+
+**Near-real-time indexing.** The Ingest Service publishes a Kafka message to the "email-indexed" topic immediately after writing to S3 and Cassandra. A fleet of Elasticsearch indexing workers consumes this topic, batches documents (500 at a time or 5 seconds, whichever comes first), and calls the Elasticsearch Bulk API. The `index.refresh_interval` is set to 5s — longer than Elasticsearch's default of 1s — to reduce segment flush overhead at high ingest rates. The result is a 5–10 second indexing lag from message receipt to search availability, which is acceptable for an email system (users do not typically search for a message in the first 10 seconds of receiving it).
+
+**Query construction.** A user search query `from:alice project proposal has:attachment after:2025-01-01` is parsed into a structured Elasticsearch query:
+
+```json
+{
+  "query": {
+    "bool": {
+      "must": [
+        {
+          "multi_match": {
+            "query": "project proposal",
+            "fields": ["subject^2", "body_text", "from_addr", "to_addrs"]
+          }
+        }
+      ],
+      "filter": [
+        { "term": { "from_addr.keyword": "alice@example.com" } },
+        { "term": { "has_attachment": true } },
+        { "range": { "received_at": { "gte": "2025-01-01T00:00:00Z" } } },
+        { "term": { "user_id": "user-uuid" } }
+      ]
+    }
+  },
+  "highlight": {
+    "fields": { "subject": {}, "body_text": { "fragment_size": 200 } }
+  }
+}
+```
+
+Filters are pushed into the `filter` context (not `must`) so they benefit from Elasticsearch's filter cache and do not affect scoring. The `user_id` filter is always present and ensures no cross-user data leakage even if a query somehow reaches the wrong shard.
+
+### IP reputation and deliverability engineering
+
+Deliverability is the practice of ensuring your outbound emails reach recipients' inboxes rather than spam folders or being rejected at the SMTP connection level. At a platform scale serving thousands of customers, it is a full-time engineering discipline.
+
+**IP warm-up protocol.** A brand new IP address has no reputation at receiving domains. Gmail, Outlook, and Yahoo maintain internal scoring for every IP they receive mail from. A new IP sending 1 million emails on day one will be rate-limited or blocked immediately. The correct warm-up ramp: start at 1,000 emails/day on day one, double every 7 days — reaching 500K/day at week 9 and 1M/day at week 11. During warm-up, only send to your most engaged recipients (those who have opened email in the last 30 days) — positive engagement signals (opens, clicks) build reputation faster than neutral delivery alone.
+
+**IP pool segmentation.** Never mix email types on the same IP pool. Transactional email (password resets, 2FA codes, order confirmations) must be on a dedicated IP pool separate from marketing email (newsletters, promotional campaigns). The reason: a single bad marketing campaign that generates spam complaints contaminates the IP's reputation, which then causes your password reset emails to go to spam — a catastrophic user experience. Typical segmentation: transactional IPs (smallest pool, highest reputation SLA), product notification IPs (medium pool), marketing IPs (large pool, most vulnerable to reputation damage from customer misuse).
+
+**Bounce handling.** Hard bounces (SMTP 5xx permanent failure: address does not exist, domain does not exist, mailbox full permanently) must be added to a suppression list immediately and never retried. Sending to suppressed addresses is one of the fastest ways to damage your IP reputation. Soft bounces (SMTP 4xx temporary failure: mailbox temporarily full, receiving server temporarily unavailable) are retried with exponential backoff: 1 minute, 5 minutes, 30 minutes, 2 hours, 6 hours, 24 hours, then abandon and classify as a hard bounce. The suppression list is checked before every send — it is the first guard in the SMTP relay worker.
+
+**Feedback loops (FBL).** Gmail Postmaster Tools, Microsoft SNDS (Smart Network Data Services), and Yahoo FBL provide per-IP and per-domain spam complaint rates. When a recipient marks your email as spam, these services send a complaint report to a registered email address. Your FBL processor ingests these reports, identifies the original message (by Message-ID in the complaint), extracts the recipient address, and adds it to the suppression list. It also updates the sending customer's complaint rate counter. If a customer's complaint rate exceeds 0.08% (Gmail's stated enforcement threshold), their account is flagged and their sending is automatically throttled until the issue is resolved.
+
+**DKIM signing at send time.** Every outbound message must be DKIM-signed before delivery. The SMTP relay worker calls a signing service that retrieves the appropriate private key (stored in AWS KMS) for the sending domain, generates the DKIM-Signature header covering the canonical form of the message headers and body, and injects it into the message before transmission. Key rotation is performed every 6 months; the old key remains published in DNS for 72 hours after rotation to allow in-flight messages to validate.
+
+## Java integration
+
+### Part A — InboundEmailProcessor.java
+
+Core ingest service class: resolves the thread, scores for spam, writes to S3 and Cassandra, and publishes to Kafka for search indexing.
+
+```java
+package com.example.mail.ingest;
+
+import jakarta.mail.internet.MimeMessage;
+import lombok.RequiredArgsConstructor;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Service;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import java.util.Arrays;
+import java.util.List;
+import java.util.UUID;
+
+@Service
+@RequiredArgsConstructor
+public class InboundEmailProcessor {
+
+    private final MessageRepository messageRepository;
+    private final ThreadIndexRepository threadIndexRepository;
+    private final SpamClassifierClient spamClassifier;
+    private final S3Client s3Client;
+    private final KafkaTemplate<String, EmailIndexEvent> kafkaTemplate;
+    private final SnowflakeIdGenerator idGenerator;
+
+    private static final String BUCKET = "mail-bodies";
+    private static final float SPAM_THRESHOLD = 0.80f;
+
+    public ProcessResult processEmail(MimeMessage msg, String recipientAddr) throws Exception {
+        String[] inReplyTo = msg.getHeader("In-Reply-To");
+        String[] references  = msg.getHeader("References");
+
+        UUID threadId = resolveThreadId(inReplyTo, references);
+        UUID messageId = idGenerator.nextUUID();
+        String userId  = resolveUserId(recipientAddr);
+
+        float spamScore = spamClassifier.score(msg);
+        String folder   = spamScore > SPAM_THRESHOLD ? "spam" : "inbox";
+
+        String s3Key = "messages/%s/%s/body.eml".formatted(userId, messageId);
+        byte[] rawBytes = MimeUtil.toBytes(msg);
+        s3Client.putObject(
+            PutObjectRequest.builder().bucket(BUCKET).key(s3Key).build(),
+            RequestBody.fromBytes(rawBytes));
+
+        MessageEntity entity = MessageEntity.builder()
+            .userId(userId).folder(folder).messageId(messageId)
+            .threadId(threadId).fromAddr(MimeUtil.from(msg))
+            .toAddrs(MimeUtil.to(msg)).subject(msg.getSubject())
+            .bodyS3Key(s3Key).spamScore(spamScore)
+            .hasAttachment(MimeUtil.hasAttachment(msg))
+            .receivedAt(msg.getSentDate().toInstant())
+            .isRead(false).build();
+        messageRepository.save(entity);
+
+        threadIndexRepository.upsert(MimeUtil.messageId(msg), threadId, userId);
+
+        kafkaTemplate.send("email-indexed", userId,
+            new EmailIndexEvent(messageId, userId, threadId,
+                MimeUtil.from(msg), MimeUtil.to(msg),
+                msg.getSubject(), MimeUtil.bodyText(msg),
+                entity.hasAttachment(), entity.receivedAt()));
+
+        return new ProcessResult(messageId, threadId, folder, spamScore);
+    }
+
+    private UUID resolveThreadId(String[] inReplyTo, String[] references) {
+        List<String> msgIds = MimeUtil.extractMessageIds(inReplyTo, references);
+        return msgIds.stream()
+            .map(threadIndexRepository::findThreadId)
+            .filter(opt -> opt.isPresent())
+            .map(opt -> opt.get())
+            .findFirst()
+            .orElse(UUID.fromString(idGenerator.nextSnowflake()));
+    }
+
+    private String resolveUserId(String addr) {
+        return messageRepository.findUserIdByAddress(addr);
+    }
+
+    public record ProcessResult(UUID messageId, UUID threadId,
+                                String folder, float spamScore) {}
+    public record MessageEntity(String userId, String folder, UUID messageId,
+        UUID threadId, String fromAddr, List<String> toAddrs, String subject,
+        String bodyS3Key, float spamScore, boolean hasAttachment,
+        java.time.Instant receivedAt, boolean isRead) {
+        public static MessageEntityBuilder builder() { return new MessageEntityBuilder(); }
+        public static class MessageEntityBuilder {
+            private String userId; private String folder; private UUID messageId;
+            private UUID threadId; private String fromAddr; private List<String> toAddrs;
+            private String subject; private String bodyS3Key; private float spamScore;
+            private boolean hasAttachment; private java.time.Instant receivedAt; private boolean isRead;
+            public MessageEntityBuilder userId(String v) { userId=v; return this; }
+            public MessageEntityBuilder folder(String v) { folder=v; return this; }
+            public MessageEntityBuilder messageId(UUID v) { messageId=v; return this; }
+            public MessageEntityBuilder threadId(UUID v) { threadId=v; return this; }
+            public MessageEntityBuilder fromAddr(String v) { fromAddr=v; return this; }
+            public MessageEntityBuilder toAddrs(List<String> v) { toAddrs=v; return this; }
+            public MessageEntityBuilder subject(String v) { subject=v; return this; }
+            public MessageEntityBuilder bodyS3Key(String v) { bodyS3Key=v; return this; }
+            public MessageEntityBuilder spamScore(float v) { spamScore=v; return this; }
+            public MessageEntityBuilder hasAttachment(boolean v) { hasAttachment=v; return this; }
+            public MessageEntityBuilder receivedAt(java.time.Instant v) { receivedAt=v; return this; }
+            public MessageEntityBuilder isRead(boolean v) { isRead=v; return this; }
+            public MessageEntity build() { return new MessageEntity(userId,folder,messageId,
+                threadId,fromAddr,toAddrs,subject,bodyS3Key,spamScore,hasAttachment,receivedAt,isRead); }
+        }
+    }
+}
+```
+
+### Part B — MessageController.java
+
+Spring Boot REST controller wiring Cassandra, Kafka, and Elasticsearch together behind the REST API.
+
+```java
+package com.example.mail.api;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.data.cassandra.core.query.CassandraPageRequest;
+import org.springframework.http.ResponseEntity;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.web.bind.annotation.*;
+import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import java.util.List;
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/v1")
+@RequiredArgsConstructor
+public class MessageController {
+
+    private final MessageRepository messageRepository;
+    private final ThreadRepository threadRepository;
+    private final ElasticsearchClient esClient;
+    private final KafkaTemplate<String, OutboundEmailEvent> kafkaTemplate;
+    private final SnowflakeIdGenerator idGenerator;
+    private final SecurityContext securityContext;
+
+    @GetMapping("/messages")
+    public ResponseEntity<MessageListResponse> listMessages(
+            @RequestParam String folder,
+            @RequestParam(required = false) String cursor,
+            @RequestParam(defaultValue = "50") int count) {
+        String userId = securityContext.currentUserId();
+        var page = messageRepository.findByUserAndFolder(
+            userId, folder, CassandraPageRequest.of(cursor, Math.min(count, 100)));
+        return ResponseEntity.ok(MessageListResponse.from(page));
+    }
+
+    @GetMapping("/threads/{threadId}/messages")
+    public ResponseEntity<List<FullMessage>> getThreadMessages(
+            @PathVariable UUID threadId) {
+        String userId = securityContext.currentUserId();
+        var messages = threadRepository.findMessagesByThread(userId, threadId);
+        return ResponseEntity.ok(messages.stream().map(FullMessage::from).toList());
+    }
+
+    @PostMapping("/messages/send")
+    public ResponseEntity<SendResponse> sendMessage(@RequestBody SendRequest req) {
+        String userId = securityContext.currentUserId();
+        UUID messageId = idGenerator.nextUUID();
+        kafkaTemplate.send("outbound-smtp", userId,
+            OutboundEmailEvent.from(messageId, userId, req));
+        return ResponseEntity.accepted().body(new SendResponse(messageId, "queued"));
+    }
+
+    @GetMapping("/search")
+    public ResponseEntity<SearchResponse> search(
+            @RequestParam String q,
+            @RequestParam(required = false) String fromDate,
+            @RequestParam(required = false) String toDate,
+            @RequestParam(required = false) Boolean hasAttachment,
+            @RequestParam(required = false) String cursor) throws Exception {
+        String userId = securityContext.currentUserId();
+        var response = esClient.search(s -> s
+            .index("mail_" + (userId.hashCode() & 0x7FFFFFFF) % 1000)
+            .query(q2 -> q2.bool(b -> {
+                b.must(m -> m.multiMatch(mm -> mm.query(q)
+                    .fields("subject^2", "body_text", "from_addr", "to_addrs")));
+                b.filter(f -> f.term(t -> t.field("user_id").value(userId)));
+                if (hasAttachment != null)
+                    b.filter(f -> f.term(t -> t.field("has_attachment").value(hasAttachment)));
+                if (fromDate != null || toDate != null) {
+                    b.filter(f -> f.range(r -> {
+                        r.field("received_at");
+                        if (fromDate != null) r.gte(co.elastic.clients.json.JsonData.of(fromDate));
+                        if (toDate != null) r.lte(co.elastic.clients.json.JsonData.of(toDate));
+                        return r;
+                    }));
+                }
+                return b;
+            }))
+            .highlight(h -> h.fields("subject", hf -> hf).fields("body_text", hf -> hf.fragmentSize(200)))
+            .size(20), Void.class);
+        return ResponseEntity.ok(SearchResponse.from(response));
+    }
+
+    @PatchMapping("/messages/{messageId}/labels")
+    public ResponseEntity<LabelResponse> updateLabels(
+            @PathVariable UUID messageId,
+            @RequestBody LabelUpdateRequest req) {
+        String userId = securityContext.currentUserId();
+        var updated = messageRepository.updateLabels(userId, messageId, req.add(), req.remove());
+        return ResponseEntity.ok(new LabelResponse(updated.labels()));
+    }
+}
+```
+
+## Tradeoff analysis
+
+<TradeoffTable
+  columns={["Approach", "Storage Cost", "Search Latency", "Threading Accuracy", "Scalability"]}
+  rows={[
+    ["Single relational DB (PostgreSQL)", "High — TOAST rows for bodies; index bloat at billions of rows", "Poor — LIKE queries do sequential scans; GIN index helps but degrades under write load", "Good — ACID transactions guarantee consistent thread_id assignment", "Poor — vertical scaling ceiling; partitioning complex; VACUUM struggles at high write rates"],
+    ["Cassandra (metadata) + S3 (bodies)", "Low — S3 at $0.023/GB; Cassandra compressed 4×; TimeWindow compaction reclaims space", "None native — Cassandra has no full-text search; requires separate search layer", "Good — Cassandra LWT (lightweight transactions) for thread_id assignment races", "Excellent — linear horizontal scaling; no single point of write contention; naturally multi-region"],
+    ["Cassandra + Elasticsearch", "Medium — Elasticsearch adds ~1.5 PB per 30-day window; requires warm/cold tiering to control cost", "Excellent — p99 < 200ms for complex queries; shard-per-user gives privacy isolation", "Good — threading logic in application layer; Cassandra for message index; Elasticsearch for search only", "Excellent — both systems scale horizontally independently; Kafka decouples ingest from indexing"],
+    ["Gmail's actual approach (Bigtable + Colossus + Caffeine cache)", "Optimized — custom columnar storage in Colossus; Bigtable with custom compaction; petabyte-scale", "Excellent — custom inverted index built on Bigtable; search returns in ~50ms p99 for large mailboxes", "Excellent — custom threading engine with full header ancestry tracking across all users' mailboxes", "Excellent — purpose-built for planetary scale; not reproducible with off-the-shelf components"],
+  ]}
+/>
+
+## Common pitfalls
+
+<Pitfall title="Storing full email bodies in Cassandra">
+Cassandra is a wide-column store optimized for key-value and time-series workloads where you know the partition key and clustering key. It is not designed for storing large blob values. A single email body of 500 KB stored as a Cassandra column value creates read amplification on compaction — Cassandra must read and rewrite entire SSTables during compaction, and large blob values make this extremely expensive both in I/O and in compaction duration. At email scale, with 173,000 messages per second, compaction can fall behind permanently.
+
+The correct pattern: store the raw RFC 5322 message body in S3 (object storage built for exactly this use case) and store only a pointer (the S3 key) in Cassandra. S3 provides 11-nines durability, multipart upload for large attachments, and lifecycle policies for automatic tiering to Glacier for old messages. Cassandra stores only the lightweight metadata (subject, sender, labels, spam_score) that you need for folder list rendering, thread construction, and pagination — never the body. Never query Cassandra with ALLOW FILTERING or model a use case that requires scanning multiple partitions; always design the partition key to co-locate the data your most frequent queries need.
+</Pitfall>
+
+<Pitfall title="Sending all outbound email from a shared IP pool">
+When you allocate a single pool of IP addresses for all outbound email — transactional (password resets, 2FA codes) mixed with marketing (newsletter campaigns, promotional blasts) — you create a situation where a single bad actor or a single poorly-targeted campaign can destroy deliverability for every customer on the platform.
+
+Here is how it plays out: a customer sends a 5-million-recipient campaign with a poorly-cleaned list. Ten percent of addresses bounce (list not maintained); 0.5% of recipients mark it as spam (list not opted-in). Gmail's Postmaster Tools records a 0.5% complaint rate for your shared IP pool — an order of magnitude above the 0.08% threshold. Gmail starts rate-limiting connections from those IPs and routing more traffic to spam. Now a user trying to reset their password on your platform gets the reset email in their spam folder or not at all. The blast radius of one customer's bad campaign extends to every user on the platform who relies on transactional email.
+
+The fix is IP pool segmentation enforced at the SMTP relay worker level: transactional IPs, product notification IPs, and marketing IPs never share addresses. The `ipPoolId` field on the Kafka outbound-smtp message determines which pool the relay worker draws from. Customer reputation scores gate which pool they can use — new customers start on the marketing pool and graduate to dedicated IPs only after demonstrating good list hygiene for 90 days.
+</Pitfall>
+
+## Curveball questions
+
+<Curveball question="A phishing campaign sends 50M emails through your system in 30 minutes before detection. How do you kill the campaign mid-flight and retroactively pull back already-delivered messages?">
+Mid-flight kill: the Kafka "outbound-smtp" topic retains unprocessed messages. Add the campaign's batch_id (stamped at send time) to a Redis blocklist; SMTP relay workers check this blocklist before pulling from Kafka. Unprocessed messages are immediately dropped. For messages already in-flight at the SMTP level (TCP connection open, DATA phase in progress), the relay worker cannot abort mid-session without triggering a soft bounce, so some will succeed — accept this as unavoidable.
+
+Retroactive recall of already-delivered messages: there is no SMTP mechanism to recall a message once accepted by the receiving MTA. What you can do: (1) for messages delivered within your own platform (inbound to your own users), directly update the folder from "inbox" to "spam" and mark them as deleted in Cassandra — this takes effect immediately for users who have not yet opened the message; (2) for messages delivered to external recipients (Gmail, Outlook), contact the receiving domain's abuse desk with the Message-IDs and request retroactive spam classification — Gmail has internal tooling for this; (3) immediately rotate or revoke the DKIM signing key used by the phishing campaign — this causes any message bearing that DKIM signature to fail DKIM validation on future delivery attempts (helps for queued messages at receiving servers, not ones already in inboxes); (4) publish DMARC policy change to "p=reject" for the sending domain to prevent further impersonation. The architectural lesson: campaigns must always carry a traceable batch_id, and the suppression blocklist must be checked before message injection into Kafka, not just before SMTP delivery.
+</Curveball>
+
+<Curveball question="A GDPR erasure request comes in — the user wants all emails they have ever sent or received deleted. How do you delete from S3, Cassandra, and Elasticsearch consistently across petabytes of data?">
+The core challenge is that there is no atomic delete across three heterogeneous storage systems, and GDPR requires completion within 30 days. Design the erasure as a durable multi-stage pipeline rather than a synchronous operation.
+
+Step 1 — issue an erasure token: write the request to a durable erasure_requests table in PostgreSQL with status "pending", user_id, requested_at, and a deadline of requested_at + 29 days. Respond to the user with a confirmation that erasure will complete within 30 days.
+
+Step 2 — Cassandra erasure: query all partition keys for the user (user_id × folder for each system folder plus custom labels). For each partition, issue a DELETE statement. Cassandra tombstones the rows; they remain on disk until the next compaction cycle. Because tombstones survive until the gc_grace_seconds window expires (default 10 days), set the tombstone TTL to 10 days to ensure clean physical deletion after compaction.
+
+Step 3 — S3 erasure: the Cassandra scan (before deletion) produces the list of body_s3_key values for the user. Batch-submit S3 DeleteObjects requests (up to 1000 keys per call). Attachments are enumerated separately via the attachment S3 prefix. S3 immediate delete is synchronous — data is removed within seconds.
+
+Step 4 — Elasticsearch erasure: issue a delete-by-query with filter `{ "term": { "user_id": "..." } }`. Elasticsearch performs a background task; the data is marked for deletion from segments on the next merge.
+
+Step 5 — verify and close: after all three stages complete, update the erasure_requests record to "completed". A compliance report is generated and stored for audit purposes (containing no personal data — only that the erasure was completed, not what was deleted). If any stage fails, the pipeline retries automatically; idempotency is guaranteed because DELETE of a non-existent key is a no-op in all three systems.
+</Curveball>
+
+<Curveball question="Gmail's spam filter is generating 10% false positives (legitimate email classified as spam) after a model update. How do you detect this in production, roll back the model, and reclassify affected emails?">
+Detection: a 10% false positive rate at Gmail scale is immediately visible in multiple signals before most users notice individually. Monitor the ratio of "Not Spam" reports (user clicks "Not spam" button) to total spam folder deliveries — this should be below 0.5% normally; a spike to 10% is a 20× anomaly that triggers automated alerting. Also monitor the spam folder delivery rate as a percentage of total inbound — normally around 99.9% spam catch means 0.1% of mail goes to inbox and perhaps 0.1% of ham goes to spam; if ham-to-spam rate doubles, the aggregate spam folder delivery rate increases visibly. Domain reputation monitoring surfaces another signal: legitimate senders like github.com, amazon.com whose notification emails are now hitting spam folders will show delivery success but inbox placement failure in seed account monitoring.
+
+Roll back the model: the ML serving layer should support blue/green model deployment with a percentage-based traffic split. To roll back: shift 100% of traffic to the previous model version (a single configuration update to the model serving service). This takes effect within seconds for new inbound messages. The previous model artifact must be retained in your model registry with its serving configuration — never overwrite the production model; always deploy a new version alongside.
+
+Reclassify affected emails: identify the time window when the bad model was active (model deployment timestamp to rollback timestamp). Query Cassandra for all messages received in that window with folder = "spam" and spam_score values characteristic of the bad model (e.g., scores in the 0.80–0.95 range that the bad model inflated). For each such message, re-run the old model's scoring function (or the new replacement model) against the body (fetched from S3). Messages that score below 0.5 on the corrected model are reclassified: Cassandra UPDATE sets folder = "inbox", is_read = false; Elasticsearch document updated with new labels. Push an in-app notification to the user: "Some emails were incorrectly moved to spam and have been restored to your inbox." The reclassification job runs as a Spark batch job against Cassandra using token range scanning, processing the affected time window's messages in parallel across the cluster.
+</Curveball>
+
+## Further reading
+
+- **RFC 5321** — Simple Mail Transfer Protocol: the definitive specification for SMTP, covering the command/response model, relaying, and bounce handling in exhaustive detail
+- **RFC 6376** — DomainKeys Identified Mail (DKIM) Signatures: full specification of DKIM including canonicalization algorithms, selector DNS record format, and signature verification procedure
+- **Google Postmaster Tools documentation** — Google's official resource for monitoring your domain and IP reputation when sending to Gmail users; includes guidance on interpreting spam rate, domain reputation, and IP reputation dashboards
+- **SpamAssassin documentation** — the canonical reference for rule-based spam scoring; reading the rule taxonomy gives intuition for what signals matter in spam classification even if you build an ML classifier
+
+<RelatedQuestions items={[
+  { slug: "notification-system", title: "Design a Notification System", difficulty: "mid" },
+  { slug: "slack", title: "Design Slack", difficulty: "senior" },
+  { slug: "whatsapp-messenger", title: "Design WhatsApp Messenger", difficulty: "senior" },
+]} />

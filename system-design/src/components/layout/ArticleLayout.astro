@@ -1,0 +1,498 @@
+---
+import Header from './Header.astro';
+import Footer from './Footer.astro';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import Badge from '../ui/Badge.astro';
+
+export interface Props {
+  title: string;
+  description?: string;
+  category: string;
+  difficulty: 'mid' | 'senior' | 'staff';
+  tags?: string[];
+  estimatedReadMinutes?: number;
+  publishedAt?: string;
+  updatedAt?: string;
+  ogImage?: string;
+}
+
+const {
+  title,
+  description,
+  category,
+  difficulty,
+  tags = [],
+  estimatedReadMinutes,
+  publishedAt,
+  updatedAt,
+  ogImage,
+} = Astro.props;
+
+const canonicalUrl = new URL(Astro.url.pathname, Astro.site);
+
+const jsonLd = JSON.stringify({
+  '@context': 'https://schema.org',
+  '@type': 'Article',
+  headline: title,
+  description: description,
+  ...(ogImage && { image: ogImage }),
+  url: canonicalUrl.toString(),
+  ...(publishedAt && { datePublished: publishedAt }),
+  ...(updatedAt   && { dateModified:  updatedAt }),
+  author: {
+    '@type': 'Person',
+    name: 'Pushkar Kumar',
+    url: 'https://pushkar1005.github.io',
+  },
+  keywords: tags.join(', '),
+});
+---
+
+<BaseLayout title={title} description={description} ogImage={ogImage}>
+  <!-- KaTeX CSS — only on article pages -->
+  <link
+    slot="head"
+    rel="stylesheet"
+    href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"
+    crossorigin="anonymous"
+  />
+  <!-- JSON-LD structured data -->
+  <Fragment slot="head">
+    <script type="application/ld+json" set:html={jsonLd} />
+  </Fragment>
+  <Header activeCategory={category} />
+
+  <div class="article-shell">
+
+    <!-- Reading progress bar -->
+    <div id="reading-progress" class="reading-progress" role="progressbar" aria-valuenow={0} aria-valuemin={0} aria-valuemax={100} aria-label="Reading progress"></div>
+
+    <div class="article-layout">
+
+      <!-- Sidebar TOC (desktop only) -->
+      <aside class="article-toc" aria-label="Table of contents">
+        <div class="article-toc__inner">
+          <p class="article-toc__heading">On this page</p>
+          <nav class="toc-nav">
+            <div class="toc-pill" aria-hidden="true"></div>
+            <slot name="toc" />
+          </nav>
+        </div>
+      </aside>
+
+      <!-- Main article -->
+      <main id="main-content" class="article-main">
+
+        <!-- Article header -->
+        <header class="article-header">
+          <div class="article-header__meta">
+            <Badge variant="category" value={category} />
+            <Badge variant="difficulty" value={difficulty} />
+            {estimatedReadMinutes && (
+              <span class="article-header__read-time">{estimatedReadMinutes} min read</span>
+            )}
+          </div>
+
+          <h1 class="article-header__title">{title}</h1>
+
+          {description && (
+            <p class="article-header__summary">{description}</p>
+          )}
+
+          {tags.length > 0 && (
+            <div class="article-header__tags">
+              {tags.map(tag => <Badge variant="tag" value={tag} />)}
+            </div>
+          )}
+
+          {(publishedAt || updatedAt) && (
+            <div class="article-header__dates">
+              {publishedAt && (
+                <time datetime={publishedAt}>
+                  Published {new Date(publishedAt).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}
+                </time>
+              )}
+              {updatedAt && updatedAt !== publishedAt && (
+                <time datetime={updatedAt}>
+                  · Updated {new Date(updatedAt).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}
+                </time>
+              )}
+            </div>
+          )}
+        </header>
+
+        <!-- Article body (data-pagefind-body marks this for Pagefind indexing) -->
+        <div class="prose" data-pagefind-body>
+          <slot />
+        </div>
+
+      </main>
+    </div>
+  </div>
+
+  <Footer />
+</BaseLayout>
+
+<style>
+  .reading-progress {
+    position: fixed;
+    top: 0;
+    left: 0;
+    height: 2px;
+    width: 0%;
+    background: var(--accent);
+    z-index: 100;
+    transition: width 0.1s linear;
+  }
+
+  .article-shell {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .article-layout {
+    display: grid;
+    grid-template-columns: 1fr;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 2rem clamp(1rem, 3vw, 2rem) 4rem;
+    width: 100%;
+    gap: 3rem;
+  }
+
+  @media (min-width: 1024px) {
+    .article-layout {
+      grid-template-columns: minmax(0, 1fr) 220px;
+      grid-template-areas: 'main toc';
+    }
+    .article-main { grid-area: main; }
+    .article-toc  { grid-area: toc; }
+  }
+
+  /* TOC sidebar */
+  .article-toc {
+    display: none;
+  }
+  @media (min-width: 1024px) {
+    .article-toc {
+      display: block;
+    }
+    .article-toc__inner {
+      position: sticky;
+      top: 72px; /* header height + gap */
+      max-height: calc(100vh - 88px);
+      overflow-y: auto;
+      scrollbar-width: none;
+    }
+    .article-toc__inner::-webkit-scrollbar { display: none; }
+  }
+
+  .article-toc__heading {
+    font-family: 'Geist', system-ui, sans-serif;
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-4);
+    margin: 0 0 0.75rem;
+  }
+
+  /* Article header */
+  .article-main {
+    min-width: 0;
+  }
+
+  .article-header {
+    margin-bottom: 2.5rem;
+    padding-bottom: 2rem;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .article-header__meta {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-bottom: 1rem;
+  }
+
+  .article-header__read-time {
+    font-size: 0.75rem;
+    color: var(--ink-4);
+  }
+
+  .article-header__title {
+    font-family: 'Source Serif 4', 'Georgia', serif;
+    font-size: clamp(1.625rem, 4vw, 2.25rem);
+    font-weight: 700;
+    color: var(--ink);
+    line-height: 1.2;
+    letter-spacing: -0.02em;
+    margin: 0 0 0.75rem;
+  }
+
+  .article-header__summary {
+    font-size: 1.0625rem;
+    color: var(--ink-2);
+    line-height: 1.65;
+    margin: 0 0 1rem;
+    max-width: 60ch;
+  }
+
+  .article-header__tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+    margin-bottom: 0.875rem;
+  }
+
+  .article-header__dates {
+    font-size: 0.78rem;
+    color: var(--ink-4);
+  }
+</style>
+
+<style>
+  /* ── TOC links (from named slot) ───────────────────── */
+  .toc-nav {
+    position: relative;
+  }
+  .toc-nav :global(a) {
+    display: block;
+    font-size: 0.8rem;
+    color: var(--ink-3);
+    text-decoration: none;
+    padding: 0.28em 0 0.28em 0.75rem;
+    line-height: 1.45;
+    transition: color var(--dur-fast);
+  }
+  .toc-nav :global(a:hover) { color: var(--ink); }
+  .toc-nav :global(a.toc-active) { color: var(--accent); }
+  .toc-nav :global(a.toc-h3) {
+    padding-left: 1.375rem;
+    font-size: 0.76rem;
+  }
+
+  /* Sliding amber indicator pill */
+  .toc-pill {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 2px;
+    height: 24px;
+    background: var(--accent);
+    border-radius: 1px;
+    opacity: 0;
+    pointer-events: none;
+    will-change: transform;
+    transition: opacity 0.2s;
+  }
+  .toc-pill.visible { opacity: 1; }
+
+  /* ── Copy button on code blocks ────────────────────── */
+  :global(pre) { position: relative !important; }
+  :global(.copy-btn) {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.11);
+    border-radius: 5px;
+    color: rgba(255, 255, 255, 0.4);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s, background 0.15s, color 0.15s, border-color 0.15s;
+    z-index: 2;
+  }
+  :global(pre:hover .copy-btn) { opacity: 1; }
+  :global(.copy-btn:hover) {
+    background: rgba(255, 255, 255, 0.14);
+    color: rgba(255, 255, 255, 0.85);
+  }
+  :global(.copy-btn.copied) {
+    opacity: 1;
+    color: #6db88a;
+    border-color: rgba(109, 184, 138, 0.35);
+    background: rgba(109, 184, 138, 0.12);
+  }
+  :global(.copy-btn .check-icon) { display: none; }
+  :global(.copy-btn.copied .copy-icon) { display: none; }
+  :global(.copy-btn.copied .check-icon) { display: block; }
+
+  /* Light theme copy button */
+  [data-theme='light'] :global(.copy-btn) {
+    background: rgba(0, 0, 0, 0.05);
+    border-color: rgba(0, 0, 0, 0.1);
+    color: rgba(0, 0, 0, 0.35);
+  }
+  [data-theme='light'] :global(.copy-btn:hover) {
+    background: rgba(0, 0, 0, 0.1);
+    color: rgba(0, 0, 0, 0.75);
+  }
+
+  /* ── Scroll-reveal initial state ───────────────────── */
+  /* Only applies when JS is running (class added by script) */
+  :global(.will-reveal) {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+</style>
+
+<!-- Reading progress bar -->
+<script>
+  const bar = document.getElementById('reading-progress') as HTMLElement | null;
+  if (bar) {
+    const update = () => {
+      const el = document.documentElement;
+      const scrolled = el.scrollTop || document.body.scrollTop;
+      const total = el.scrollHeight - el.clientHeight;
+      const pct = total > 0 ? Math.round((scrolled / total) * 100) : 0;
+      bar.style.width = `${pct}%`;
+      bar.setAttribute('aria-valuenow', String(pct));
+    };
+    window.addEventListener('scroll', update, { passive: true });
+    update();
+  }
+</script>
+
+<!-- Mermaid (lazy-loaded only when diagrams exist) -->
+<script>
+  if (document.querySelector('.mermaid')) {
+    const theme = document.documentElement.getAttribute('data-theme') === 'light' ? 'neutral' : 'dark';
+    import('https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs')
+      .then(({ default: mermaid }) => {
+        mermaid.initialize({ startOnLoad: false, theme });
+        mermaid.run();
+      })
+      .catch(() => {});
+  }
+</script>
+
+<!-- TOC scroll-spy + copy buttons + GSAP scroll reveals -->
+<script>
+  // ── TOC scroll-spy (CSS fallback) ──────────────────
+  const tocLinks = Array.from(document.querySelectorAll<HTMLAnchorElement>('.toc-nav a'));
+  const pill     = document.querySelector<HTMLElement>('.toc-pill');
+
+  const headingEls = tocLinks
+    .map(a => document.getElementById(new URL(a.href).hash.slice(1)))
+    .filter(Boolean) as HTMLElement[];
+
+  let activeTocLink: HTMLAnchorElement | null = null;
+
+  function syncToc(activeEl: HTMLElement | undefined) {
+    tocLinks.forEach(a => {
+      const id = new URL(a.href).hash.slice(1);
+      const isActive = id === activeEl?.id;
+      a.classList.toggle('toc-active', isActive);
+      if (isActive) activeTocLink = a;
+    });
+  }
+
+  if (headingEls.length > 0) {
+    const onScroll = () => {
+      let active = headingEls[0];
+      for (const el of headingEls) {
+        if (el.getBoundingClientRect().top < 90) active = el;
+      }
+      syncToc(active);
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+  }
+
+  // ── Copy buttons ────────────────────────────────────
+  const COPY_SVG  = `<svg class="copy-icon"  width="14" height="14" viewBox="0 0 14 14" fill="none"><rect x="4.5" y=".5" width="9" height="11" rx="1.5" stroke="currentColor" stroke-width="1.3"/><path d="M3 3H2A1.5 1.5 0 0 0 .5 4.5v8A1.5 1.5 0 0 0 2 14h7A1.5 1.5 0 0 0 10.5 12.5V11" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>`;
+  const CHECK_SVG = `<svg class="check-icon" width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2 7.5L5.5 11L12 3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+  document.querySelectorAll<HTMLElement>('.prose pre').forEach(pre => {
+    const code = pre.querySelector('code');
+    if (!code) return;
+    const btn = document.createElement('button');
+    btn.className = 'copy-btn';
+    btn.setAttribute('aria-label', 'Copy code');
+    btn.innerHTML = COPY_SVG + CHECK_SVG;
+    btn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(code.textContent ?? '');
+        btn.classList.add('copied');
+        btn.setAttribute('aria-label', 'Copied!');
+        setTimeout(() => {
+          btn.classList.remove('copied');
+          btn.setAttribute('aria-label', 'Copy code');
+        }, 1800);
+      } catch {}
+    });
+    pre.appendChild(btn);
+  });
+
+  // ── GSAP: TOC indicator + scroll reveals ────────────
+  const rm = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (!rm) {
+    Promise.all([
+      import('https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.mjs'),
+      import('https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/ScrollTrigger.min.mjs'),
+    ]).then(([gsapMod, stMod]) => {
+      const gsap = gsapMod.default;
+      const ScrollTrigger = stMod.default;
+      if (!gsap || !ScrollTrigger) return;
+      gsap.registerPlugin(ScrollTrigger);
+
+      // ── Sliding TOC pill ──────────────────────────
+      function movePill(link: HTMLAnchorElement) {
+        if (!pill) return;
+        pill.classList.add('visible');
+        gsap.to(pill, {
+          y:        link.offsetTop,
+          height:   link.offsetHeight,
+          duration: 0.28,
+          ease:     'power2.out',
+          overwrite: true,
+        });
+      }
+
+      // Hook into existing scroll-spy: watch for active link changes
+      const pillObserver = new MutationObserver(() => {
+        const active = tocLinks.find(a => a.classList.contains('toc-active'));
+        if (active) movePill(active);
+      });
+      tocLinks.forEach(a => pillObserver.observe(a, { attributes: true, attributeFilter: ['class'] }));
+      // Initial position
+      const initialActive = tocLinks.find(a => a.classList.contains('toc-active'));
+      if (initialActive) movePill(initialActive);
+
+      // ── Scroll-reveal for content blocks ──────────
+      const revealSelectors = [
+        '.tldr', '.capacity', '.pitfall', '.curveball',
+        '.tradeoff-table', '.diagram', '.mermaid-figure',
+        '.prose pre',
+      ].join(', ');
+
+      const vp = window.innerHeight;
+      document.querySelectorAll<HTMLElement>(revealSelectors).forEach(el => {
+        // Skip if already in viewport at page load — no CLS
+        if (el.getBoundingClientRect().top < vp * 0.85) return;
+
+        gsap.from(el, {
+          opacity: 0,
+          y: 22,
+          duration: 0.5,
+          ease: 'power2.out',
+          clearProps: 'opacity,transform',
+          scrollTrigger: {
+            trigger: el,
+            start: 'top 88%',
+            once: true,
+          },
+        });
+      });
+
+    }).catch(() => {});
+  }
+</script>

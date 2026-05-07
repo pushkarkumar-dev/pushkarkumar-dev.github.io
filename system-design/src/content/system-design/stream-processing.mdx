@@ -1,0 +1,655 @@
+---
+title: "Design a Stream Processing System"
+slug: "stream-processing"
+category: "infra"
+difficulty: "senior"
+estimatedReadMinutes: 22
+tags: ["kafka", "flink", "kafka-streams", "windowing", "exactly-once", "stateful-processing", "watermarks"]
+companyFlavors: ["LinkedIn", "Uber", "Netflix", "Lyft", "Twitter"]
+relatedQuestions: ["distributed-logging-system", "metrics-monitoring", "top-k-trending"]
+publishedAt: "2025-01-07"
+updatedAt: "2025-01-07"
+summary: "Design a stream processing system using Kafka as the event backbone and Apache Flink for stateful computation with windowing, watermarks for late data, and exactly-once semantics via two-phase commit."
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+
+<Bookmark slug="stream-processing" title="Design a Stream Processing System" />
+
+<Tldr>
+- **Kafka is the durable, ordered, replayable event log; Flink is the stateful computation engine on top of it** — Kafka retains events for days or weeks so Flink can replay from any offset; Flink provides keyed state, windowing, and exactly-once semantics that a raw Kafka consumer cannot
+- **Windowing: tumbling windows (non-overlapping periods), sliding windows (overlapping), session windows (gap-based grouping)** — the choice of window type determines memory usage, result freshness, and how partial results are handled at boundaries
+- **Watermarks handle late data: emit results when the watermark passes the window end time; configure allowed lateness for stragglers** — a 30-second bounded-out-of-orderness watermark tells Flink that all events within 30 seconds of event time will have arrived; events beyond that threshold go to a side output
+- **Exactly-once semantics via Flink's two-phase commit with Kafka transactions: checkpoint = atomic commit to both Kafka offset and sink** — on recovery Flink rolls back any uncommitted sink transactions and re-reads from the last committed Kafka offset, guaranteeing no duplicates
+- **State management: Flink's RocksDB state backend scales beyond JVM heap; checkpoint to S3 for fault tolerance** — incremental RocksDB checkpoints upload only new SST files since the last snapshot, reducing checkpoint size from TBs to hundreds of MBs
+</Tldr>
+
+## Why stream processing?
+
+Stream processing sits at the intersection of distributed systems, database internals, and real-time analytics. The core challenge is processing an unbounded, out-of-order stream of events — where "now" is ambiguous due to network delays and clock skew — and producing correct aggregations over time windows. Apache Kafka provides the durable, ordered event log that makes replay possible; Apache Flink provides the stateful computation engine that makes correctness possible. Together they form the backbone of every ride-sharing surge calculation, every real-time fraud score, and every live leaderboard.
+
+Batch processing — running Spark or Hive jobs over yesterday's data — is insufficient when the business decision must be made in seconds. Uber cannot wait until midnight to detect that surge pricing should activate in a neighborhood. Netflix cannot process recommendation signals for a trending show 24 hours after it starts trending. Twitter cannot compute the top-trending hashtags once per hour. The operational requirement for real-time or near-real-time output, combined with the volume and velocity of modern event streams, is what drives the design complexity of this system.
+
+The fundamental difficulty that separates stream processing from batch processing is the treatment of time. In a batch job, all the data is already there — you know the universe is complete. In a stream, data arrives continuously and out of order. An event with timestamp 12:00:00 might arrive at 12:00:45 because a mobile device was offline and synced when it came back online. A sensor reading might arrive late because a regional Kafka broker was slow. The system must decide: when is a time window "done" so its result can be emitted? That decision — encoded in the watermark mechanism — is the central intellectual contribution of the Dataflow model and the thing that distinguishes Flink from a naive consumer group.
+
+## Clarifying questions
+
+Pin down these dimensions before proposing any architecture. Each answer constrains a different design decision.
+
+| Question | What to extract | Why it matters |
+|---|---|---|
+| What is the event volume and velocity? | "1M events/sec peak, 200 bytes per event" | Determines Kafka partition count, Flink task parallelism, and network bandwidth |
+| What is the state size per key? | "Avg 1KB per active user, 10M concurrent users" | Determines whether HashMapStateBackend (JVM heap) or RocksDB is required |
+| What windowing semantics are needed? | "5-minute tumbling for billing, 1-minute sliding for anomaly detection" | Tumbling is simple and cheap; sliding multiplies memory by the slide factor; session requires merge logic |
+| What is the end-to-end latency target? | "Under 1 second for fraud scoring, under 5 minutes for reporting" | Sub-second latency rules out micro-batch (Spark Streaming); requires true streaming with low checkpoint intervals |
+| Exactly-once or at-least-once? | "Exactly-once for billing, at-least-once for analytics counters" | Exactly-once requires a sink that supports transactions or idempotent writes; adds ~10% throughput overhead |
+| What is the sink system? | "PostgreSQL for serving, Kafka for downstream topics, Elasticsearch for search" | PostgreSQL supports 2PC via BEGIN/COMMIT; Elasticsearch requires idempotent upserts; Kafka supports transactions |
+| What is the late data policy? | "Accept events up to 5 minutes late, discard beyond" | Drives `allowedLateness` configuration and side output routing logic |
+| Do we need reprocessing or backfill? | "Yes — replay 30 days of history when a bug is fixed" | Requires Kafka retention long enough to cover the backfill window; pipeline must be stateless enough to replay cleanly |
+
+## Functional requirements
+
+- Ingest events from Kafka topics at high throughput (1M events/sec sustained)
+- Compute windowed aggregations (count, sum, average, percentile) keyed by entity identifier (user ID, driver ID, product ID)
+- Detect patterns in streams: sequence detection (login followed by purchase within 10 minutes), threshold breaches (spend > $1000 in 1 hour)
+- Emit results to a configurable sink: OLTP database, data warehouse, another Kafka topic for downstream consumers
+- Handle late-arriving events gracefully: accept events within the allowed lateness window; route beyond-threshold events to a dead-letter side output
+- Support reprocessing from historical Kafka data through the same pipeline logic without code changes
+
+## Non-functional requirements
+
+- **Throughput**: 1 million events per second sustained ingestion
+- **Latency**: end-to-end latency under 1 second for hot-path aggregations (fraud scoring, surge pricing)
+- **Correctness**: exactly-once semantics for billing and financial pipelines; at-least-once acceptable for analytics
+- **State scale**: up to 1TB of keyed state per Flink job, backed by RocksDB on local NVMe SSDs
+- **Fault tolerance**: recover from failure by resuming from the last checkpoint in under 30 seconds
+- **Availability**: the Kafka cluster targets 99.99% uptime; the Flink cluster targets 99.9% (restarts are fast and transparent)
+- **Reprocessing**: support replaying any 30-day window of historical events without infrastructure changes
+
+## Capacity estimation
+
+<Capacity title="Stream Processing Capacity">
+
+**Kafka ingest bandwidth**
+
+$$\text{Bandwidth} = 1{,}000{,}000 \text{ events/sec} \times 200 \text{ bytes/event} = 200 \text{ MB/s}$$
+
+**Kafka retention storage (7-day window)**
+
+$$\text{Raw storage} = 200 \text{ MB/s} \times 86{,}400 \text{ s/day} \times 7 \text{ days} = 117 \text{ TB}$$
+
+With replication factor 3:
+
+$$\text{Total Kafka storage} = 117 \text{ TB} \times 3 = 351 \text{ TB}$$
+
+This calls for roughly 60–70 Kafka brokers with 6TB NVMe each (or tiered Kafka with S3 for longer retention).
+
+**Flink state per task**
+
+Active keys: 10 million. Average state per key: 1KB (one accumulator record).
+
+$$\text{State per task} = \frac{10{,}000{,}000 \text{ keys} \times 1 \text{ KB}}{N_\text{tasks}}$$
+
+With 10 tasks: $\approx 1 \text{ GB per task}$ — fits comfortably in RocksDB on a single node.
+
+For 1TB total state (e.g., large sliding window state): spread across 100 tasks, each holding 10GB on a local NVMe SSD.
+
+**Flink task parallelism for ingestion**
+
+Assume each Flink source task saturates at 100K events/sec (network I/O bound on the Kafka consumer):
+
+$$\text{Flink source tasks} = \frac{1{,}000{,}000 \text{ events/sec}}{100{,}000 \text{ events/sec per task}} = 10 \text{ tasks}$$
+
+Set Kafka partition count = Flink source parallelism = 10 (scale both together). For higher throughput, increase partitions to 100 and parallelism to 100.
+
+**Checkpoint storage (S3)**
+
+Full checkpoint of 10GB state every 30 seconds:
+
+$$\text{Full checkpoint storage/day} = 10 \text{ GB} \times \frac{86{,}400}{30} = 28.8 \text{ TB/day}$$
+
+With **incremental checkpointing** (RocksDB SST delta upload only), typical delta is 1–2% of total state:
+
+$$\text{Incremental checkpoint/day} \approx 10 \text{ GB} \times 0.01 \times 2{,}880 = 288 \text{ GB/day}$$
+
+Use incremental checkpointing on any job with state larger than 1GB.
+
+</Capacity>
+
+## API design
+
+```text
+Pipeline configuration (REST, admin-facing):
+
+POST /api/v1/pipelines
+  body: {
+    name: string,
+    sourceTopics: string[],
+    sinkType: "postgresql" | "kafka" | "elasticsearch",
+    windowType: "tumbling" | "sliding" | "session",
+    windowSizeMs: number,
+    slideMs: number,          -- only for sliding windows
+    sessionGapMs: number,     -- only for session windows
+    aggregations: ["count", "sum", "avg", "p95"]
+  }
+  → { pipelineId: string, jobId: string }
+
+GET /api/v1/pipelines/{pipelineId}/status
+  → {
+      status: "RUNNING" | "PAUSED" | "FAILED",
+      latency_ms: number,       -- current source-to-sink latency
+      throughput_eps: number,   -- events per second
+      lastCheckpoint: ISO8601,  -- timestamp of last successful checkpoint
+      backpressure: boolean
+    }
+
+POST /api/v1/pipelines/{pipelineId}/pause
+  → { savepoint: "s3://checkpoints/{pipelineId}/savepoint-{ts}" }
+
+POST /api/v1/pipelines/{pipelineId}/resume
+  body: { savepointPath: string }
+  → { jobId: string }
+
+POST /api/v1/pipelines/{pipelineId}/backfill
+  body: { fromTimestamp: ISO8601, toTimestamp: ISO8601 }
+  → { jobId: string }
+  -- Launches a separate Flink job reading from historical Kafka offsets
+  -- through the same pipeline DAG; results written to the same sink
+
+Querying aggregated state (online, sub-second read):
+
+GET /api/v1/aggregates/{pipelineId}/{entityId}
+  → {
+      entityId: string,
+      windowStart: ISO8601,
+      windowEnd: ISO8601,
+      count: number,
+      sum: number,
+      avg: number,
+      p95: number
+    }
+  -- Reads from Flink queryable state or from the sink DB directly
+```
+
+## Data model
+
+State stored in Flink (RocksDB or heap) is ephemeral and recreated from checkpoints on restart. The persisted record of truth lives in the sink database.
+
+```sql
+-- Sink table: windowed aggregations persisted for serving
+CREATE TABLE windowed_aggregates (
+    pipeline_id     VARCHAR(100) NOT NULL,
+    entity_id       VARCHAR(200) NOT NULL,
+    window_start    TIMESTAMPTZ NOT NULL,
+    window_end      TIMESTAMPTZ NOT NULL,
+    event_count     BIGINT NOT NULL,
+    sum_value       DOUBLE PRECISION,
+    p95_value       DOUBLE PRECISION,
+    computed_at     TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (pipeline_id, entity_id, window_start)
+);
+
+-- Pipeline config (Flink reads on startup via JDBC source)
+CREATE TABLE pipeline_configs (
+    pipeline_id     VARCHAR(100) PRIMARY KEY,
+    source_topics   JSONB NOT NULL,
+    sink_type       VARCHAR(50) NOT NULL,
+    window_config   JSONB NOT NULL,
+    aggregations    JSONB NOT NULL,
+    is_active       BOOLEAN DEFAULT true
+);
+
+-- Late event audit log (side output drain)
+CREATE TABLE late_events (
+    pipeline_id     VARCHAR(100) NOT NULL,
+    entity_id       VARCHAR(200) NOT NULL,
+    event_time      TIMESTAMPTZ NOT NULL,
+    received_at     TIMESTAMPTZ NOT NULL,
+    lateness_ms     BIGINT NOT NULL,
+    payload         JSONB
+);
+```
+
+Flink in-memory and RocksDB state layout:
+
+```text
+ValueState<AggregateAccumulator> per (pipeline_id, entity_id, window):
+  AggregateAccumulator {
+    count: Long
+    sum: Double
+    min: Double
+    max: Double
+    hll_sketch: HyperLogLog   -- cardinality estimates (distinct user count)
+  }
+
+MapState<Long, List<Event>> for session windows:
+  key:   session_start_timestamp (Long)
+  value: list of events in this session (grows until gap closes the session)
+
+ListState<AggregateResult> in CheckpointedJdbcSink:
+  -- in-flight buffer of results not yet flushed to the sink DB
+  -- snapshotted at checkpoint time so they survive task failure
+```
+
+## Architecture diagram
+
+<Mermaid diagram={`flowchart TD
+  P1[Producer: Mobile App] -->|events| K
+  P2[Producer: Web App] -->|events| K
+  P3[Producer: IoT Sensors] -->|events| K
+
+  K[(Kafka Cluster\npartitioned by entity_id\n3x replication)]
+
+  K -->|parallel reads\none task per partition| FSO
+
+  subgraph Flink Cluster
+    FSO[Source Operators\nparallelism = partition count\nassign event-time watermarks]
+    FSO -->|keyBy entity_id| FKO
+    FKO[KeyBy / Shuffle\nrepartition by entity_id]
+    FKO --> FWO
+    FWO[Window Operators\nstateful aggregation\nRocksDB state backend]
+    FWO -->|window results| FSI
+    FSI[Sink Operators\ntwo-phase commit\nbatch writes]
+    JM[JobManager\norchestrates checkpoints\ncoordinates 2PC]
+    JM -.->|checkpoint barriers| FSO
+    JM -.->|checkpoint barriers| FWO
+    JM -.->|checkpoint barriers| FSI
+  end
+
+  FWO -->|late events side output| LE[(Late Events Table)]
+  FSI -->|commit on checkpoint| PG[(PostgreSQL\nwindowed_aggregates)]
+  FSI -->|commit on checkpoint| ES[(Elasticsearch\nfor full-text search)]
+  FSI -->|Kafka transaction commit| KO[(Kafka Output Topic\nfor downstream consumers)]
+
+  CP[(S3 Checkpoint Store\nincremental RocksDB snapshots)]
+  JM -->|upload snapshots| CP
+`} />
+
+The key insight in this topology is the `keyBy(entity_id)` shuffle. All events for a given entity_id are routed to the same Flink task, which means the keyed state for that entity — the accumulator, the running sum, the HyperLogLog sketch — lives on one machine and can be updated without distributed coordination. This is what makes Flink's stateful processing scalable: the parallelism model mirrors consistent hashing, where each key has exactly one owner task at any point in time.
+
+## Deep dive 1: Windowing
+
+Windowing is the mechanism by which Flink groups an unbounded event stream into finite, computable buckets. The choice of window type is one of the highest-leverage design decisions in a stream processing system.
+
+### Tumbling windows
+
+A tumbling window divides time into non-overlapping, fixed-size periods. A 1-minute tumbling window over a stream of click events produces one result per entity per minute: events in [00:00, 00:59] form one window, events in [01:00, 01:59] form the next, with no overlap. An event belongs to exactly one window.
+
+Tumbling windows are the most memory-efficient option because each event is counted once, and the state for a window can be discarded once the window closes and results are emitted. They are appropriate for: hourly billing reports, daily active user counts, per-minute error rate metrics, and any aggregation where you want clean non-overlapping periods.
+
+In Flink: `TumblingEventTimeWindows.of(Time.minutes(1))`.
+
+### Sliding windows
+
+A sliding window has two parameters: the window size and the slide interval. A "5-minute window sliding every 1 minute" means the active windows at any moment are [00:00–04:59], [01:00–05:59], [02:00–06:59], and so on. An event that arrives at 03:30 belongs to five windows simultaneously: the one starting at 00:00, 01:00, 02:00, and 03:00.
+
+This multi-membership means sliding windows consume `size/slide` times more memory and CPU than tumbling windows of the same size. A 5-minute window sliding every second is 300× more expensive than a simple 5-minute tumbling window. In practice, keep the `size/slide` ratio below 10× for production pipelines.
+
+Sliding windows are appropriate for: "average response time over the last 5 minutes" dashboards, anomaly detection that must fire within 1 minute of a threshold breach, and rolling average computations where the user expects a smoothly updating metric.
+
+In Flink: `SlidingEventTimeWindows.of(Time.minutes(5), Time.minutes(1))`.
+
+### Session windows
+
+Session windows group events by activity gap rather than by fixed time boundaries. A session window closes when no event for a given key arrives within a configurable gap period (e.g., 30 minutes). The window is variable-length: a user who clicks rapidly for 2 hours has one large session window; a user who clicks once, waits 45 minutes, then clicks again has two separate session windows.
+
+The implementation challenge is that sessions can merge. If event A arrives at 10:00, event B at 10:20, and event C at 10:40 — all within the 30-minute gap threshold — they form one merged session. Flink handles this via a merge trigger in the windowing subsystem: when a new event's session window overlaps with an existing session's window, Flink merges the state of both sessions into one.
+
+Session windows are appropriate for: web analytics session segmentation, click-stream attribution pipelines, user journey analysis, and any use case where the concept of "a continuous period of user activity" is the natural unit of analysis.
+
+In Flink: `EventTimeSessionWindows.withGap(Time.minutes(30))`.
+
+## Deep dive 2: Watermarks and late data
+
+Events arrive out of order due to network delays, mobile offline-then-sync patterns, and clock drift between devices. The "event time" stamped in the event payload does not equal the "processing time" when Flink sees it. A GPS event from an Uber driver phone might be stamped 12:05:00 but arrive at Kafka at 12:06:45 because the driver was briefly in a tunnel.
+
+### The watermark mechanism
+
+A watermark is a special marker injected into the event stream asserting: "no event with event-time timestamp less than W will arrive after this point." It is a monotonically increasing timestamp that Flink uses to decide when a window is "complete enough" to emit results.
+
+When a watermark W passes the end time of a window (e.g., W > 12:05:59 for a 12:05:00–12:05:59 tumbling window), Flink triggers the window computation and emits results. Without watermarks, Flink would never know when a window was done — it might wait forever.
+
+The standard watermark strategy for a system with bounded out-of-orderness is:
+
+```java
+WatermarkStrategy.<UserEvent>forBoundedOutOfOrderness(Duration.ofSeconds(30))
+    .withTimestampAssigner((event, recordTimestamp) -> event.getEventTimeMs())
+```
+
+This tells Flink: "the maximum delay between event time and arrival time is 30 seconds." The watermark at any point is `max(event_time_seen) - 30 seconds`. Events that arrive more than 30 seconds after their event time are considered "late."
+
+### Allowed lateness
+
+After a watermark fires a window, Flink can still accept additional late events up to a configurable `allowedLateness` duration. Each late event triggers a recomputation of the window and emission of an updated (corrected) result. This is useful for pipelines where occasional correction is acceptable and the sink supports upserts.
+
+```java
+stream
+    .keyBy(UserEvent::getEntityId)
+    .window(TumblingEventTimeWindows.of(Time.minutes(1)))
+    .allowedLateness(Time.minutes(5))
+    .sideOutputLateData(lateOutputTag)
+    .aggregate(new EventCountAggregator());
+```
+
+Events arriving more than 5 minutes past the window end time are routed to the `lateOutputTag` side output, which can be drained to a dead-letter table for auditing or manual reprocessing.
+
+### Watermark alignment in multi-source pipelines
+
+When a Flink job reads from multiple Kafka partitions (or multiple topics), the watermark for the job is the minimum watermark across all partitions. If one Kafka partition is idle (no events arriving), its watermark stalls at the last seen event time, which stalls the entire pipeline. The solution is to configure an idle partition timeout: Flink marks a partition as idle after N seconds with no events and excludes it from watermark computation.
+
+```java
+WatermarkStrategy.<UserEvent>forBoundedOutOfOrderness(Duration.ofSeconds(30))
+    .withIdleness(Duration.ofSeconds(60))
+```
+
+## Deep dive 3: Exactly-once semantics
+
+Exactly-once is the hardest correctness guarantee in distributed systems. It means each event is processed and reflected in the sink exactly once — not zero times (at-most-once), not potentially more than once (at-least-once).
+
+### At-least-once baseline
+
+The simpler guarantee is at-least-once: Flink periodically checkpoints its state and the committed Kafka consumer offsets. If the job crashes, it restarts from the last checkpoint, re-reads events from the last committed Kafka offset, and reprocesses them. Any events between the checkpoint and the crash are processed a second time. The sink receives duplicate writes.
+
+At-least-once is acceptable when the sink write is idempotent: an Elasticsearch document upsert with a deterministic document ID (derived from the event's primary key) is idempotent because writing the same document twice produces the same state. A counter increment (`UPDATE ... SET count = count + 1`) is NOT idempotent — a duplicate write inflates the count.
+
+### Exactly-once with two-phase commit
+
+Flink implements exactly-once via a two-phase commit (2PC) protocol coordinated by the JobManager checkpoint mechanism:
+
+1. **Phase 1 — Pre-commit**: when a checkpoint barrier arrives at the sink operator, the sink begins a transaction in the target system (e.g., `BEGIN` in PostgreSQL, `initTransactions()` in the Kafka producer). The sink writes all buffered events into the open transaction but does not commit.
+
+2. **Phase 2 — Commit**: when the JobManager receives confirmation from all operators that the checkpoint is complete (all state is written to S3), it notifies the sink operators to commit their transactions. The Kafka source offset is also committed at this point. Both commits happen within the same checkpoint, making them logically atomic.
+
+3. **Recovery**: if the job crashes before Phase 2, Flink restarts from the last checkpoint. The open sink transaction is automatically rolled back (or aborted on restart). The Kafka consumer re-reads from the last committed offset. No duplicate writes reach the sink.
+
+For Kafka-to-Kafka pipelines, the Flink Kafka sink uses `transactional.id` per task:
+
+```java
+KafkaSink.<AggregateResult>builder()
+    .setBootstrapServers(brokers)
+    .setRecordSerializer(serializer)
+    .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+    .setTransactionalIdPrefix("flink-pipeline-job-1")
+    .build();
+```
+
+The `transactionalIdPrefix` must be stable across job restarts so that Flink can find and abort any open transactions from before the crash.
+
+### Sink compatibility matrix
+
+Not every sink supports 2PC. The practical implications:
+
+- **Kafka**: full exactly-once via producer transactions
+- **PostgreSQL**: full exactly-once via `BEGIN`/`COMMIT` inside the checkpoint callback
+- **MySQL**: full exactly-once via `BEGIN`/`COMMIT` (same pattern as PostgreSQL)
+- **Elasticsearch**: no transaction support; use idempotent upserts with deterministic `_id` — this gives effectively-once for idempotent writes but not for non-idempotent operations
+- **HDFS / S3**: exactly-once via atomic rename (write to a temp path, rename on commit) — Flink's StreamingFileSink does this natively
+
+The overhead of exactly-once is roughly 5–15% throughput reduction due to the transaction coordination latency. For financial pipelines, this is mandatory. For high-throughput analytics counters where occasional duplicate increments are tolerable, at-least-once with idempotent sinks is the pragmatic choice.
+
+## Deep dive 4: State management and backpressure
+
+### State backend selection
+
+Flink offers two production state backends:
+
+**HashMapStateBackend**: stores all keyed state in the JVM heap as Java objects. Read/write is a direct Java object access — nanosecond latency. The hard limit is the JVM heap size, typically 4–8GB per task. Suitable for jobs with small state per task (session metadata, counters, small lookup tables). Checkpoints serialize all heap state to S3, which means checkpoint duration grows linearly with state size.
+
+**RocksDBStateBackend**: stores all keyed state in RocksDB, an embedded LSM key-value store backed by local NVMe SSDs. State can grow to terabytes — bounded only by disk capacity. Read/write requires serialization/deserialization to byte arrays and a RocksDB lookup, adding 10–100 microseconds of overhead per state access. Incremental checkpointing is available: only new SST files added since the last checkpoint are uploaded to S3, reducing checkpoint cost from O(total state) to O(state changed since last checkpoint).
+
+For any job with more than 2GB of state per task, use RocksDB. For latency-critical jobs with small state, use HeapHashMap.
+
+### Backpressure propagation
+
+Backpressure in Flink propagates upstream via credit-based flow control. Each operator maintains input and output queues. When a downstream operator's input queue is full (it cannot process records fast enough), it stops issuing credits to the upstream operator. The upstream operator stops writing to the downstream buffer. This signal propagates all the way to the Kafka source operator, which slows its poll rate. Kafka retains the unread events; the consumer group lag grows.
+
+This design guarantees no data loss during a backpressure event: the Kafka consumer simply falls behind, and the lag grows. When the downstream bottleneck clears (e.g., a slow sink write completes), the pipeline catches up by processing at full speed until the lag returns to zero.
+
+The danger of backpressure is that it causes watermarks to stall. If the Kafka consumer is not reading new events, no new watermarks are generated. If no watermarks advance, Flink cannot close windows and emit results. End-to-end latency spikes. The monitoring signal to watch is checkpoint duration: if checkpoints start taking longer than 2× the checkpoint interval, the job is under backpressure stress and may need scaling.
+
+### Scaling Flink
+
+Horizontal scaling in Flink requires increasing the parallelism of the bottleneck operator and the Kafka partition count:
+
+1. Profile the job in the Flink UI — identify the operator with the highest backpressure indicator
+2. Increase that operator's parallelism in the job configuration (or rescale the entire job)
+3. If the source operator is the bottleneck, increase Kafka partition count first (Kafka Admin API), then increase Flink source parallelism to match
+4. Take a savepoint, stop the job, restart with the new parallelism from the savepoint — state is automatically redistributed across the new number of tasks
+
+## Java implementation: TumblingWindowAggregator
+
+```java
+import org.apache.flink.api.common.functions.AggregateFunction;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
+import org.apache.flink.streaming.api.windowing.time.Time;
+
+public class TumblingWindowAggregator {
+
+    public static DataStream<AggregateResult> build(
+            StreamExecutionEnvironment env,
+            DataStream<UserEvent> events,
+            Time windowSize) {
+
+        return events
+            .assignTimestampsAndWatermarks(
+                WatermarkStrategy.<UserEvent>forBoundedOutOfOrderness(
+                    Duration.ofSeconds(30))
+                .withTimestampAssigner((e, ts) -> e.getEventTimeMs()))
+            .keyBy(UserEvent::getEntityId)
+            .window(TumblingEventTimeWindows.of(windowSize))
+            .allowedLateness(Time.minutes(5))
+            .aggregate(new EventCountAggregator());
+    }
+
+    public static class EventCountAggregator
+            implements AggregateFunction<UserEvent, Accumulator, AggregateResult> {
+
+        @Override
+        public Accumulator createAccumulator() {
+            return new Accumulator(0L, 0.0);
+        }
+
+        @Override
+        public Accumulator add(UserEvent event, Accumulator acc) {
+            return new Accumulator(acc.count + 1, acc.sum + event.getValue());
+        }
+
+        @Override
+        public AggregateResult getResult(Accumulator acc) {
+            return new AggregateResult(acc.count, acc.sum,
+                acc.count > 0 ? acc.sum / acc.count : 0.0);
+        }
+
+        @Override
+        public Accumulator merge(Accumulator a, Accumulator b) {
+            return new Accumulator(a.count + b.count, a.sum + b.sum);
+        }
+    }
+
+    public record Accumulator(long count, double sum) {}
+    public record AggregateResult(long count, double sum, double avg) {}
+}
+```
+
+## Java implementation: CheckpointedSinkFunction
+
+```java
+import org.apache.flink.api.common.state.ListState;
+import org.apache.flink.api.common.state.ListStateDescriptor;
+import org.apache.flink.runtime.state.FunctionInitializationContext;
+import org.apache.flink.runtime.state.FunctionSnapshotContext;
+import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
+import org.apache.flink.streaming.api.functions.sink.SinkFunction;
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.util.ArrayList;
+import java.util.List;
+
+public class CheckpointedJdbcSink
+        implements SinkFunction<AggregateResult>, CheckpointedFunction {
+
+    private final DataSource dataSource;
+    private final int batchSize;
+    private transient List<AggregateResult> buffer;
+    private transient ListState<AggregateResult> checkpointedBuffer;
+
+    public CheckpointedJdbcSink(DataSource dataSource, int batchSize) {
+        this.dataSource = dataSource;
+        this.batchSize = batchSize;
+    }
+
+    @Override
+    public void invoke(AggregateResult value, Context context) throws Exception {
+        buffer.add(value);
+        if (buffer.size() >= batchSize) flush();
+    }
+
+    private void flush() throws Exception {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO windowed_aggregates (entity_id, event_count, sum_value, computed_at) " +
+                "VALUES (?,?,?,NOW()) ON CONFLICT DO UPDATE SET event_count=EXCLUDED.event_count")) {
+            for (AggregateResult r : buffer) {
+                ps.setLong(1, r.count());
+                ps.setDouble(2, r.sum());
+                ps.addBatch();
+            }
+            ps.executeBatch();
+        }
+        buffer.clear();
+    }
+
+    @Override
+    public void snapshotState(FunctionSnapshotContext ctx) throws Exception {
+        checkpointedBuffer.clear();
+        checkpointedBuffer.addAll(buffer);
+    }
+
+    @Override
+    public void initializeState(FunctionInitializationContext ctx) throws Exception {
+        buffer = new ArrayList<>();
+        checkpointedBuffer = ctx.getOperatorStateStore()
+            .getListState(new ListStateDescriptor<>("buffer", AggregateResult.class));
+        if (ctx.isRestored()) checkpointedBuffer.get().forEach(buffer::add);
+    }
+}
+```
+
+## Framework tradeoff comparison
+
+<TradeoffTable title="Stream Processing Frameworks">
+
+| Framework | Exactly-Once | State Management | Latency | Operational Complexity | Best For |
+|---|---|---|---|---|---|
+| **Kafka Streams** | Yes (Kafka transactions) | RocksDB, in-JVM — bounded by local disk | Low (milliseconds) | Low — runs as a library inside your JVM, no separate cluster | Microservice-local stream processing; enrichment and filtering on a single service's event stream |
+| **Apache Flink** | Yes (2PC with compatible sinks) | HashMapStateBackend or RocksDB; checkpoint to S3; up to TBs of state | Very low (milliseconds) | High — separate JobManager + TaskManager cluster, checkpoint tuning, savepoint management | Large-scale stateful processing; windowed aggregations; complex event processing; anything requiring more than a single node of state |
+| **Apache Spark Streaming** | Yes (via micro-batch and idempotent writes) | Executor memory — state lives in RDDs, checkpointed to HDFS/S3 | Medium (seconds per micro-batch) | Medium — managed by YARN/K8s; familiar to data engineering teams with Spark batch experience | Teams already on the Spark ecosystem; batch and streaming sharing the same codebase via Structured Streaming |
+| **Custom Kafka Consumer** | At-least-once (exactly-once requires manual idempotency) | Application memory or external store (Redis, PostgreSQL) — must implement yourself | Configurable — as low as milliseconds | Low initially, high at scale — you own all the fault tolerance, backpressure, and state management | Simple stateless transformations or routing; prototype/low-volume jobs where operational overhead of a full framework is unjustified |
+
+</TradeoffTable>
+
+<Pitfall title="Using processing time instead of event time for windowing">
+
+Processing time windows close based on the wall clock on the Flink server — not on when the events actually occurred. A 5-minute processing-time window that starts at 12:00:00 closes at 12:05:00 regardless of the event timestamps inside it.
+
+The failure mode is subtle and insidious. A mobile device that was offline for 10 minutes sends a burst of 50 events when connectivity is restored. All 50 events arrive at Kafka at 12:06:00, but they carry event timestamps ranging from 11:56:00 to 12:05:45. With processing time windowing, all 50 events are counted in the 12:05:00–12:10:00 window — even though 40 of them should belong to the 11:55:00–12:00:00 window and the 12:00:00–12:05:00 window. Your 12:00 hourly report shows zero activity when there was actually significant activity; your 12:05 window is inflated with backlog events.
+
+Always use event time with appropriate watermarks for any analytics that cares about when something happened. The watermark overhead is minimal; the correctness benefit is fundamental. The only valid reason to use processing time is for debugging ("I want to see events as they arrive, not as they happened") or for metrics about pipeline performance itself (e.g., "how many events per second is Flink processing right now?").
+
+</Pitfall>
+
+<Pitfall title="Large state without incremental checkpointing">
+
+Full checkpoints of a large RocksDB state backend serialize and upload the entire state to S3 on every checkpoint cycle. For a job with 1TB of RocksDB state and a 30-second checkpoint interval, this means uploading 1TB every 30 seconds — 2.88TB per minute, and approximately 4.1PB per day in snapshot storage writes. The checkpoint takes 10–20 minutes to complete, far longer than the 30-second interval, causing checkpoint failures and the JobManager continuously trying and failing to close checkpoints.
+
+The second consequence is recovery time. If the job crashes, recovery reads the entire 1TB checkpoint from S3 before the job can resume. On a 1Gbps link, reading 1TB takes roughly 2.2 hours — not the "under 30 seconds" recovery target.
+
+Enable Flink's incremental RocksDB checkpointing: only the SST files added or compacted since the last checkpoint are uploaded. Because RocksDB's LSM structure naturally limits the volume of newly written SST files, incremental deltas are typically 1–2% of total state size per checkpoint interval. For a 1TB state with 30-second checkpoints, the incremental upload is typically 10–20GB per checkpoint rather than 1TB. Configure it with `EmbeddedRocksDBStateBackend(true)` (the `true` enables incremental mode). Recovery reads the base checkpoint plus the incremental deltas — still fast because it skips the unchanged 98% of state.
+
+</Pitfall>
+
+<Curveball title="A Flink job has been running for 6 months. You need to change the state schema — add a new field to the accumulator. How do you migrate state without losing 6 months of accumulated data?">
+
+This is a state schema evolution problem, and it is one of the most practically painful operational challenges in production Flink deployments.
+
+The recommended approach is savepoint-based migration. First, trigger a manual savepoint of the running job via the Flink REST API or CLI: `flink savepoint {jobId} s3://checkpoints/savepoint-migration`. This captures the full state — all accumulators, all window state, all operator state — at a consistent point in time. Stop the job.
+
+Next, update the state class to add the new field. Flink's POJO serializer supports adding new fields with default values if: (1) the class is a POJO (public fields or getters/setters, no-arg constructor), (2) the new field is annotated appropriately, or (3) you switch to a schema-evolution-aware serializer like Apache Avro with a schema registry. For Jackson-based serialization: add `@JsonIgnoreProperties(ignoreUnknown=true)` to handle old savepoints that don't have the new field — it defaults to null/zero on deserialization.
+
+Restart the job with `--fromSavepoint s3://checkpoints/savepoint-migration`. Flink deserializes the old state using the new class definition; the new field is initialized to its default value for all existing state. The job resumes from where it left off.
+
+For complex migrations where the state structure changes fundamentally (e.g., the key type changes, or the window type changes): run the old and new jobs in parallel, feeding both from the same Kafka topic. The new job builds up its state from scratch by replaying from a historical Kafka offset. Once the new job has caught up to the present, cut over the sink pointer to the new job and drain the old one. Kafka's log retention is what makes this dual-job migration safe — it is your schema migration rollback mechanism.
+
+</Curveball>
+
+<Curveball title="You need to join two Kafka streams — a clickstream and a purchase stream — where a click within 30 minutes before a purchase counts as an attribution event. How do you implement this?">
+
+This is a temporal stream-stream join, and it maps directly to Flink's interval join operator.
+
+The semantics: for each purchase event P with event time T, find all click events C for the same user where `T - 30 minutes ≤ C.eventTime ≤ T`. Flink's interval join handles this natively:
+
+```java
+clickStream
+    .keyBy(Click::getUserId)
+    .intervalJoin(purchaseStream.keyBy(Purchase::getUserId))
+    .between(Time.minutes(-30), Time.minutes(0))
+    .process(new AttributionJoinFunction());
+```
+
+Flink buffers each stream in keyed state for the duration of the interval. Click events are retained in state for 30 minutes; purchase events trigger lookups against the buffered clicks. The state size is proportional to: `click_volume_per_user × interval_duration`. For 10 million users each generating 10 clicks per hour, the 30-minute buffer holds `10M users × 5 clicks × avg_click_size(200B) = 10GB` of buffered click state — feasible on a moderate RocksDB backend.
+
+The edge cases to address: a user who clicks many times and never purchases will accumulate click state that is never joined and must eventually expire. Flink automatically cleans up expired state based on the interval bounds — but only when a purchase event for that user arrives. If a user has clicks but never purchases, their click state lives in RocksDB until the interval expires relative to the watermark. Configure a state TTL as a safety net: `StateTtlConfig.newBuilder(Time.hours(2)).build()` to cap unbounded state growth for ghost users.
+
+For multi-touch attribution (a purchase should credit multiple prior clicks), collect all clicks within the interval using a `ProcessJoinFunction` that emits one attribution record per (click, purchase) pair. For last-touch attribution, keep only the most recent click in state using a `ValueState<Click>` updated on each click event.
+
+</Curveball>
+
+<Curveball title="Your stream processing job falls 2 hours behind during a traffic spike. How do you catch up without sacrificing correctness?">
+
+Consumer lag of 2 hours means Flink's Kafka source is reading events that are 2 hours old. Because the pipeline uses event time windowing, the results it is currently emitting are for windows from 2 hours ago — they are correct, just delayed. The watermarks are also delayed by 2 hours, so windows are being closed and results are being emitted — just 2 hours late.
+
+Correctness is not compromised by lag when using event time. The danger is that latency SLAs are violated: fraud scoring that should fire within 1 second is firing 2 hours later, which is operationally equivalent to never.
+
+The recovery playbook:
+
+First, identify the bottleneck operator using the Flink UI backpressure indicators. The operator with the highest backpressure ratio is the constraint. Common culprits: the sink operator (slow DB writes), the window operator (heavy aggregation computation), or the source operator (Kafka network throughput).
+
+If the **sink is the bottleneck**: increase the batch size in the sink operator to reduce the per-record write overhead. Switch from synchronous to asynchronous sink writes using `AsyncDataStream`. If the PostgreSQL target is overloaded, temporarily redirect output to a Kafka topic and re-drain to PostgreSQL once the lag clears.
+
+If the **window operator is the bottleneck**: increase its parallelism. Take a savepoint, stop the job, increase the `parallelism.default` for the bottleneck operator (or the global parallelism), and restart from the savepoint. Flink redistributes the keyed state across the new number of tasks. If Kafka partition count is the limiting factor on the source side, add partitions via the Kafka Admin API before scaling the source parallelism.
+
+If **Kafka ingestion is the bottleneck**: increase the number of Kafka partitions (and correspondingly the Flink source parallelism). Note that increasing Kafka partitions requires reassigning existing partitions using `kafka-reassign-partitions.sh` and does not take effect for the consumer until the rebalance completes.
+
+During catchup, latency is elevated but correctness is preserved — event time windowing is entirely unaffected by how delayed the processing is. The windows close when the watermark advances past their end time, and the watermark advances with the events regardless of processing delay.
+
+</Curveball>
+
+## Further reading
+
+The conceptual foundation for modern stream processing is the **Dataflow Model paper** (Akidau et al., Google 2015), published at VLDB. It introduced the formal treatment of event time vs. processing time, the watermark abstraction, and the `(What, Where, When, How)` framework for reasoning about windowed stream computations. Every major stream processing system — Flink, Beam, Dataflow, Spark Structured Streaming — has converged on the model described in that paper. Reading it is the highest-leverage investment for understanding why these systems are designed the way they are, rather than just how to use them.
+
+**Apache Flink's official documentation** on stateful stream processing covers the state backend selection guide, checkpoint configuration, savepoint operations, and the watermark generation API in depth. The section on "Working with State" is particularly valuable for understanding when to use ValueState vs. ListState vs. MapState and the performance implications of each.
+
+For teams that do not need a separate Flink cluster, the **Kafka Streams DSL** provides windowing, aggregation, and exactly-once semantics entirely within the JVM of your existing microservice. It uses the same RocksDB state backend as Flink under the hood. The tradeoff is that Kafka Streams is limited to the resources of the host JVM — it cannot scale across multiple machines the way a Flink cluster can. It is the right choice for per-service stream processing (e.g., a payment service that computes its own fraud score locally) rather than for cross-service global aggregations.
+
+**Martin Kleppmann's "Designing Data-Intensive Applications"**, Chapter 11 ("Stream Processing"), provides the best accessible treatment of the correctness problems in stream processing: the dual-write problem, the idempotency requirements for at-least-once delivery, and the formal definition of exactly-once. Chapter 8 ("The Trouble with Distributed Systems") provides the clock skew and network delay background that motivates why watermarks are necessary.
+
+**LinkedIn's Apache Samza** is an alternative to Flink that uses Kafka as its changelog store for state (rather than RocksDB with S3 checkpoints). Because state changes are written as Kafka messages, recovery simply replays the changelog from Kafka — no S3 checkpoint needed. The tradeoff is that state reads go through Kafka, adding latency compared to RocksDB's local SSD access. Samza remains widely used at LinkedIn, where Kafka infrastructure is deeply mature.
+
+<RelatedQuestions items={[
+  { slug: "distributed-logging-system", title: "Design a Distributed Logging System", difficulty: "senior" },
+  { slug: "metrics-monitoring", title: "Design a Metrics and Monitoring System", difficulty: "senior" },
+  { slug: "top-k-trending", title: "Design Top-K Trending", difficulty: "mid" },
+]} />

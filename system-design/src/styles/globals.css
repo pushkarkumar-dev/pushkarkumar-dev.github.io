@@ -1,0 +1,228 @@
+/* Tailwind v4 */
+@import 'tailwindcss';
+
+@import './tokens.css';
+
+/* ── Base resets ── */
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: 'Geist', system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+  background: var(--bg);
+  color: var(--ink);
+  transition: background var(--dur-base) var(--ease-out),
+              color var(--dur-base) var(--ease-out);
+}
+
+/* ── Prose / reading content ── */
+.prose {
+  font-family: 'Source Serif 4 Variable', Georgia, serif;
+  font-size: 1.0625rem;
+  line-height: 1.78;
+  max-width: 68ch;
+  color: var(--ink-2);
+}
+
+.prose h1, .prose h2, .prose h3, .prose h4 {
+  font-family: 'Geist', system-ui, sans-serif;
+  color: var(--ink);
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+  margin-top: 2em;
+  margin-bottom: 0.5em;
+}
+
+.prose h1 { font-size: 2rem;    font-weight: 700; }
+.prose h2 { font-size: 1.375rem; font-weight: 650; }
+.prose h3 { font-size: 1.125rem; font-weight: 600; }
+
+.prose p  { margin: 1em 0; }
+
+.prose a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-color: var(--accent-line);
+  text-underline-offset: 3px;
+  transition: text-decoration-color var(--dur-fast);
+}
+.prose a:hover { text-decoration-color: var(--accent); }
+
+.prose code {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 0.88em;
+  background: var(--code-bg);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-sm);
+  padding: 0.1em 0.35em;
+  color: var(--accent);
+}
+
+.prose pre {
+  background: var(--code-bg) !important;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-md);
+  padding: 1.25rem 1.5rem;
+  overflow-x: auto;
+  font-size: 0.875rem;
+  line-height: 1.65;
+  margin: 1.5em 0;
+}
+.prose pre code { background: none; border: none; padding: 0; color: inherit; font-size: inherit; }
+
+.prose blockquote {
+  border-left: 3px solid var(--accent-line);
+  margin: 1.5em 0;
+  padding: 0.5em 0 0.5em 1.25em;
+  color: var(--ink-3);
+  font-style: italic;
+}
+
+.prose ul, .prose ol { padding-left: 1.5em; margin: 1em 0; }
+.prose li { margin: 0.35em 0; }
+.prose li::marker { color: var(--accent); }
+
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+  margin: 1.5em 0;
+  font-family: 'Geist', system-ui, sans-serif;
+}
+.prose th {
+  background: var(--bg-raised);
+  color: var(--ink);
+  font-weight: 600;
+  text-align: left;
+  padding: 0.6em 0.875em;
+  border-bottom: 1px solid var(--line-2);
+}
+.prose td {
+  padding: 0.55em 0.875em;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink-2);
+  vertical-align: top;
+}
+.prose tr:last-child td { border-bottom: none; }
+
+.prose hr {
+  border: none;
+  border-top: 1px solid var(--line-2);
+  margin: 2.5em 0;
+}
+
+/* ── KaTeX math ── */
+.prose .katex-display {
+  overflow-x: auto;
+  padding: 0.5em 0;
+  color: var(--ink);
+}
+
+/* ── Shiki dual-theme ── */
+.astro-code, .astro-code span {
+  color: var(--shiki-dark) !important;
+  background-color: var(--shiki-dark-bg) !important;
+}
+[data-theme='light'] .astro-code,
+[data-theme='light'] .astro-code span {
+  color: var(--shiki-light) !important;
+  background-color: var(--shiki-light-bg) !important;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: var(--ink-4); }
+
+/* ── Focus ring ── */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+
+/* ── Selection ── */
+::selection {
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+
+/* ── Skip-to-content ── */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+.sr-only:focus, .sr-only:focus-visible {
+  position: fixed;
+  width: auto;
+  height: auto;
+  padding: 0.5rem 1rem;
+  margin: 0;
+  overflow: visible;
+  clip: auto;
+  white-space: normal;
+}
+
+/* ── Print styles ── */
+@media print {
+  /* Hide navigation chrome */
+  header, footer, .article-toc, .reading-progress,
+  .bookmark-wrap, .copy-btn, #reading-progress { display: none !important; }
+
+  /* Single-column layout */
+  .article-layout { display: block !important; padding: 0 !important; }
+  .article-main   { max-width: 100% !important; }
+
+  /* Reset colors to black-on-white */
+  *, *::before, *::after {
+    background: #fff !important;
+    color: #000 !important;
+    box-shadow: none !important;
+    text-shadow: none !important;
+  }
+
+  /* Keep code readable */
+  .prose pre, .prose code {
+    border: 1px solid #ccc !important;
+    white-space: pre-wrap !important;
+  }
+
+  /* Avoid page breaks inside key blocks */
+  .prose pre, table, .tldr, .capacity, .tradeoff-table,
+  .pitfall, .curveball, .mermaid-figure {
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+
+  /* Show URLs after links */
+  .prose a[href]::after { content: ' (' attr(href) ')'; font-size: 0.8em; color: #555 !important; }
+  .prose a[href^="#"]::after { content: ''; } /* skip anchor links */
+
+  /* Expand collapsed curvealls */
+  details { display: block !important; }
+  summary { display: block; font-weight: bold; }
+
+  /* Show full headings */
+  h1, h2, h3, h4 {
+    page-break-after: avoid;
+    break-after: avoid;
+  }
+}

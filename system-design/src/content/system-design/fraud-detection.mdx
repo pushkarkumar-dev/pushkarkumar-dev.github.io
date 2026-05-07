@@ -1,0 +1,692 @@
+---
+title: "Design a Real-Time Fraud Detection System"
+slug: "fraud-detection"
+category: "ai"
+difficulty: "staff"
+estimatedReadMinutes: 26
+tags: ["rule-engine", "ml", "graph-fraud", "real-time", "kafka", "redis", "feature-store", "risk-scoring"]
+companyFlavors: ["Stripe", "PayPal", "Visa", "Uber", "Airbnb"]
+relatedQuestions: ["stripe-payment-gateway", "ml-inference-pipeline", "feature-store"]
+publishedAt: "2025-01-07"
+updatedAt: "2025-01-07"
+summary: "Build a layered fraud detection system combining synchronous rule engine for hard blocks, real-time ML scoring with velocity features, and an asynchronous graph-based fraud ring detection pipeline."
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+
+<Bookmark slug="fraud-detection" title="Design a Real-Time Fraud Detection System" />
+
+<Tldr>
+- Three-layer architecture: synchronous rule engine (hard blocks, &lt; 5ms) → real-time ML scorer (&lt; 50ms) → async graph analysis (minutes, retrospective freezes)
+- Velocity features in Redis: rolling counters (transactions/hour, failed attempts/day) per user/device/IP with Lua-based atomic sliding windows
+- ML model: gradient boosted trees (XGBoost/LightGBM) on 200+ features; retrained daily on labeled fraud data from chargebacks and analyst decisions
+- Graph fraud detection: shared device IDs, emails, and phone numbers cluster accounts into fraud rings via Union-Find; rings above 30% fraud rate trigger account freezes
+- Decision outcomes are APPROVE, REVIEW (step-up auth), and BLOCK; false positive rate is a hard product constraint — not an afterthought
+</Tldr>
+
+Fraud detection is an adversarial ML problem — the moment you publish your detection logic, fraudsters start working around it. The design must be inherently layered: fast rule-based filters catch known patterns at zero ML cost, a real-time ML model catches novel patterns using behavioral signals, and an asynchronous graph analysis catches fraud rings that no individual transaction reveals. The system must make all of this happen in the same 50ms window the payment processor allows.
+
+The stakes are asymmetric: a missed fraud event costs the platform money and erodes trust; a false positive blocks a legitimate customer and costs a sale, a support call, and potentially the customer relationship forever. Staff-level fraud system design means you can navigate both sides of that tradeoff simultaneously, making explicit product and engineering decisions about where to draw the line.
+
+## Clarifying Questions
+
+Before designing anything, an interviewer expects you to establish the problem boundaries. Ask these:
+
+| Question | Why It Matters |
+|---|---|
+| What transaction types are in scope — card payments only, or also account creation and login? | Account takeover (ATO) fraud requires different signals than payment fraud; they may be separate models |
+| What is the acceptable false positive rate? | This is a hard product constraint that determines how aggressively you can tune thresholds |
+| What is the synchronous latency budget for a fraud decision? | 50ms is typical for a payment processor; login flows may allow 200ms |
+| How large is the manual review team, and what volume can they handle daily? | Determines how many REVIEW decisions you can route without overwhelming analysts |
+| How frequently should the ML model be retrained? | Daily retraining with fresh labels vs. weekly is a significant infrastructure choice |
+| Are there regulatory requirements — BSA (Bank Secrecy Act), PSD2, or local equivalents? | PSD2 mandates Strong Customer Authentication for high-risk transactions in Europe |
+| What is the chargeback and dispute feedback loop — how long until we know ground truth? | Chargebacks arrive 30–90 days post-transaction; the label pipeline must handle delayed labels |
+| What is the device fingerprinting scope — first-party SDK or third-party provider? | In-house fingerprinting gives more control but requires significant engineering investment |
+
+For this design, assume: all transaction types in scope; false positive rate hard cap of 0.3%; 50ms p99 synchronous budget; daily model retraining; chargeback labels arrive within 90 days; device fingerprinting via first-party SDK.
+
+## Functional Requirements
+
+**Core decision pipeline:**
+- Real-time fraud evaluation for every transaction, returning APPROVE, REVIEW, or BLOCK within the latency budget
+- Velocity feature computation: transactions per hour, amount per hour, failed login attempts per day, new payees per week — computed per user, per device, and per IP address
+- Rule engine: configurable business rules expressed in a no-code DSL that operations teams can edit and hot-load without engineering intervention
+- ML risk score computation using a feature vector of 200+ behavioral, contextual, device, and cross-entity signals
+
+**Case management and feedback:**
+- Route REVIEW decisions to a human analyst case management system with full transaction context
+- Analyst decisions (fraud vs. legitimate) are fed back into the training label pipeline
+- Chargeback outcomes (ground truth fraud labels) are ingested from the payment processor and backfilled into the label store
+
+**Fraud ring detection:**
+- Identify clusters of accounts sharing device identifiers, email addresses, phone numbers, or IP address blocks
+- Emit fraud ring alerts when a cluster exceeds the fraud rate threshold, triggering account freezes across the entire ring
+- Real-time ring expansion: when a new account links to a known fraud ring, trigger immediate REVIEW
+
+## Non-Functional Requirements
+
+- **Throughput:** 50,000 transactions per second peak
+- **Latency:** p99 synchronous decision in under 50ms end-to-end
+- **False positive rate:** less than 0.3% of legitimate transactions incorrectly blocked or reviewed
+- **Fraud catch rate:** greater than 95% of known fraud patterns detected
+- **Model retraining cadence:** daily, with shadow testing (new model evaluated in parallel without affecting decisions) before promotion to production
+- **Availability:** 99.999% uptime — the fraud check is on the payment critical path; unavailability means payments either fail or bypass fraud checking entirely, both unacceptable
+- **Audit trail:** every evaluation decision with full feature snapshot must be stored for regulatory compliance (7-year retention in some jurisdictions)
+
+## Capacity Estimation
+
+<Capacity title="Fraud Detection Capacity">
+
+**In-flight transactions at peak:**
+
+$$\text{in-flight} = \text{TPS} \times \text{latency budget} = 50{,}000 \times 0.05\text{s} = 2{,}500 \text{ simultaneous evaluations}$$
+
+**Redis feature read throughput:**
+
+Each transaction reads approximately 50 velocity features, each roughly 50 bytes:
+
+$$\text{Redis read bandwidth} = 50{,}000 \frac{\text{tx}}{\text{s}} \times 50 \text{ features} \times 50\text{B} = 125 \frac{\text{MB}}{\text{s}}$$
+
+A single Redis node can sustain 500K ops/sec. With 50 features read per transaction (pipelined as one HGETALL), that is 50K ops/sec — well within a single shard. But we shard by user ID for horizontal scale.
+
+**Velocity counter storage:**
+
+$$\text{storage} = 500\text{M users} \times 20 \text{ counters} \times 50\text{B} = 500\text{ GB}$$
+
+This fits in a sharded Redis cluster of 10 nodes at 64GB RAM each, with replication.
+
+**ML model size and inference:**
+
+XGBoost with 500 trees at depth 6: approximately 100MB model artifact. Loads entirely into memory — zero disk I/O at inference time. Inference latency for a single feature vector: 1–3ms on a single CPU core.
+
+**ML server count:**
+
+$$\text{effective TPS per ML server} = \frac{1000\text{ms}}{50\text{ms}} \times \text{concurrency} = 20 \times 100 = 2000 \text{ TPS/server}$$
+
+At 50K TPS peak: $\lceil 50{,}000 / 2{,}000 \rceil = 25$ servers minimum. Add 50% headroom for rolling deployments and traffic spikes: **38 ML inference servers**.
+
+**Graph storage (entity links):**
+
+$$\text{edges} = 500\text{M users} \times 5 \text{ avg links} = 2.5\text{B edges}$$
+
+At 100 bytes per edge: 250GB. Neo4j or an adjacency list in Redis sets. The batch graph analysis runs on a separate compute cluster — not on the hot path.
+
+**Daily fraud evaluations stored:**
+
+$$50{,}000 \frac{\text{tx}}{\text{s}} \times 86{,}400 \frac{\text{s}}{\text{day}} = 4.32\text{B evaluations/day}$$
+
+At 500 bytes per evaluation record (with feature JSONB snapshot): approximately 2.16 TB/day. Partitioned PostgreSQL with time-based partition pruning; older partitions archived to cold storage after 90 days.
+
+</Capacity>
+
+## API Design
+
+The synchronous evaluation API lives on the hot payment path. Latency discipline is non-negotiable.
+
+```text
+Synchronous decision (on payment critical path):
+POST /api/v1/fraud/evaluate
+  Content-Type: application/json
+  Body:
+    {
+      "transactionId": "txn_abc123",
+      "userId": "usr_xyz",
+      "amount": 249.99,
+      "currency": "USD",
+      "merchantId": "mer_789",
+      "deviceId": "dev_fingerprint_hash",
+      "ipAddress": "203.0.113.42",
+      "paymentMethod": { "type": "card", "last4": "4242", "binCountry": "US" },
+      "timestamp": "2025-01-07T14:32:00Z"
+    }
+  Response 200:
+    {
+      "decision": "APPROVE",           // APPROVE | REVIEW | BLOCK
+      "riskScore": 0.12,               // 0.0 (safe) to 1.0 (fraud)
+      "rulesFired": [],
+      "requestId": "req_def456",
+      "latencyMs": 23
+    }
+
+Case management — analyst decision submission:
+POST /api/v1/cases/{caseId}/decision
+  Body: { "analystId": "usr_analyst_01", "outcome": "FRAUD", "notes": "..." }
+  Response 200: { "caseId": "...", "labeledAt": "2025-01-07T15:00:00Z" }
+  Side effect: emits LabelEvent to Kafka → training pipeline
+
+Admin — rule management (ops team, no-code):
+POST /api/v1/rules
+  Body:
+    {
+      "name": "velocity_bomb_block",
+      "condition": "velocity.tx_count_1h > 50 AND amount > 100",
+      "action": "BLOCK",
+      "priority": 10
+    }
+  Response 201: { "ruleId": "rule_ghi789" }
+
+PUT /api/v1/rules/{ruleId}/toggle
+  Body: { "isActive": false }
+
+Internal — async graph analysis trigger:
+POST /api/v1/graph/analyze
+  Body: { "entityId": "dev_fingerprint_hash", "entityType": "DEVICE" }
+  Response 202: { "jobId": "job_jkl012" }  // accepted, runs async
+```
+
+## Data Model
+
+```sql
+CREATE TABLE fraud_evaluations (
+    transaction_id  VARCHAR(100) PRIMARY KEY,
+    user_id         UUID NOT NULL,
+    decision        VARCHAR(10) NOT NULL,   -- APPROVE, REVIEW, BLOCK
+    risk_score      FLOAT NOT NULL,
+    rules_fired     JSONB,
+    features        JSONB,                  -- snapshot of features at decision time
+    model_version   VARCHAR(50),
+    evaluated_at    TIMESTAMPTZ NOT NULL
+) PARTITION BY RANGE (evaluated_at);
+
+CREATE INDEX idx_eval_user_time ON fraud_evaluations (user_id, evaluated_at DESC);
+CREATE INDEX idx_eval_decision   ON fraud_evaluations (decision) WHERE decision != 'APPROVE';
+
+CREATE TABLE fraud_rules (
+    rule_id         UUID PRIMARY KEY,
+    name            VARCHAR(200) UNIQUE NOT NULL,
+    condition_expr  TEXT NOT NULL,          -- DSL expression string
+    action          VARCHAR(10) NOT NULL,   -- BLOCK or REVIEW
+    is_active       BOOLEAN DEFAULT true,
+    priority        INT NOT NULL,           -- lower number = evaluated first
+    created_by      VARCHAR(100),
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE fraud_cases (
+    case_id         UUID PRIMARY KEY,
+    transaction_id  VARCHAR(100) NOT NULL,
+    status          VARCHAR(20) NOT NULL,   -- OPEN, RESOLVED_FRAUD, RESOLVED_LEGIT
+    analyst_id      UUID,
+    resolved_at     TIMESTAMPTZ,
+    notes           TEXT
+);
+
+CREATE INDEX idx_cases_status ON fraud_cases (status) WHERE status = 'OPEN';
+
+CREATE TABLE entity_links (
+    source_entity_id   VARCHAR(200) NOT NULL,
+    source_type        VARCHAR(20) NOT NULL,  -- USER, DEVICE, EMAIL, PHONE
+    target_entity_id   VARCHAR(200) NOT NULL,
+    target_type        VARCHAR(20) NOT NULL,
+    first_seen         TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (source_entity_id, target_entity_id)
+);
+
+CREATE INDEX idx_links_source ON entity_links (source_entity_id);
+CREATE INDEX idx_links_target ON entity_links (target_entity_id);
+
+CREATE TABLE training_labels (
+    transaction_id  VARCHAR(100) PRIMARY KEY,
+    label           VARCHAR(10) NOT NULL,   -- FRAUD or LEGIT
+    label_source    VARCHAR(20) NOT NULL,   -- ANALYST, CHARGEBACK, AUTOMATED
+    labeled_at      TIMESTAMPTZ NOT NULL,
+    model_version   VARCHAR(50)             -- which model was in use when evaluated
+);
+```
+
+**Redis velocity features — key schema:**
+
+```text
+Sliding window sorted set (for accurate 1h counts):
+  KEY:   user:{userId}:tx_ts
+  TYPE:  Sorted Set
+  SCORE: epoch_ms of transaction
+  VALUE: transaction_id
+  TTL:   86400s (24h)
+
+  Query pattern:
+    ZREMRANGEBYSCORE key 0 (now_ms - 3600000)  -- evict old entries
+    ZCARD key                                   -- count in last 1h
+
+Hash for pre-aggregated multi-window counters (faster reads, maintained by Lua):
+  KEY:   user:{userId}:velocity
+  TYPE:  Hash
+  FIELDS:
+    tx_count_1h     -> "3"
+    tx_amount_1h    -> "450.00"
+    tx_count_24h    -> "7"
+    fail_count_24h  -> "1"
+    new_payee_7d    -> "2"
+  TTL:   7 days
+
+Device counters:
+  KEY:   device:{deviceId}:velocity
+  FIELDS:
+    unique_users_24h -> "1"
+    tx_count_1h      -> "3"
+
+IP counters:
+  KEY:   ip:{hashedIp}:velocity
+  FIELDS:
+    unique_users_1h  -> "1"
+    tx_count_1h      -> "5"
+```
+
+## Architecture Diagram
+
+<Mermaid diagram={`flowchart TD
+  Client["Payment Client"] --> GW["Fraud Gateway\n(load balanced, 50ms SLA)"]
+
+  GW --> RE["Rule Engine\n(compiled DSL, < 5ms)"]
+  GW --> FF["Feature Fetcher\n(Redis pipeline)"]
+
+  RE --> DA["Decision Aggregator"]
+  FF --> ML["ML Scorer\n(XGBoost, 1–3ms inference)"]
+  ML --> DA
+
+  DA -->|"APPROVE / REVIEW / BLOCK"| GW
+  GW --> Client
+
+  DA -->|"evaluation event"| K1["Kafka\nfraud-evaluations"]
+
+  K1 --> FS["Feature Store Updater\n(velocity refresh)"]
+  K1 --> GA["Graph Analyzer\n(async batch + streaming)"]
+  K1 --> CM["Case Manager\n(REVIEW → analyst queue)"]
+
+  GA -->|"fraud ring detected"| K2["Kafka\nfraud-rings"]
+  K2 --> AS["Account Service\n(freeze accounts)"]
+
+  CM --> Analyst["Analyst Dashboard"]
+  Analyst -->|"label: FRAUD / LEGIT"| LP["Label Pipeline\n(Kafka → training set)"]
+  LP --> TR["Daily Retraining Job\n(XGBoost, shadow test, promote)"]
+
+  style GW fill:#1e3a5f,color:#fff
+  style ML fill:#1e3a5f,color:#fff
+  style GA fill:#2d4a2d,color:#fff
+  style DA fill:#4a2d1e,color:#fff
+`} />
+
+## Deep Dive: Rule Engine
+
+The rule engine provides the first line of defense: immediate, deterministic, and fully interpretable blocks for known fraud patterns. It operates in under 5ms — before any ML inference — so that catastrophic cases (extreme velocity, sanctioned countries, known stolen BINs) are blocked at zero ML cost.
+
+Rules are evaluated in ascending priority order. The first rule with `action = BLOCK` short-circuits the pipeline and returns immediately. Rules with `action = REVIEW` accumulate — the final decision aggregator promotes to REVIEW if any rule fired with that action, even if the ML score would approve.
+
+**Rule DSL examples:**
+
+```text
+Priority 1  — BLOCK:
+  IF velocity.tx_count_1h > 50 THEN BLOCK
+  (velocity bomb: account compromised, attacker draining funds fast)
+
+Priority 2  — BLOCK:
+  IF user.account_age_days < 7 AND amount > 1000 THEN BLOCK
+  (new account, high value: classic mule account pattern)
+
+Priority 5  — REVIEW:
+  IF device.is_known = false AND amount > 2000 THEN REVIEW
+  (new device, high amount: possible ATO)
+
+Priority 6  — REVIEW:
+  IF ip.country != account.registered_country AND amount > 500 THEN REVIEW
+  (geographic anomaly)
+
+Priority 7  — REVIEW:
+  IF card.bin_country != ip.country THEN REVIEW
+  (card not issued in country of use)
+
+Priority 10 — BLOCK:
+  IF ip.is_sanctioned_country = true THEN BLOCK
+  (regulatory: OFAC compliance)
+```
+
+Rules are not evaluated via interpreted string matching at runtime — that would be far too slow. Instead, each rule is compiled to a decision tree node at load time. The ops team writes rules via a no-code web UI backed by a YAML definition:
+
+```yaml
+rules:
+  - name: velocity_bomb_block
+    priority: 1
+    condition:
+      all:
+        - field: velocity.tx_count_1h
+          op: gt
+          value: 50
+    action: BLOCK
+    is_active: true
+```
+
+Hot-loading without restart: the rule engine polls a Redis key `fraud:rules:version` every 30 seconds. When the ops team saves a new rule, the admin service increments the version and writes the new rule set to Redis. The rule engine sees the version bump, fetches the new compiled rule set, and swaps it atomically in memory. No deployment required.
+
+## Deep Dive: Velocity Feature Computation
+
+Velocity features capture behavioral anomalies — a user who normally makes 2 transactions per day suddenly making 30 in an hour. These are the single highest-signal features for detecting account compromise and bot-driven fraud.
+
+The core challenge is computing rolling window aggregates at 50K TPS without introducing significant latency. We use Redis Sorted Sets as atomic sliding windows:
+
+```text
+Lua script for atomic 1-hour sliding window transaction count:
+  1. ZADD user:{userId}:tx_ts {now_ms} {tx_id}
+  2. ZREMRANGEBYSCORE user:{userId}:tx_ts 0 {now_ms - 3600000}
+  3. ZCARD user:{userId}:tx_ts
+  Returns: integer count of transactions in the last 60 minutes
+
+Why Lua? Atomicity. Without Lua, a concurrent write between ZREMRANGE and ZCARD
+could produce an incorrect count. The Lua script executes atomically on the Redis server.
+```
+
+**Feature groups computed per entity dimension:**
+
+| Dimension | Features | Window |
+|---|---|---|
+| Per user | tx count, tx amount sum, new payee count | 1h, 24h, 7d |
+| Per user | failed authentication count | 24h |
+| Per device | unique user count | 24h |
+| Per device | tx count | 1h |
+| Per IP | unique user count | 1h |
+| Per IP | tx count, geolocation anomaly flag | 1h |
+| Per card BIN | fraud rate (from historical batch data) | 7d rolling |
+
+At evaluation time, all relevant keys are fetched in a single Redis pipeline — one network round-trip for all 50 features. This keeps the feature fetch under 2ms even at high load.
+
+**Geolocation anomaly flag:** the IP's resolved country is compared to the user's historical modal country (computed nightly as a batch job and stored in the feature store). A mismatch sets the `ip.geo_anomaly` flag, which is both a rule condition and an ML feature.
+
+## Deep Dive: ML Risk Scoring
+
+The ML model operates on a feature vector of 200+ features assembled from: real-time velocity features (Redis), historical behavioral profiles (feature store, batch-updated nightly), transaction context (amount, merchant category code, hour of day, day of week, is_weekend), device and network signals (device age in days, IP reputation score from a third-party feed, is_proxy, is_vpn, is_tor), and cross-entity signals (number of accounts sharing this device, whether the device is linked to any previously blocked account).
+
+**Model architecture:** Gradient boosted trees (XGBoost or LightGBM). Tree models are preferred over neural networks for fraud detection because: (1) they handle heterogeneous tabular features natively without embedding; (2) they are interpretable — feature importance and individual prediction explanations via SHAP values are critical for analyst trust and regulatory audit; (3) inference latency is 1–3ms on CPU, no GPU required; (4) they handle sparse features and missing values gracefully.
+
+**Class imbalance handling:** Fraud accounts for roughly 0.1% of transactions. Training on raw data produces a model that predicts APPROVE for everything and gets 99.9% accuracy. Solutions: (a) cost-sensitive learning — set `scale_pos_weight = 1000` in XGBoost (1 fraud label outweighs 1000 legitimate labels in loss); (b) oversample the fraud class via SMOTE in the training pipeline; (c) calibrate probabilities using Platt scaling so the model output is a well-calibrated probability, not a raw score.
+
+**Threshold calibration:** The model outputs a probability score 0.0–1.0. Thresholds that map scores to decisions are tuned separately from the model, against a business-metric-weighted objective:
+
+```text
+Threshold calibration objective:
+  Maximize:  fraud_catch_rate (true positive rate on fraud class)
+  Subject to: false_positive_rate < 0.003 (hard constraint: < 0.3%)
+
+Resulting thresholds (example, tuned quarterly):
+  score >= 0.80  → BLOCK
+  score >= 0.40  → REVIEW
+  score <  0.40  → APPROVE
+
+Thresholds are stored in the config service — adjustable without model redeployment.
+```
+
+**Shadow testing:** Before promoting a new model version to production, it runs in shadow mode for 24 hours — evaluating every transaction in parallel with the current model but not affecting decisions. The shadow model's decisions and scores are logged; engineers compare accuracy metrics, score distributions, and rule interaction patterns before promotion. This prevents a bad model from causing a sudden spike in false positives or missed fraud.
+
+**Daily retraining pipeline:**
+1. Extract: pull all transactions from the past 90 days with confirmed labels (analyst decisions + chargebacks)
+2. Transform: reconstruct the feature vector for each transaction using the feature values logged at evaluation time (not current values — this avoids label leakage)
+3. Train: XGBoost with cross-validation; hyperparameter tuning via Bayesian optimization
+4. Evaluate: compare AUC-PR, false positive rate at 0.3% constraint, and top-decile lift against the current production model
+5. Shadow deploy: if metrics improve, deploy to shadow; promote after 24-hour shadow period with no regressions
+
+## Deep Dive: Graph-Based Fraud Ring Detection
+
+Individual transaction ML misses coordinated fraud — a network of 50 accounts each making one suspicious transaction individually, each appearing borderline legitimate, but collectively controlled by the same criminal actor sharing devices and contact information.
+
+Graph analysis detects this by treating accounts, devices, emails, and phone numbers as nodes in a graph, with edges representing "this account used this device" or "this account registered with this email." Accounts connected by shared attributes form clusters; clusters with high fraud rates are fraud rings.
+
+**Algorithm — Union-Find (Disjoint Set Union):**
+
+Union-Find runs in near-linear time on the entity_links table: $O(N \alpha(N))$ where $\alpha$ is the inverse Ackermann function — effectively constant. This makes it practical even on 2.5 billion edges.
+
+```text
+Batch graph fraud ring detection (runs hourly as a Spark/Python job):
+
+1. Load entity_links table: all (source_entity_id, target_entity_id) pairs
+2. Run Union-Find: union(source, target) for each link
+   → Produces connected components: each account assigned a cluster root ID
+3. For each connected component:
+   a. Count total members
+   b. Count members with decision='BLOCK' in fraud_evaluations (fraud flag)
+   c. Compute fraud_rate = fraud_members / total_members
+4. Filter: cluster_size >= 5 AND fraud_rate >= 0.30
+5. For matching clusters: emit FraudRingAlert to Kafka topic "fraud-rings"
+6. Account Service consumes "fraud-rings": freeze all accounts in ring, notify risk team
+
+FraudRingAlert payload:
+  { "ringId": "ring_uuid", "members": ["usr_1", "usr_2", ...],
+    "fraudRate": 0.42, "clusterSize": 23, "action": "FREEZE_ALL" }
+```
+
+**Real-time ring expansion:** The batch job runs hourly, but a new account linking to a known fraud ring should trigger immediate action. When the Fraud Gateway processes any transaction:
+
+1. The `entity_links` table is updated (device/email/phone links logged)
+2. A `NewEntityLink` event is published to Kafka
+3. A streaming job consumes `NewEntityLink` events and checks: does either entity already belong to a known frozen fraud ring (cached in Redis)?
+4. If yes: immediately route the transaction to REVIEW and flag the new account for analyst attention
+
+This hybrid approach (batch for ring discovery, streaming for ring expansion) balances computational cost against response time.
+
+## Python Integration — Part A: FraudEvaluationService
+
+```python
+import time
+import logging
+from dataclasses import dataclass
+from typing import List, Optional
+import redis
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class EvaluationResult:
+    decision: str
+    risk_score: float
+    rules_fired: List[str]
+    latency_ms: float
+
+class FraudEvaluationService:
+    def __init__(self, rule_engine, feature_client, ml_model,
+                 redis_client: redis.RedisCluster):
+        self.rules = rule_engine
+        self.features = feature_client
+        self.model = ml_model
+        self.redis = redis_client
+
+    def evaluate(self, transaction: dict) -> EvaluationResult:
+        start = time.monotonic()
+        user_id = transaction["user_id"]
+
+        velocity = self._get_velocity_features(user_id, transaction)
+        rule_result = self.rules.evaluate({**transaction, "velocity": velocity})
+        if rule_result.action == "BLOCK":
+            return EvaluationResult("BLOCK", 1.0, rule_result.rules_fired,
+                                    (time.monotonic() - start) * 1000)
+
+        ml_features = self.features.get_features(user_id, [
+            "user_stats:avg_tx_amount", "user_stats:account_age_days",
+            "user_stats:chargeback_rate_90d", "device:unique_users_24h",
+        ])
+        feature_vector = self._build_feature_vector(
+            transaction, velocity, ml_features)
+        risk_score = float(self.model.predict_proba([feature_vector])[0][1])
+
+        self._update_velocity(user_id, transaction)
+
+        decision = "BLOCK" if risk_score > 0.8 else \
+                   "REVIEW" if risk_score > 0.4 else "APPROVE"
+        return EvaluationResult(decision, risk_score, rule_result.rules_fired,
+                                (time.monotonic() - start) * 1000)
+
+    def _get_velocity_features(self, user_id: str, tx: dict) -> dict:
+        now_ms = int(time.time() * 1000)
+        one_hour_ago = now_ms - 3_600_000
+        key = f"user:{user_id}:tx_ts"
+        self.redis.zremrangebyscore(key, 0, one_hour_ago)
+        tx_count_1h = self.redis.zcard(key)
+        return {"tx_count_1h": tx_count_1h, "amount": float(tx.get("amount", 0))}
+
+    def _update_velocity(self, user_id: str, tx: dict):
+        now_ms = int(time.time() * 1000)
+        key = f"user:{user_id}:tx_ts"
+        self.redis.zadd(key, {tx["transaction_id"]: now_ms})
+        self.redis.expire(key, 86400)
+
+    def _build_feature_vector(self, tx: dict, velocity: dict, ml_feats: dict) -> list:
+        return [
+            float(tx.get("amount", 0)),
+            velocity.get("tx_count_1h", 0),
+            float(ml_feats.get("user_stats:avg_tx_amount") or 0),
+            float(ml_feats.get("user_stats:account_age_days") or 0),
+            float(ml_feats.get("user_stats:chargeback_rate_90d") or 0),
+            float(ml_feats.get("device:unique_users_24h") or 1),
+        ]
+```
+
+## Python Integration — Part B: GraphFraudAnalyzer
+
+```python
+from collections import defaultdict
+import logging
+
+logger = logging.getLogger(__name__)
+
+class UnionFind:
+    def __init__(self):
+        self.parent = {}
+    def find(self, x):
+        self.parent.setdefault(x, x)
+        if self.parent[x] != x:
+            self.parent[x] = self.find(self.parent[x])
+        return self.parent[x]
+    def union(self, x, y):
+        self.parent[self.find(x)] = self.find(y)
+
+class GraphFraudAnalyzer:
+    def __init__(self, db_session, kafka_producer,
+                 fraud_rate_threshold: float = 0.3, min_cluster_size: int = 5):
+        self.db = db_session
+        self.kafka = kafka_producer
+        self.threshold = fraud_rate_threshold
+        self.min_size = min_cluster_size
+
+    def run_batch_analysis(self):
+        links = self.db.execute(
+            "SELECT source_entity_id, target_entity_id FROM entity_links"
+        ).fetchall()
+        uf = UnionFind()
+        for source, target in links:
+            uf.union(source, target)
+
+        clusters = defaultdict(list)
+        for entity_id in uf.parent:
+            clusters[uf.find(entity_id)].append(entity_id)
+
+        fraud_flags = self._load_fraud_flags()
+        for root, members in clusters.items():
+            if len(members) < self.min_size:
+                continue
+            fraud_rate = sum(1 for m in members if m in fraud_flags) / len(members)
+            if fraud_rate >= self.threshold:
+                self._emit_fraud_ring(members, fraud_rate)
+                logger.warning("Fraud ring detected: %d members, rate=%.2f",
+                               len(members), fraud_rate)
+
+    def _load_fraud_flags(self) -> set:
+        rows = self.db.execute(
+            "SELECT DISTINCT user_id FROM fraud_evaluations WHERE decision='BLOCK'"
+        ).fetchall()
+        return {str(r[0]) for r in rows}
+
+    def _emit_fraud_ring(self, members: list, fraud_rate: float):
+        self.kafka.send("fraud-rings", value={
+            "members": members, "fraud_rate": fraud_rate, "action": "FREEZE_ALL"
+        })
+```
+
+<TradeoffTable title="Fraud Detection Architecture Layers">
+
+| Approach | Latency | Catch Rate | False Positive Rate | Adversarial Robustness | Recommended For |
+|---|---|---|---|---|---|
+| Rules only | < 5ms | ~60% (known patterns only) | Low if rules are conservative | Very low — trivial to reverse-engineer thresholds | Regulatory hard blocks; known stolen BINs |
+| ML only | 20–50ms | ~92% (captures novel patterns) | Moderate without careful threshold calibration | Medium — can be probed via adversarial transactions | Greenfield with no ops rule-writing capacity |
+| Rules + ML | 20–50ms | ~95% (complementary coverage) | Low — rules catch catastrophic cases; ML handles ambiguous | High — rules for invariants, ML for behavioral anomalies | Most production payment platforms |
+| Rules + ML + Graph | 20–50ms sync; minutes for ring detection | ~98% (catches rings missed by per-transaction models) | Lowest — graph prunes false positives via cluster context | Highest — rings require coordinated evasion of all three layers | Mature platforms with manual review teams and chargeback data |
+
+</TradeoffTable>
+
+<Pitfall title="Optimizing only for fraud catch rate while ignoring false positive rate">
+
+Blocking 99% of fraud sounds like an unambiguous win until you realize that at 50K TPS with a 1% false positive rate, you are blocking 500 legitimate transactions every second. Each is a lost sale, a potential customer support call, and a churn risk for a customer who did nothing wrong.
+
+The product team sets the acceptable false positive rate — say, 0.3% — as a hard business constraint before ML training begins. The ML team's job is to maximize fraud catch rate within that constraint, not to maximize raw AUC on a balanced test set. Train with asymmetric loss (`scale_pos_weight` in XGBoost, or a custom cost matrix), and calibrate decision thresholds on a validation set weighted by business impact: a blocked legitimate transaction at $5,000 should count much more heavily in the loss than one at $10.
+
+Instrument both sides of the tradeoff in your dashboards. A fraud team that only tracks "fraud caught" without tracking "good customers impacted" will systematically overtighten thresholds over time until customer complaints force a crisis recalibration.
+
+</Pitfall>
+
+<Pitfall title="No feedback loop from analyst decisions back to training labels">
+
+The ML model is only as good as its training labels. If analyst REVIEW decisions — the cases where the model was uncertain and a human provided ground truth — never make it back into the training dataset, the model cannot learn from its hardest examples. Those are precisely the cases that matter most.
+
+Implement a label collection pipeline as a first-class engineering concern, not an afterthought. Every analyst decision flows: analyst UI → `POST /api/v1/cases/{caseId}/decision` → Kafka `fraud-labels` topic → label pipeline → next day's training dataset. Chargebacks (the ultimate ground truth) arrive 30–90 days after the transaction and must be backfilled retroactively into the label store, keyed by transaction ID.
+
+Beware of survivorship bias: the model is only ever evaluated on transactions it routed to REVIEW (it never sees the ground truth for approvals, since those aren't sent to analysts). Use a holdout exploration policy — route a random 0.1% of APPROVE decisions to analysts for ground truth labeling, even though this adds cost. Without this, the model's recall on approved-but-fraudulent transactions is completely unknown.
+
+</Pitfall>
+
+<Curveball title="Fraudsters discovered your velocity threshold (> 50 tx/hour triggers block) and now make exactly 49 transactions/hour. How do you adapt?">
+
+This is the core adversarial dynamic of fraud detection: hard thresholds in the rule engine are observable and gameable. A sophisticated fraud operation will probe the system — make 45 transactions/hour for a week, observe no blocks, then make 49 — and calibrate precisely to stay just below your threshold.
+
+The solution is to move away from absolute thresholds toward learned relative features. Instead of `tx_count_1h > 50` as a hard rule, add `tx_count_1h / user.historical_avg_tx_count_1h` as a feature in the ML model. A user who normally makes 1 transaction per hour making 49 looks catastrophically anomalous on this relative feature, even at a count that would pass the absolute threshold. The ML model learns the appropriate sensitivity context-by-context.
+
+For the rule engine itself, keep hard thresholds only for cases where the absolute value is independently catastrophic (e.g., 200 transactions in any single hour, which no legitimate user could ever generate). For the middle range, rely on the ML model. Additionally, add behavioral biometrics (typing speed, mouse movement, touch pressure patterns captured by the mobile SDK) as signals — these are extremely difficult to replicate programmatically even if the attacker knows they exist.
+
+Finally, implement active adversarial testing: red-team your own system quarterly by trying to probe and evade the rules. If your red team can game it in an afternoon, adversarial fraudsters will game it in a week.
+
+</Curveball>
+
+<Curveball title="A legitimate user's account is compromised and used for account takeover fraud. How is this different from payment fraud and what signals catch it?">
+
+Account takeover (ATO) fraud is fundamentally different from payment fraud: the fraudster is using real, legitimate credentials — they passed authentication. The payment transaction itself may look completely normal (same amount range, same merchant category as the user's history), because the attacker studied the account before striking.
+
+ATO is detected at login time and account event time, not payment time. The signals are:
+
+**Login signals:** new device fingerprint (no cookie, no device ID match); IP geolocation far from the user's modal location (computed nightly); IP address on a commercial proxy or VPN; failed login attempts followed by success (credential stuffing pattern); login at 3am local time for an account that has never logged in after midnight.
+
+**Post-login account event signals:** email address or phone number changed within minutes of login (credential pivot — attacker locking out the real user); new payment method added immediately; password reset followed within seconds by a high-value transaction; shipping address changed to an address never used before.
+
+The correct mitigation for ATO is step-up authentication (MFA challenge, biometric prompt, OTP to the registered phone), not a hard block. A hard block would lock out the real user if the ATO detection is wrong, which is a far worse outcome. The REVIEW decision with step-up auth gates the attacker on the second factor while giving the legitimate user a path to proceed.
+
+Implement ATO detection as a separate model triggered at login and account-event time, with its own feature set and its own risk scoring. The output of the ATO model feeds into the session risk level, which the payment fraud model uses as a feature: `session.ato_risk_score` from the current session.
+
+</Curveball>
+
+<Curveball title="How would you handle a Black Friday scenario where fraud volume increases 10x alongside legitimate volume?">
+
+Black Friday breaks fraud models in two simultaneous ways. First, legitimate users exhibit anomalous behavior — making 5 transactions in an hour (unusually high for them), spending large amounts, shopping from merchants they've never visited — which trips velocity rules and inflates ML risk scores. Second, fraud volume genuinely spikes 10x because fraudsters time their attacks to coincide with peak volume, knowing analyst queues will be overwhelmed and automated systems stressed.
+
+Mitigate on multiple fronts:
+
+**Pre-compute seasonal behavioral baselines:** run a yearly batch job the week before Black Friday using prior year's data. Compute per-user and platform-wide velocity distributions for Black Friday specifically. Inject these as seasonal features: `user.bf_tx_count_1h_p95_last_year` tells the model what "normal" looks like on this specific day.
+
+**Widen APPROVE thresholds temporarily:** a deliberate, documented business decision to accept a slightly higher false negative rate (more fraud slips through) in exchange for a dramatically lower false positive rate (fewer legitimate customers blocked). The cost of blocking a $400 sale on Black Friday is higher than on a Tuesday. Set threshold adjustments as time-boxed overrides in the config service — they expire automatically.
+
+**Pre-scale infrastructure:** auto-scaling is not fast enough for a traffic cliff that arrives at midnight. Pre-scale the ML inference fleet, Redis cluster read replicas, and Kafka consumer groups 2 hours before anticipated peak. Use historical traffic curves to determine the pre-scale target.
+
+**Increase analyst capacity:** hire temporary contract analysts for the peak week, and pre-train them on the case management UI. Route only the highest-risk REVIEW cases to senior analysts; lower-risk REVIEW cases can go to temporary analysts with a simplified decision interface.
+
+**Monitor in real time:** instrument the false positive rate and fraud catch rate with 1-minute granularity dashboards. Black Friday is when you want an engineer watching the fraud dashboard live, not responding to an alert that fires 15 minutes after the system drifts.
+
+</Curveball>
+
+## Further Reading
+
+Stripe's Radar system is the canonical public reference for production ML-based fraud detection at scale — their engineering blog covers how gradient boosted trees on behavioral features dramatically outperform rule-only systems while keeping false positive rates low enough for consumer payments. PayPal's fraud engineering team has published on graph-based fraud detection using Apache Spark's GraphX library, showing how Union-Find at scale over billions of entity links identifies fraud rings invisible to per-transaction models. The foundational ML paper is "XGBoost: A Scalable Tree Boosting System" by Tianqi Chen and Carlos Guestrin (KDD 2016), which remains the go-to reference for understanding why tree boosting is so effective on tabular fraud features with extreme class imbalance. Uber's JARVIS fraud platform (covered in their engineering blog) demonstrates how a real-time feature computation system built on Flink and a purpose-built feature store keeps velocity features consistent between training and serving — the training-serving skew problem is one of the most common causes of production ML model degradation. Finally, the European Banking Authority's PSD2 regulation and its Strong Customer Authentication (SCA) technical standards are essential reading for anyone designing fraud systems that operate in Europe — SCA mandates dynamic linking (the authentication is cryptographically bound to the specific transaction amount and payee) for high-risk transactions, which forces the fraud system to make a risk classification decision before the authentication flow, not after.
+
+<RelatedQuestions items={[
+  { slug: "stripe-payment-gateway", title: "Design Stripe Payment Gateway", difficulty: "staff" },
+  { slug: "ml-inference-pipeline", title: "Design an ML Model Serving Infrastructure", difficulty: "staff" },
+  { slug: "feature-store", title: "Design a Feature Store", difficulty: "staff" },
+]} />

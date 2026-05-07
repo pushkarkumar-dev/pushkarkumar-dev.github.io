@@ -1,0 +1,653 @@
+---
+title: "Design TikTok/Reels"
+slug: "tiktok-reels"
+category: "media"
+difficulty: "senior"
+estimatedReadMinutes: 23
+tags: ["short-video", "for-you-page", "recommendation", "cdn", "transcoding", "cold-start", "two-tower"]
+companyFlavors: ["TikTok", "Instagram Reels", "YouTube Shorts", "Snapchat Spotlight"]
+prerequisites: ["youtube-design", "instagram", "cdn-design"]
+relatedQuestions: ["youtube-design", "instagram", "netflix"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design TikTok's short-form video platform: upload pipeline, the For You Page recommendation engine that drives 70% of watch time, cold-start for new creators, edge-cached pre-loading for instant playback, and content moderation at 100M videos per day."
+javaPackages:
+  - "software.amazon.awssdk:s3:2.25.0"
+  - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="tiktok-reels" title="Design TikTok/Reels" />
+
+<Tldr>
+- **Upload pipeline**: raw video → S3 → FFmpeg transcoding (9:16 aspect, 720p/1080p at 30fps, H.264) → thumbnail extraction → content moderation (ML classifier) → CDN origin push; all coordinated async via Kafka so the upload API returns immediately after the S3 write.
+- **For You Page (FYP)**: pure interest-graph — no social follow required. Two-stage pipeline: candidate retrieval (nearest-neighbor search in 128-dim user embedding space via FAISS/ScaNN, ~200 candidates) then ranking model (predicts completion rate, like probability, share probability); result materialised into a per-user Redis queue of 50 video IDs with a 5-minute TTL; the API is a cache pop, never a model inference call.
+- **Pre-loading**: client pre-fetches the next 3 video segments while the current video plays; CDN edge PoPs cache the top-1,000 videos per region in L1 DRAM (not just disk) for sub-millisecond byte-0 latency; FYP API returns pre-signed CDN URLs for all 15 videos in a single batch response so the client begins pre-fetching immediately.
+- **Cold start for new creators**: every new video enters a tiered virality funnel — distributed first to a 1K-user test cohort matched by hashtag/sound interest signals; if completion rate exceeds 50% and like rate exceeds 3%, the video expands automatically to 100K, then 1M, then global FYP; virality is earned by engagement metrics, not gated by follower count.
+- **Content moderation**: every video passes a multi-modal ML safety classifier (violence/adult/CSAM/hate speech across frames, audio, and OCR text) before status is set to active; high-confidence violations (score > 0.95) are auto-removed within 60 seconds of upload complete; borderline cases go to a human review queue with a 30-minute SLA.
+</Tldr>
+
+## The scale of the problem
+
+TikTok crossed 1 billion daily active users faster than any platform before it. At that scale, 100 million videos are uploaded every day, and at US peak hours approximately 30 million streams are happening concurrently. These numbers are not just large — they are architecturally decisive. A platform at Instagram's scale can still afford to build the feed around the social graph: users follow accounts, posts fan out to follower feeds, and ranking is a refinement on top of that socially curated candidate set. TikTok eliminated that premise entirely. The For You Page has no mandatory social component. A brand-new user with zero follows and zero followers can open the app and immediately receive a personalized feed, and a creator with zero followers can upload a video and go globally viral within 24 hours. This is not a product feature layered on top of a conventional social architecture — it is a fundamentally different system design in which the recommendation engine replaces the social graph as the primary content routing mechanism.
+
+The architectural implications are significant. Without a social graph to generate candidates, the FYP must derive every candidate from content embeddings and behavioral signals alone. This requires a two-tower recommendation model — one tower for users, one for videos — both producing 128-dimensional embedding vectors in a shared latent space, with approximate nearest-neighbor search bridging the two. The model must be retrained frequently enough to capture rapidly shifting trends (sounds, dances, challenges) without requiring a full batch retrain on every interaction. Online learning with a 4-hour batch cycle is the practical operating point.
+
+The other architectural revolution is the instant-swipe UX contract. On YouTube you click and wait for buffering. On Netflix you press play and accept a 1–2 second loading animation. On TikTok you swipe and the next video is already playing before your thumb lifts. This is not achievable with on-demand video fetching. It requires aggressive pre-loading — the client begins buffering the next 3 videos while the current one plays — combined with CDN edge PoPs that hold the top-1,000 regional videos in DRAM, not disk, so the first byte arrives in single-digit milliseconds. Every design decision in the serving stack flows from this 300ms first-frame SLA, which is only achievable because the video is already in the client buffer before the user swipes.
+
+## Clarifying questions
+
+Lock down these eight questions in the first five minutes. Each one gates a major subsystem decision.
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| What is the maximum video length? | 15 seconds to 10 minutes (the product has expanded over time) | Determines chunk size for segmented upload, CDN segment duration (HLS/DASH chunk size), and transcoding worker memory allocation |
+| Aspect ratio requirements? | 9:16 vertical only for FYP; landscape allowed for uploaded-to-profile content | Simplifies transcoding profiles — all FYP videos share a single aspect ratio, so CDN edge can store a uniform segment format |
+| FYP vs Following feed — both in scope? | Yes, both; but FYP drives 70%+ of watch time and is the primary design challenge | Following feed is a simpler chronological sorted-set problem; FYP requires the two-tower recommendation system, cold-start funnel, and pre-load cache |
+| Creator monetization in scope? | Out of scope — assume a separate Creator Fund service exists | Removes ad-insertion logic, CPM calculation, and payment reconciliation from the design space |
+| Live streaming in scope? | Out of scope — treat live as a separate product with its own WebRTC/RTMP pipeline | Live streaming has fundamentally different latency requirements (sub-2s vs sub-300ms for first frame) and cannot share the same transcoding pipeline |
+| Duet and Stitch features? | Yes — Duet records a side-by-side video referencing a source video; Stitch clips up to 5 seconds from a source video | Both require the system to store a `source_video_id` reference on the derivative video and enforce permissions (creators can disable duet/stitch per video) |
+| Geographic content restrictions? | Yes — per-region content policies apply (certain content visible in some countries, blocked in others) | CDN edge PoPs must apply geo-filtering rules per video; the FYP recommendation pipeline must exclude geo-blocked videos from candidates for users in restricted regions |
+| Comments in scope? | Yes, basic — nested replies out of scope for this interview | Adds a comments table with `video_id`, `user_id`, `body`, `created_at`; no threaded reply tree required |
+
+## Functional requirements
+
+- Users can upload videos up to 10 minutes long; uploads are chunked directly to S3 via pre-signed multipart URLs so the API servers never handle raw video bytes.
+- Every uploaded video is processed asynchronously: transcoded to multiple quality variants (360p, 540p, 720p, 1080p), thumbnail extracted at 3 representative frames, and assessed by a multi-modal content moderation classifier before the video goes live.
+- Each user receives a personalized For You Page feed that sources candidates from content embeddings — no social follows required; the FYP is the primary discovery surface.
+- Users can swipe vertically through the FYP feed with sub-300ms first-frame latency; the client pre-fetches the next 3 videos while the current video is playing.
+- Users can like, comment, share, and follow creators; all interaction events are published to Kafka and consumed by both the signal store (for recommendation model features) and the engagement counters.
+- Users can search by keyword, hashtag, sound, or creator; search returns videos, users, sounds, and hashtag pages.
+
+## Non-functional requirements
+
+- **Scale**: 1 billion DAU; 100 million videos uploaded per day; 30 million concurrent streams at US peak.
+- **First-frame latency**: p99 < 300ms for FYP videos (achievable only via pre-loading; this is not an on-demand streaming SLA).
+- **FYP availability**: 99.99% uptime — the feed must degrade gracefully to a popularity-ranked fallback if the recommendation service is unavailable.
+- **Moderation turnaround**: high-confidence violations removed within 60 seconds of upload-complete; human review queue drained within 30 minutes for borderline cases.
+- **Recommendation freshness**: user and video embeddings refreshed every 4 hours; trending signals (viral sounds, hashtags) propagated to FYP candidates within 15 minutes.
+- **Durability**: 11 nines for video stored in S3; video metadata replicated across at least 3 availability zones in each region.
+
+<Capacity title="TikTok Capacity Estimates">
+**Upload throughput**
+
+$$\frac{100\text{M videos/day}}{86{,}400\text{ s/day}} \approx 1{,}157 \text{ uploads/s}$$
+
+At 3× peak factor: $\approx 3{,}500$ uploads/s hitting the transcoding pipeline simultaneously.
+
+**Storage growth**
+
+Raw video average size is 50 MB. Transcoded to 5 quality variants averages 15 MB each.
+
+$$50\text{ MB} \times 100\text{M} \times 365 = 1.83 \text{ EB/year (raw)}$$
+
+$$15\text{ MB} \times 5 \times 100\text{M} \times 365 = 27.4 \text{ PB/year (transcoded variants)}$$
+
+Raw video can be deleted 30 days after transcoding is confirmed, keeping the live storage footprint closer to the transcoded figure plus a 30-day raw buffer (~150 PB raw backlog).
+
+**Concurrent streams and CDN egress**
+
+$$1\text{B DAU} \times \frac{45\text{ min/day}}{1{,}440\text{ min/day}} \approx 31\text{M concurrent streams}$$
+
+At 2 Mbps average bitrate:
+
+$$31\text{M} \times 2\text{ Mbps} = 62 \text{ Tbps CDN egress}$$
+
+This is a fleet-scale CDN problem — no single provider can deliver this from a single region.
+
+**Pre-load buffer in flight**
+
+Client pre-fetches 3 videos at ~10 MB each = 30 MB per concurrent user.
+
+$$31\text{M} \times 30\text{ MB} = 930 \text{ TB in-flight across CDN edge at any moment}$$
+
+**Recommendation compute**
+
+1B users refreshing their FYP queue every 5 swipes, with an average of 200 swipes/day per active user:
+
+$$\frac{1\text{B} \times 200}{5} = 40\text{B ranking inferences/day} \approx 463\text{K inferences/s}$$
+
+At a p99 latency budget of 50ms per batch of 200 candidates, this requires a GPU inference cluster operating at sustained high utilisation. Batching and model quantisation (INT8) are mandatory — FP32 inference at this QPS would require an impractically large cluster.
+</Capacity>
+
+## API design
+
+**Video upload — two-phase**
+
+```http
+POST /api/v1/upload/initiate
+Body: { filename, file_size_bytes, content_type }
+Response: {
+  upload_id: "ulp_abc123",
+  s3_presigned_parts: [{ part_number, presigned_url }],
+  chunk_size_bytes: 10485760
+}
+```
+
+```http
+POST /api/v1/upload/complete
+Body: {
+  upload_id: "ulp_abc123",
+  title: "My dance video",
+  description: "...",
+  hashtags: ["#fyp", "#dance"],
+  sound_id: "snd_789",
+  allow_duet: true,
+  allow_stitch: true
+}
+Response: { video_id: "vid_xyz", status: "processing" }
+```
+
+The client uploads all parts directly to S3 using the pre-signed URLs, then calls `/complete` which triggers the async processing pipeline via Kafka. The API never touches raw video bytes.
+
+**FYP feed — batch delivery with pre-signed CDN URLs**
+
+```http
+GET /api/v1/feed/fyp?session_id={id}&cursor={opaque_cursor}&count=15
+Response: {
+  videos: [
+    {
+      video_id: "vid_xyz",
+      creator: { id, username, avatar_url, verified },
+      cdn_urls: { "360p": "https://cdn...", "720p": "https://cdn...", "1080p": "https://cdn..." },
+      thumbnail_url: "https://cdn.../thumb.jpg",
+      duration_ms: 34500,
+      like_count: 142300,
+      comment_count: 891,
+      share_count: 4200,
+      sound: { id, title, artist },
+      hashtags: ["#dance", "#fyp"],
+      allow_duet: true,
+      allow_stitch: false
+    }
+  ],
+  next_cursor: "eyJ...",
+  prefetch_priority: [0, 1, 2]
+}
+```
+
+The `prefetch_priority` array tells the client which indices to buffer first. All CDN URLs are HMAC-SHA256-signed with a 1-hour TTL so they cannot be hot-linked. The batch of 15 videos arrives in a single response; the client starts pre-fetching indices 1, 2, and 3 immediately.
+
+**Following feed**
+
+```http
+GET /api/v1/feed/following?cursor={cursor}&count=20
+```
+
+Simple chronological sorted-set query — much simpler than FYP; not the interesting design problem.
+
+**Interaction events**
+
+```http
+POST /api/v1/videos/{video_id}/interaction
+Body: {
+  type: "complete" | "like" | "share" | "comment" | "skip",
+  watch_duration_ms: 28400,
+  position_ms: 28400
+}
+Response: 200 OK
+```
+
+Fire-and-forget for the client. The server publishes to Kafka `video-interactions` and returns immediately. Completion signals (watch_duration_ms / video duration > 0.8) are the highest-weight signal in the ranking model.
+
+**Search**
+
+```http
+GET /api/v1/search?q={query}&type={video|user|sound|hashtag}&cursor={cursor}
+```
+
+## Data model
+
+**videos table — Cassandra, partition key = video_id**
+
+```sql
+CREATE TABLE videos (
+  video_id        bigint,        -- Snowflake ID
+  creator_id      bigint,
+  title           text,
+  description     text,
+  hashtag_ids     list<bigint>,
+  sound_id        bigint,
+  duration_ms     int,
+  status          text,          -- processing | active | under_review | removed
+  s3_keys         map<text, text>,  -- quality -> s3_key e.g. "720p" -> "videos/2025/vid_xyz_720p.m3u8"
+  thumbnail_keys  list<text>,    -- 3 frames
+  view_count      counter,
+  like_count      counter,
+  share_count     counter,
+  geo_restrictions list<text>,   -- ISO country codes where video is blocked
+  allow_duet      boolean,
+  allow_stitch    boolean,
+  source_video_id bigint,        -- set for Duet/Stitch derivatives
+  created_at      timestamp,
+  PRIMARY KEY (video_id)
+);
+```
+
+Cassandra is chosen for videos because the access pattern is almost entirely point reads by `video_id` — the FYP service resolves a batch of video IDs from the cache into metadata, not a range scan. Counter columns handle high-frequency view/like increments without read-before-write.
+
+**video_interactions — Kafka to data warehouse**
+
+Events published as Avro-serialised records on the `video-interactions` topic:
+
+```json
+{
+  "user_id": 98765,
+  "video_id": 12345,
+  "interaction_type": "complete",
+  "watch_duration_ms": 28400,
+  "video_duration_ms": 34500,
+  "timestamp": "2025-01-15T14:23:11Z",
+  "session_id": "sess_abc",
+  "device_type": "ios",
+  "region": "US-WEST"
+}
+```
+
+Kafka consumers: (1) real-time engagement counter updater (increments Cassandra counters), (2) Flink streaming job that maintains rolling 1-hour engagement rate per video (used for the virality funnel), (3) hourly Spark batch job that materialises training features for the ranking model.
+
+**user_embeddings and video_embeddings — Redis + model store**
+
+```text
+Redis key: emb:user:{user_id}  →  128-dim float32 vector (binary encoded, 512 bytes)
+Redis key: emb:video:{video_id}  →  128-dim float32 vector
+TTL: 4 hours (refreshed by embedding update job on each cycle)
+```
+
+The full embedding index (all active videos, all users) lives in an FAISS flat-IP index on GPU-attached inference nodes. Redis holds individual vectors for fast lookup and cache invalidation. When a user's embedding is refreshed, the old Redis key is deleted and the FAISS index is incrementally updated.
+
+**fyp_cache — Redis, per-user queue**
+
+```text
+Redis key: fyp:{user_id}  →  Redis List of video_id strings
+LRANGE fyp:{user_id} 0 14   →  next 15 video IDs for API response
+LTRIM fyp:{user_id} 15 -1   →  consume those 15 IDs
+EXPIRE fyp:{user_id} 300    →  5-minute TTL; stale queue refreshed proactively
+```
+
+The queue holds up to 50 video IDs. When the length drops below 10, the FYP cache service publishes a `fyp-refresh-needed` event to Kafka, which triggers the recommendation service to generate a new batch of 50 ranked video IDs and call `replenishFyp`.
+
+**cdn_popularity — Redis Sorted Set, per region**
+
+```text
+Redis key: cdn:popular:{region}:{hour_epoch}
+ZADD cdn:popular:US-WEST:1736953200 142300 "vid_xyz"
+ZREVRANGE cdn:popular:US-WEST:1736953200 0 999  →  top-1000 video IDs by view count
+TTL: 2 hours
+```
+
+Every 15 minutes, the popularity service reads the top-1,000 per region and issues cache pre-warm commands to CDN edge PoPs so those video segments are pinned in DRAM.
+
+## System architecture flows
+
+<Mermaid diagram={`flowchart TD
+  subgraph Upload["Upload Pipeline"]
+    C[Creator App] -->|multipart upload| S3R[S3 Raw Bucket]
+    C -->|POST /upload/complete| API[Upload API]
+    API -->|publish video-uploaded| KU[Kafka: video-uploaded]
+    KU --> TW[Transcoding Worker\nFFmpeg 9:16 5-quality HLS]
+    KU --> MOD[Moderation Worker\nMulti-modal ML]
+    TW -->|HLS segments| S3T[S3 Transcoded Bucket]
+    S3T -->|origin push| CDN[CDN Edge PoPs]
+    TW -->|video ready| KR[Kafka: video-ready]
+    MOD -->|score lt 0.7| ACT[Set status=active\nCassandra]
+    MOD -->|score 0.7-0.95| HQ[Human Review Queue]
+    MOD -->|score gt 0.95| RM[Auto-remove\nstatus=removed]
+    ACT --> POP[Update cdn:popular ZSET\nRedis]
+    ACT --> CF[Cold-start Cohort\nFunnel Service]
+  end
+
+  subgraph FYP["FYP Serving"]
+    U[User App] -->|swipe| FAPI[FYP API]
+    FAPI -->|LRANGE fyp:userId| RC[Redis fyp cache]
+    RC -->|gt 10 remaining| URL[Resolve pre-signed CDN URLs]
+    RC -->|lt 10 remaining| KF[Kafka: fyp-refresh-needed]
+    KF --> RS[Recommendation Service]
+    RS -->|lookup emb:user:userId| RE[Redis Embeddings]
+    RE -->|128-dim vector| FAISS[FAISS ANN Search\n200 candidates]
+    FAISS --> RANK[Ranking Model\nDNN GPU inference]
+    RANK -->|RPUSH 50 video IDs| RC
+    URL --> META[Batch fetch metadata\nCassandra]
+    META --> FAPI
+    FAPI -->|15 videos + CDN URLs| U
+    U -->|pre-fetch segments 1-3| CDN2[CDN Edge PoPs\ntop-1000 in DRAM]
+  end`} />
+
+## Deep dives
+
+### For You Page recommendation engine
+
+The FYP is the engineering core of TikTok. Understanding why it works requires understanding the failure modes it was designed to avoid.
+
+A follower-graph feed fails the cold-start test at both ends: a new user with no follows has no candidates, and a new creator with no followers gets no distribution. A purely chronological feed fails the engagement test: recency and quality are uncorrelated, and burying high-quality videos under a flood of mediocre new uploads destroys session time. Collaborative filtering in the Netflix/YouTube mould (users who watched what you watched also watched X) works well but is slow to adapt to fast-breaking trends and requires a history of interactions before it personalises.
+
+TikTok's FYP uses a two-tower architecture — the same broad class of model described in Google's "Deep Neural Networks for YouTube Recommendations" (2016), but adapted for the zero-follow case. The user tower produces a 128-dimensional embedding vector from the user's watch history: which videos were watched to completion, which were skipped in the first 3 seconds, which sounds and hashtags appeared in watched videos, device type, time-of-day patterns, and geographic region. The video tower produces a 128-dimensional embedding from content features: visual encoder output (sampled frames through a ResNet), audio encoder output (spectrogram features), text features (title, description, hashtag embeddings), and aggregate engagement statistics from the cold-start funnel (completion rate, like rate, share rate).
+
+Both towers are trained jointly on the same dataset — the billions of (user, video, interaction) triples accumulated from the interaction Kafka stream — using a contrastive learning objective that pulls watched-to-completion pairs together in the embedding space and pushes skipped pairs apart.
+
+**Stage 1 — Candidate generation (ANN retrieval)**
+
+At recommendation time, the user's current 128-dim embedding vector is looked up from Redis (`emb:user:{userId}`) and submitted to a FAISS flat-IP index (inner-product similarity, equivalent to cosine similarity on unit-normalised vectors). The index returns the top 200 nearest video IDs. Three additional candidate sources are merged in:
+
+- Trending in user's ISO country and language (top-50 from `cdn:popular:{region}:{hour}`)
+- Videos sharing hashtags with the user's top-5 most watched hashtags (inverted index lookup, top-30)
+- Videos using sounds the user has previously engaged with (top-20 from sound engagement history)
+
+Total candidate pool after deduplication: approximately 270 videos.
+
+**Stage 2 — Ranking model (DNN inference)**
+
+A 6-layer DNN scores each of the 270 candidates against the user context. Input features per (user, video) pair:
+
+- User embedding (128 dims)
+- Video embedding (128 dims)
+- Predicted completion rate (the single highest-weight feature — did users like this user finish this video?)
+- Predicted like probability
+- Predicted share probability
+- Recency score (exponential decay with half-life of 48 hours — balances freshness vs. engagement quality)
+- Creator quality score (rolling 30-day like rate / impression rate for the creator)
+- Diversity penalty (continuous penalty applied if the same creator or sound appears more than twice in the output list)
+- Geographic relevance (videos in user's language and region scored higher)
+
+The ranking model outputs a score per candidate. The top 50 are written to `fyp:{userId}` in Redis via RPUSH. The API pops the next 15 via LRANGE + LTRIM on each FYP request.
+
+**Model updates**
+
+The embedding models and ranking DNN are retrained on a 4-hour batch cycle using Spark feature pipelines and distributed GPU training (PyTorch, data-parallel across 64–128 GPUs). The FAISS index is rebuilt from the new embeddings after each training cycle and hot-swapped without downtime using a blue-green index deployment. Online serving uses the previous cycle's index while the new one is being built.
+
+Trending signal freshness is a separate concern. A Flink streaming job maintains a 1-hour rolling view count per video per region, updated every minute. This feeds the `cdn:popular` sorted sets and ensures a video that goes viral at noon is in the trending candidate pool by 12:15pm — not waiting for the 4-hour model retrain.
+
+### Cold start for new videos
+
+Every new video enters the virality funnel immediately after the moderation classifier returns a score below 0.7 (safe to serve). The cold-start service does not wait for the video to accumulate organic views — it actively routes the video to a test cohort.
+
+**Phase 1 — Interest-matched micro-cohort (1,000 users)**
+
+The video's hashtags and sound ID are used to identify 1,000 active users whose recent watch history shows affinity for those signals. These users are not random — they are users most likely to engage with this content category, which gives the video its best chance of clearing the engagement thresholds. The FYP cache service injects the new video into the cohort users' fyp queues directly (bypassing the ANN retrieval stage — this is a cold-start override, not a ranked recommendation).
+
+**Measurement window**: 30 minutes of exposure. Metrics tracked via the Flink streaming job:
+- Completion rate (watch_duration_ms / duration_ms > 0.8 on average): target > 50%
+- Like rate (likes / impressions): target > 3%
+- Share rate (shares / impressions): target > 0.5%
+
+**Phase 2 — Expanded cohort (100,000 users)**
+
+If Phase 1 metrics clear thresholds, the video is injected into a 100K-user cohort sampled from the broader interest category (not just the most-affine users). Measurement window: 2 hours. If metrics hold, proceed to Phase 3.
+
+**Phase 3 — Regional FYP (1M users), then global FYP**
+
+Videos that clear Phase 2 are added to the ANN retrieval index normally and begin appearing in organic FYP recommendations. Videos that clear Phase 3 (1M users) are marked as trending candidates and elevated in the ranking model's recency score.
+
+**Time to viral**: a video with exceptional engagement (>70% completion rate in Phase 1) can reach global FYP in 4–6 hours from upload. An average high-quality video clears all phases in 12–24 hours. Videos that fail Phase 1 are still accessible via the creator's profile page and search but are not actively distributed via FYP.
+
+This architecture eliminates the "cold-start creator problem" as a platform-level concern. A creator's first video competes on the same engagement signals as a creator with 10 million followers. Follower count is not an input to the FYP ranking model — it exists only as a feature proxy for the creator quality score, and even that is computed on a rolling 30-day basis, not a lifetime basis.
+
+### Instant playback: pre-loading and CDN strategy
+
+The TikTok UX contract is binary: the next video plays before your thumb lifts off the screen. There is no loading spinner, no buffering animation, no latency. Delivering on this contract is a systems engineering challenge that spans the client, the CDN, the FYP API, and the Redis cache. Each layer must be designed with the others in mind.
+
+**Layer 1 — FYP API batch response**
+
+The FYP API does not return one video at a time. It returns 15 videos in a single response, each with pre-signed CDN URLs for all quality variants. The batch response is the first enabler of pre-loading — the client has the CDN URLs for videos 2 through 15 the moment it receives the response for video 1.
+
+**Layer 2 — Client pre-fetch strategy**
+
+The client maintains a pre-fetch buffer of 3 videos. While video N is playing, the client fetches the first HLS segment (typically 2 seconds of video at the selected quality) of videos N+1, N+2, and N+3. As video N approaches completion, the client fetches additional segments of video N+1. By the time the user swipes, video N+1 has at least 4–6 seconds buffered — more than enough to cover the time for the next HLS segment fetch.
+
+Quality selection: the client uses a bandwidth estimator (EWMA of recent segment fetch times) to select the appropriate quality tier. On a strong WiFi connection, 1080p HLS is selected. On a weak LTE connection, 540p. The pre-fetch always uses the estimated quality tier to avoid buffering a 1080p segment that will be abandoned.
+
+**Layer 3 — CDN edge DRAM cache**
+
+For the top-1,000 videos per region, CDN edge PoPs maintain the HLS segment files in L1 DRAM — not SSD, not spinning disk. This is the key to the sub-millisecond byte-0 latency that makes pre-fetching viable at scale. An HLS segment arriving from disk would add 5–20ms of I/O latency per segment; from DRAM it arrives in under 1ms.
+
+The popularity service runs every 15 minutes and sends cache pre-warm commands to all edge PoPs for the current top-1,000 per region. Pre-warming pushes the video segments into DRAM proactively, so the cache is hot before users request them. For videos ranked 1,001 through 10,000, CDN SSD cache (typical CDN tier) is used — still fast, but with higher first-byte latency that makes pre-loading the client-side buffer even more critical.
+
+**Layer 4 — Redis FYP queue pre-replenishment**
+
+The `fyp:{userId}` Redis list is replenished before it is exhausted. When the length drops below 10 (rather than 0), the `fyp-refresh-needed` Kafka event fires. This gives the recommendation service a window of ~3–5 swipes (15–25 seconds at average watch time) to complete the ANN retrieval and ranking inference and refill the queue before the user reaches the end. If the queue is exhausted before replenishment completes (race condition), the API falls back to a regional popularity ranked list — users see trending videos rather than a personalised feed for those 1–2 videos, and no error or spinner is shown.
+
+### Content moderation pipeline
+
+At 100 million uploads per day, no human-review-only moderation strategy is viable. The moderation pipeline is fully automated for high-confidence cases, with human review reserved for borderline scores.
+
+**Multi-modal ML classifier**
+
+The classifier runs in parallel with the transcoding worker, triggered by the same `video-uploaded` Kafka event. It operates in four passes:
+
+1. **Frame sampling**: extract one frame per second for videos up to 60 seconds; one frame per 5 seconds for longer videos. This gives 15–60 frame samples per video.
+2. **Image classifier (ResNet-101 fine-tuned)**: runs on each sampled frame and produces per-frame scores for: violence (graphic injury, weapons), adult content (nudity, sexual content), CSAM (child safety — highest priority), and hate speech symbols (Nazi imagery, extremist iconography). Frame-level scores are aggregated via max-pooling (any single frame at high confidence triggers the category).
+3. **Audio classifier**: processes the full audio track via a spectrogram-based CNN. Detects hate speech (slurs, extremist rhetoric transcribed via speech-to-text then classified), and flags audio against a copyrighted sound database (fingerprint matching against ContentID-equivalent database).
+4. **OCR + NLP on text overlays**: Tesseract OCR extracts text from video frames; a BERT-based classifier scores the text for policy violations. Description and title text is classified by the same NLP model.
+
+The final moderation score is the max across all classifiers (worst-case signal wins). The pipeline runs end-to-end in under 60 seconds for a 60-second video on a GPU worker.
+
+**Score thresholds and actions**
+
+| Score Range | Action | SLA |
+|---|---|---|
+| > 0.95 | Automatic takedown — status = removed; video never served | < 60 seconds from upload-complete |
+| 0.70 – 0.95 | status = under_review; queued for human moderator | Human review SLA: 30 minutes |
+| < 0.70 | status = active; enters cold-start funnel | Immediate |
+
+**Human review queue**
+
+Borderline videos are surfaced to human moderators with the frame evidence highlighted: the worst-scoring frame, the audio transcript segment, and the OCR text with the highest violation score. Moderators make a binary decision (approve/remove). A feedback loop retrains the ML classifier monthly on human decisions — approved videos that scored 0.70–0.75 become negative training examples; removed videos that scored 0.75–0.85 become positive examples.
+
+**Repeat violator handling**
+
+A creator who receives three confirmed moderation removals within 30 days enters the shadowban state: their videos are still uploaded and accessible via direct link, but they are excluded from FYP candidate generation and trending candidate lists. Account strikes beyond five result in suspension. This logic lives in the Creator Risk Service and is evaluated on every `video-ready` event.
+
+## Java integration
+
+### Part A — FypCacheService.java
+
+```java
+package com.tiktok.fyp.service;
+
+import io.lettuce.core.api.sync.RedisCommands;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.springframework.stereotype.Service;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+public class FypCacheService {
+
+    private static final int QUEUE_CAPACITY    = 50;
+    private static final int REFRESH_THRESHOLD = 10;
+    private static final int QUEUE_TTL_SECONDS = 300;
+    private static final int URL_TTL_SECONDS   = 3600;
+    private static final String CDN_BASE       = "https://cdn.tiktokv.com";
+    private static final String CDN_SECRET     = System.getenv("CDN_HMAC_SECRET");
+
+    private final RedisCommands<String, String> redis;
+    private final KafkaProducer<String, String> kafka;
+
+    public FypCacheService(RedisCommands<String, String> redis,
+                           KafkaProducer<String, String> kafka) {
+        this.redis = redis;
+        this.kafka = kafka;
+    }
+
+    public List<String> getNextVideos(String userId, int count) {
+        String key = "fyp:" + userId;
+        List<String> videoIds = redis.lrange(key, 0, count - 1);
+        if (!videoIds.isEmpty()) {
+            redis.ltrim(key, videoIds.size(), -1);
+        }
+        long remaining = redis.llen(key);
+        if (remaining < REFRESH_THRESHOLD) {
+            kafka.send(new ProducerRecord<>("fyp-refresh-needed", userId, userId));
+        }
+        return videoIds;
+    }
+
+    public void replenishFyp(String userId, List<String> rankedVideoIds) {
+        String key = "fyp:" + userId;
+        String[] ids = rankedVideoIds.toArray(new String[0]);
+        redis.rpush(key, ids);
+        redis.ltrim(key, -QUEUE_CAPACITY, -1);
+        redis.expire(key, QUEUE_TTL_SECONDS);
+    }
+
+    public List<String> resolvePresignedUrls(List<String> videoIds, String quality) {
+        long expiry = (System.currentTimeMillis() / 1000) + URL_TTL_SECONDS;
+        return videoIds.stream()
+                .map(id -> signUrl(CDN_BASE + "/videos/" + id + "/" + quality + "/index.m3u8", expiry))
+                .collect(Collectors.toList());
+    }
+
+    private String signUrl(String path, long expiry) {
+        String toSign = path + "?expires=" + expiry;
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(CDN_SECRET.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            String sig = Base64.getUrlEncoder().withoutPadding()
+                    .encodeToString(mac.doFinal(toSign.getBytes(StandardCharsets.UTF_8)));
+            return toSign + "&sig=" + sig;
+        } catch (Exception e) {
+            throw new RuntimeException("URL signing failed", e);
+        }
+    }
+}
+```
+
+### Part B — FeedController.java
+
+```java
+package com.tiktok.fyp.controller;
+
+import com.tiktok.fyp.service.FypCacheService;
+import com.tiktok.fyp.service.RecommendationService;
+import com.tiktok.fyp.repository.VideoRepository;
+import com.tiktok.fyp.model.FypResponse;
+import com.tiktok.fyp.model.VideoCard;
+import com.tiktok.fyp.model.InteractionEvent;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/v1")
+public class FeedController {
+
+    private static final int FYP_BATCH_SIZE    = 15;
+    private static final int COLD_START_FLOOR  = 5;
+
+    private final FypCacheService        fypCache;
+    private final RecommendationService  recommendationService;
+    private final VideoRepository        videoRepository;
+    private final KafkaProducer<String, String> kafka;
+
+    public FeedController(FypCacheService fypCache,
+                          RecommendationService recommendationService,
+                          VideoRepository videoRepository,
+                          KafkaProducer<String, String> kafka) {
+        this.fypCache             = fypCache;
+        this.recommendationService = recommendationService;
+        this.videoRepository      = videoRepository;
+        this.kafka                = kafka;
+    }
+
+    @GetMapping("/feed/fyp")
+    public ResponseEntity<FypResponse> getFyp(@AuthenticationPrincipal String userId,
+                                              @RequestParam String quality) {
+        List<String> videoIds = fypCache.getNextVideos(userId, FYP_BATCH_SIZE);
+        if (videoIds.size() < COLD_START_FLOOR) {
+            List<String> freshIds = recommendationService.generateFyp(userId);
+            fypCache.replenishFyp(userId, freshIds);
+            videoIds = fypCache.getNextVideos(userId, FYP_BATCH_SIZE);
+        }
+        List<String> signedUrls  = fypCache.resolvePresignedUrls(videoIds, quality);
+        List<VideoCard> cards    = videoRepository.fetchBatch(videoIds, signedUrls);
+        return ResponseEntity.ok(new FypResponse(cards, buildCursor(videoIds)));
+    }
+
+    @PostMapping("/videos/{videoId}/interaction")
+    public ResponseEntity<Void> recordInteraction(@AuthenticationPrincipal String userId,
+                                                  @PathVariable String videoId,
+                                                  @RequestBody InteractionEvent event) {
+        event.setUserId(userId);
+        event.setVideoId(videoId);
+        kafka.send(new ProducerRecord<>("video-interactions", videoId, event.toJson()));
+        return ResponseEntity.ok().build();
+    }
+
+    private String buildCursor(List<String> videoIds) {
+        return java.util.Base64.getUrlEncoder().encodeToString(
+                String.join(",", videoIds).getBytes());
+    }
+}
+```
+
+<TradeoffTable
+  headers={["Approach", "Recommendation Quality", "Cold Start", "Serving Latency", "Compute Cost"]}
+  rows={[
+    ["Chronological follow-graph feed", "Low — no personalisation; buries quality under recency", "New users get empty feed; new creators get zero distribution", "Low — Redis sorted-set range query, O(log N)", "Very low — no model inference"],
+    ["Collaborative filtering (YouTube-style)", "High for established users — learns from watch history", "Poor for new users and new videos — needs interaction history", "Medium — inference on request path adds 50–200ms without caching", "High — matrix factorisation at 1B-user scale requires large CPU cluster"],
+    ["Pure content-based (hashtag/audio matching)", "Medium — captures category preference but ignores quality signals", "Excellent — content features available immediately at upload", "Low — inverted index lookup, no model inference", "Low — inverted index is cheap; no embedding model"],
+    ["TikTok FYP (two-tower + cold-start funnel + pre-loaded CDN)", "Highest — combines content, behaviour, and quality signals; adapts within hours", "Solved at platform level — cold-start funnel gives every video a test cohort regardless of follower count", "Lowest perceived latency — video pre-loaded in client buffer before user swipes", "Highest — GPU cluster for embedding updates + ANN index + ranking model; justified by 70%+ of watch time driven by FYP"]
+  ]}
+/>
+
+<Pitfall>
+**Running recommendation inference synchronously on the FYP API request path.**
+
+The DNN ranking model takes 50–200ms per inference call even on GPU, and the ANN retrieval adds another 20–50ms. If the FYP API triggers model inference on every request, p99 feed latency immediately exceeds 300ms — before accounting for metadata fetching, URL signing, or network round-trip. The FYP API must be a Redis cache read, not a model inference call. The recommendation service runs asynchronously, triggered by the `fyp-refresh-needed` Kafka event before the queue is exhausted. The API's hot path is: LRANGE Redis → resolve CDN URLs → batch Cassandra fetch → return. No ML on the critical path.
+</Pitfall>
+
+<Pitfall>
+**Sequential video delivery — requesting each video only after the previous one ends.**
+
+If the client makes a CDN request for video N+1 at the moment video N completes, the user experiences the full round-trip latency of the CDN request (even for a DRAM-cached segment this is 10–40ms network latency to the edge PoP) plus the HLS manifest fetch plus enough segment buffering to start playback. On mobile networks this realistically means 200–800ms of visible loading between every swipe — exactly the experience that TikTok is engineered to eliminate. Pre-loading 3 videos ahead in the client buffer is not an optimisation — it is the fundamental mechanism that makes the instant-swipe UX contract achievable. Any design that skips pre-loading cannot meet the 300ms first-frame SLA for sequential swipes.
+</Pitfall>
+
+<Curveball>
+**A dance challenge goes viral — 10 million users create videos using the same sound in 24 hours. How does your transcoding pipeline, CDN, and recommendation engine handle the sudden spike in correlated content?**
+
+The transcoding pipeline is the first bottleneck. Ten million uploads in 24 hours is 116 uploads/second — roughly 10% of the baseline rate, but all sharing a single sound ID. The transcoding worker pool scales horizontally via Kubernetes HPA triggered by the Kafka `video-uploaded` consumer lag metric; the sound-correlated spike is treated identically to any other volume spike. The CDN problem is more interesting: 10 million videos sharing the same sound means the same audio track appears across millions of content files — there is no segment reuse benefit because each video has a unique combined audio/video track. CDN capacity pressure is identical to any other upload spike. The recommendation engine faces the most novel challenge: the cold-start funnel runs for all 10 million videos simultaneously, each competing for test-cohort slots in the interest category for that sound. The funnel service must apply diversity constraints — a user should not receive 15 consecutive challenge videos in their test-cohort exposure. A per-sound rate limiter in the FYP cache service caps challenge-video injection at 3 videos per 15-video FYP batch. Separately, the sound ID becomes a trending signal within 15 minutes via the Flink rolling-window job, elevating challenge videos in the trending candidate pool. The net effect: the challenge goes viral at the platform level, but individual users are not flooded — the diversity penalty in the ranking model ensures they see 2–3 challenge videos per session, not 15.
+</Curveball>
+
+<Curveball>
+**A coordinated campaign uploads 500,000 videos with subtle policy violations that your ML classifier misses (score less than 0.7). They accumulate millions of views before human review catches them. How do you retroactively remove them and prevent recurrence?**
+
+Retroactive removal is a two-phase operation. Phase 1 (immediate): once the pattern is identified, the Trust and Safety team creates a classifier rule update — a new hash signature, a frame pattern, or a keyword cluster that characterises the campaign. The rule update is hot-deployed to the moderation classifier without a full retrain, and a batch job re-scores all videos from the suspected account cluster (correlated by creator_id, device fingerprint, IP range, and sound_id). Videos that now score above 0.7 under the updated rule are queued for human review; those above 0.95 are auto-removed. Phase 2 (CDN purge): for each removed video, a CDN cache invalidation command is issued via the CDN provider's tag-based purge API (videos tagged with `video_id` at upload time). Purge propagates to all edge PoPs within 60 seconds. To prevent recurrence, the campaign's behavioural pattern — coordinated upload timing, shared sound IDs, similar frame composition — is encoded as adversarial training examples added to the next monthly classifier retrain. Additionally, accounts involved in the campaign are flagged for elevated moderation scrutiny (all future uploads pre-scored by a stricter threshold of 0.5 rather than 0.7 before going live).
+</Curveball>
+
+<Curveball>
+**TikTok wants to add a Creator Mode where creators can see real-time analytics — live view count, completion rate by minute mark, geographic distribution — within 10 seconds of a video going live. Design the real-time analytics pipeline.**
+
+The interaction event stream already exists on the `video-interactions` Kafka topic. The real-time analytics pipeline taps into this stream with a dedicated Flink application. The Flink job maintains per-video aggregations in keyed state partitioned by `video_id`: a running view count (increment on every interaction event of any type), a completion-rate histogram bucketed by `position_ms / duration_ms` (allows the "completion rate by minute mark" breakdown), and a view-count-by-region counter map updated from the `region` field on each event. The Flink job emits aggregated snapshots every 5 seconds per video. These snapshots are written to a Redis Hash per video — `analytics:{video_id}` with fields `view_count`, `completion_histogram_json`, `region_counts_json` — with a 30-minute TTL (analytics are most valuable immediately after posting). The Creator Analytics API reads from this Redis Hash and returns the current snapshot. End-to-end latency from a user interaction to a creator seeing the updated metric: Kafka publish latency (~5ms) + Flink window flush (5s) + Redis write + Creator API read = approximately 5–7 seconds from interaction to dashboard update, within the 10-second SLA. For geographic distribution visualisation, the `region` field in the interaction event maps to a country code via a GeoIP lookup performed at the interaction API server before Kafka publish — the lookup is cached in a local LRU cache on each API instance so it adds negligible latency.
+</Curveball>
+
+## Further reading
+
+- **Covington P., Adams J., Sargin E.** — "Deep Neural Networks for YouTube Recommendations." RecSys 2016. The foundational paper for the two-tower candidate generation + ranking architecture that TikTok's FYP is derived from. Required reading before any senior-level recommendation system interview.
+- **TikTok Engineering Blog** — "Monolith: Real Time Recommendation System With Collisionless Embedding Table." 2022. TikTok's own description of how they handle embedding updates in a system with billions of users and billions of items without hash collisions degrading model quality. The collisionless embedding table is the key to fresh embeddings without a full retrain.
+- **Zhan R. et al.** — "Towards Content Provider Aware Recommender Systems." WWW 2021. Academic treatment of creator equity in recommendation — why optimising purely for engagement leads to recommendation concentration on a small fraction of creators, and how to design diversity constraints that keep the creator ecosystem healthy without sacrificing user engagement.
+
+<RelatedQuestions items={[
+  { slug: "youtube-design", title: "Design YouTube", difficulty: "staff" },
+  { slug: "instagram", title: "Design Instagram", difficulty: "senior" },
+  { slug: "netflix", title: "Design Netflix", difficulty: "staff" },
+]} />

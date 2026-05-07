@@ -1,0 +1,509 @@
+---
+title: "Design a Multi-channel Notification System"
+slug: "notification-system"
+category: "foundations"
+difficulty: "senior"
+estimatedReadMinutes: 21
+tags: ["kafka", "push-notifications", "fanout", "deduplication", "exactly-once", "fcm", "apns", "email"]
+companyFlavors: ["Meta", "Twitter/X", "LinkedIn", "Airbnb", "Uber"]
+prerequisites: []
+relatedQuestions: ["twitter-timeline", "distributed-rate-limiter", "web-crawler"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Design a notification platform that routes events to push (FCM/APNs), email (SendGrid), and SMS (Twilio) channels — covering fanout strategies, exactly-once delivery semantics, user preference management, and rate limiting per channel."
+javaPackages: ["org.springframework.kafka:spring-kafka:3.2.0", "org.springframework.boot:spring-boot-starter:3.3.0", "com.sendgrid:sendgrid-java:4.10.2", "redis.clients:jedis:5.1.3"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="notification-system" title="Design a Multi-channel Notification System" />
+
+<Tldr>
+- **Decouple event generation from delivery**: producers write to Kafka, channel workers (email, push, SMS) consume independently — allows retries per channel without re-processing the upstream event
+- **Exactly-once is a lie** — aim for at-least-once delivery + idempotency key on each notification (UUID stored in Redis with 24h TTL) to deduplicate on receipt
+- **Fanout-on-write for push** (few subscribers per event is fine); **fanout-on-read for email** (pull from user prefs at send time to get the freshest opt-out status)
+- **Rate limiting per user per channel**: max 1 marketing email/day, max 10 push/hour — enforced via Redis sliding window counter before queuing, not at delivery time
+- **Channel priority**: push first (cheapest, fastest), fallback to email if device token is invalid, skip SMS unless explicitly opted in
+</Tldr>
+
+## Why notification systems are hard
+
+Notification systems look deceptively simple: receive an event, send a message. The complexity reveals itself as soon as you trace the full journey from trigger to delivery. You are simultaneously managing **channel diversity** — push via FCM/APNs, email via SendGrid/SES, SMS via Twilio, in-app over WebSockets, webhooks over HTTPS — each with its own authentication scheme, payload format, rate limits, and failure modes. A device that is offline drops a push silently. An email that hits a spam filter is not a delivery failure from SendGrid's perspective. An SMS delivered to a ported number might reach the wrong person. Every channel has a different definition of "delivered."
+
+The semantics problem is equally brutal. Distributed systems give you at-most-once or at-least-once — never exactly-once — without additional coordination. For notifications, at-most-once means missed alerts for a password reset or a fraud warning. At-least-once means a user receives the same "Your order is confirmed" push notification three times and uninstalls your app. The practical answer is at-least-once delivery with idempotent deduplication at the consumer, but building that correctly across Kafka consumer groups, Redis, and three external provider APIs simultaneously is non-trivial.
+
+User preference management adds a third dimension of difficulty. A user who opts out of marketing emails at 2:47 PM must not receive a marketing email at 2:48 PM that was already enqueued at 2:46 PM. Quiet hours for a user in Tokyo mean you need to respect their local timezone when evaluating a "do not disturb 10 PM–8 AM" rule, even though your workers run in UTC. At Meta's scale — billions of notifications per day — a 0.01% rate of preference violations is still millions of unhappy users.
+
+## Clarifying questions
+
+Before drawing a single box on the whiteboard, establish scope and constraints:
+
+| Question | Ideal answer to unblock design | Why it matters |
+|---|---|---|
+| What event types trigger notifications? | Transactional (order confirmed, password reset, 2FA code) and marketing (campaign blasts, re-engagement) | Transactional needs sub-5s delivery; marketing can tolerate minutes and must respect frequency caps |
+| Which channels are in scope? | Push (FCM/APNs), email (SendGrid), SMS (Twilio), in-app, webhook | Each channel is an independent consumer with its own worker fleet |
+| What delivery guarantee is required? | At-least-once with deduplication | Drives Kafka consumer config (manual ack) and Redis idempotency store design |
+| Rate limits per user per channel? | 1 marketing email/day, 10 push/hour, 3 SMS/day | Determines where rate limiting lives — before or after the Kafka queue |
+| Is user preference management in scope? | Yes — opt-out per channel, quiet hours, timezone | Requires a `user_preferences` table and late-binding preference checks at delivery time |
+| Priority tiers? | Transactional > system alerts > marketing > digest | Separate Kafka topics per priority tier, not a single `notifications` topic |
+| Analytics needed (open rate, click rate)? | Delivery confirmation yes, click tracking out of scope for now | Delivery tracking table in Postgres; webhook callbacks from SendGrid/FCM |
+| Multi-region and timezone handling? | Single region for now, but timezone-aware scheduling | `user_preferences.timezone` stored per user; worker evaluates quiet hours in user's local time |
+
+The most important question is the rate limit question. If you enforce limits at queuing time (before Kafka), you save queue slots and avoid wasted worker cycles. If you enforce only at delivery time, you fill Kafka partitions with notifications that will be discarded — wasteful and hard to debug.
+
+## Functional requirements
+
+- **Send a notification**: Accept an event (userId, type, payload) and route it to all enabled channels for that user
+- **Channel support**: Push (FCM/APNs), email (SendGrid), SMS (Twilio), in-app (WebSocket/SSE), webhook
+- **User preference management**: Opt-out per channel, per notification type; frequency caps (max N per channel per day); quiet hours with timezone
+- **Delivery tracking**: Record `sent_at`, `delivered_at`, and `failed_at` per notification per channel; expose a status endpoint
+- **Retry on failure**: Exponential backoff for transient failures; dead letter queue (DLQ) after max retries
+- **Template support**: Register reusable templates with variable substitution (Handlebars or Mustache); channel workers render at send time
+- **Priority tiers**: Transactional notifications bypass frequency caps and quiet hours; marketing notifications respect all constraints
+
+## Non-functional requirements
+
+- **Latency**: Transactional notifications delivered to push within 5 seconds end-to-end (event ingestion to FCM/APNs API call)
+- **Delivery rate**: 99.9% of transactional notifications delivered at least once; 0% duplicate delivery for a given (notificationId, userId) pair
+- **Throughput**: Sustain 1M notifications per minute at peak (roughly 16,667/sec)
+- **Preference freshness**: Opt-out changes must be honored within 60 seconds — no enqueued notifications may deliver after a confirmed opt-out
+- **Availability**: Notification API at 99.95% uptime; channel workers may lag during degradation but must not drop messages durably queued in Kafka
+- **Observability**: p50/p95/p99 delivery latency per channel, per priority tier; DLQ depth alerting; per-channel error rates
+
+## Capacity estimation
+
+<Capacity title="Back-of-envelope: 1B users, 5 notifications/user/day, 10× peak">
+
+**Sustained throughput**
+
+$$
+\text{notifications/sec} = \frac{1 \times 10^9 \text{ users} \times 0.1 \text{ DAU fraction} \times 5 \text{ notifs/user/day}}{86{,}400 \text{ sec/day}} \approx 5{,}800 \; \text{notifs/sec}
+$$
+
+At 10× peak (campaign blasts, breaking news):
+
+$$
+\text{peak} = 5{,}800 \times 10 = 58{,}000 \; \text{notifs/sec}
+$$
+
+**Push notification payload storage**
+
+$$
+50 \text{ B/notif} \times 500 \times 10^6 \text{ notifs/day} = 25 \text{ GB/day}
+$$
+
+Push payloads are tiny (FCM capped at 4 KB, APNs at 4 KB). Storage is not a concern for push; it is a concern for email.
+
+**Email payload storage**
+
+$$
+50 \text{ KB/email} \times 50 \times 10^6 \text{ emails/day} = 2.5 \text{ TB/day}
+$$
+
+Email bodies live in S3, not in the notifications table. The database row stores a `template_id` + substitution variables JSON, not the rendered HTML.
+
+**Idempotency store sizing**
+
+$$
+500 \times 10^6 \text{ keys} \times 100 \text{ B/key} = 50 \text{ GB/day}
+$$
+
+With a 30-day TTL for deduplication history:
+
+$$
+50 \text{ GB} \times 30 \text{ days} \approx 1.5 \text{ TB Redis}
+$$
+
+Use Redis Cluster with 24h TTL for active deduplication and a Bloom filter for lookups older than 24h to save memory. A standard `r7g.4xlarge` (104 GB RAM) Redis node handles the hot set comfortably; cold deduplication history can live in DynamoDB.
+
+**Kafka partition sizing**
+
+At 58K notifs/sec peak across 5 channels: each channel topic needs at minimum:
+
+$$
+\text{partitions} = \lceil 58{,}000 / 10{,}000 \rceil = 6 \; \text{partitions per channel topic}
+$$
+
+Use 12 partitions per topic with 2× headroom. Each partition worker thread is sized at 10K messages/sec, which is conservative for simple dispatch work.
+
+</Capacity>
+
+## API design
+
+The notification API exposes five endpoints. Callers are internal services (order service, auth service, marketing platform) — not end users.
+
+```
+POST /notifications
+  Body: { userId, type, priority, channelOverrides?, payload }
+  Returns: { notificationId, status: "queued" }
+
+POST /notifications/bulk
+  Body: { userIds[], type, priority, payload, scheduledAt? }
+  Returns: { batchId, count, status: "accepted" }
+
+PUT /users/{userId}/preferences
+  Body: { channel, enabled, maxPerDay, quietHoursStart, quietHoursEnd, timezone }
+  Returns: 204 No Content
+
+GET /notifications/{id}/status
+  Returns: { notificationId, userId, channel, status, sentAt, deliveredAt, failedAt }
+
+POST /templates
+  Body: { slug, channelType, subject?, htmlBody?, textBody?, pushTitle?, pushBody? }
+  Returns: { templateId, slug }
+```
+
+Key design decisions: `POST /notifications/bulk` is asynchronous — it returns immediately with a `batchId` and processes the fanout in the background. The caller polls `/batches/{batchId}/status` for completion. This prevents HTTP timeouts on million-recipient campaigns. The `channelOverrides` field on single-notification sends allows the caller to force a specific channel (e.g., "send only SMS for this 2FA code, skip push").
+
+## Data model
+
+**`notifications` table** — one row per notification per channel attempt:
+
+```sql
+CREATE TABLE notifications (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id       BIGINT NOT NULL,
+    type          VARCHAR(64) NOT NULL,         -- "order_confirmed", "marketing_weekly"
+    channel       VARCHAR(16) NOT NULL,         -- "push", "email", "sms", "inapp"
+    priority      VARCHAR(16) NOT NULL DEFAULT 'normal',  -- "transactional", "normal", "low"
+    template_id   UUID REFERENCES templates(id),
+    payload_json  JSONB NOT NULL,               -- rendered variables, not full HTML
+    status        VARCHAR(16) NOT NULL DEFAULT 'pending', -- "pending","sent","delivered","failed"
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    sent_at       TIMESTAMPTZ,
+    delivered_at  TIMESTAMPTZ,
+    failed_at     TIMESTAMPTZ,
+    failure_reason TEXT
+);
+
+CREATE INDEX ON notifications (user_id, created_at DESC);
+CREATE INDEX ON notifications (status, created_at) WHERE status IN ('pending', 'failed');
+```
+
+**`user_preferences` table** — one row per (user, channel) pair:
+
+```sql
+CREATE TABLE user_preferences (
+    user_id             BIGINT NOT NULL,
+    channel             VARCHAR(16) NOT NULL,
+    enabled             BOOLEAN NOT NULL DEFAULT true,
+    max_per_day         INT NOT NULL DEFAULT 50,
+    quiet_hours_start   TIME,              -- e.g., '22:00'
+    quiet_hours_end     TIME,              -- e.g., '08:00'
+    timezone            VARCHAR(64) NOT NULL DEFAULT 'UTC',
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, channel)
+);
+```
+
+**`device_tokens` table** — multiple devices per user:
+
+```sql
+CREATE TABLE device_tokens (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id    BIGINT NOT NULL,
+    platform   VARCHAR(16) NOT NULL,   -- "ios", "android", "web"
+    token      TEXT NOT NULL,
+    is_active  BOOLEAN NOT NULL DEFAULT true,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, platform, token)
+);
+
+CREATE INDEX ON device_tokens (user_id) WHERE is_active = true;
+```
+
+Token staleness is a real problem: APNs returns a `410 Gone` when a token is unregistered (user deleted app). The push worker must update `is_active = false` on `410` responses and fall back to email if configured.
+
+## High-level architecture
+
+<Mermaid caption="Notification system: event sources fan out through Kafka to per-channel workers, all delivery results flow to the tracker" diagram={`graph LR
+  Events["Event Sources\nOrder · Auth · Marketing"] --> API["Notification API\nPOST /notifications"]
+  API --> PrefCheck["Preference Checker\n+ Rate Limiter\nRedis sliding window"]
+  PrefCheck --> Kafka["Kafka Topics\nper channel · per priority"]
+  Kafka --> PushWorker["Push Worker\nFCM / APNs"]
+  Kafka --> EmailWorker["Email Worker\nSendGrid"]
+  Kafka --> SMSWorker["SMS Worker\nTwilio"]
+  Kafka --> InAppWorker["In-App Worker\nWebSocket / SSE"]
+  PushWorker --> Tracker["Delivery Tracker\nPostgres + S3"]
+  EmailWorker --> Tracker
+  SMSWorker --> Tracker
+  InAppWorker --> Tracker
+  PrefCheck --> UserPrefs["User Prefs DB\nPostgres"]
+  PushWorker --> Tokens["Device Tokens\nPostgres"]`} />
+
+The Kafka topic naming convention is `notifications.{channel}.{priority}` — for example, `notifications.push.transactional`, `notifications.email.marketing`. This gives you independent consumer groups and independent scaling per channel and priority combination. A stuck email worker (e.g., SendGrid outage) does not delay transactional push notifications.
+
+## Deep dives
+
+### Fanout strategies
+
+The fundamental question is: **when do you expand one event into N per-user messages?**
+
+**Fanout-on-write (push fanout)**: When the event arrives at the Notification API, immediately generate one Kafka message per recipient and per channel. Each message is fully materialized — it contains the userId, channel, rendered template, and idempotency key. This is the right strategy for push notifications because the payload is tiny (< 4 KB) and the number of recipients per event is bounded (one order confirmation goes to one user, not 20M).
+
+**Fanout-on-read (pull fanout)**: Generate a single Kafka message representing the campaign, and let the email worker pull the recipient list from the database at send time. This is the right strategy for marketing email blasts where a campaign targets millions of users. The critical advantage: a user who opts out between campaign scheduling and email delivery will have their preference checked at the last moment, when the email worker reads their `user_preferences` row before calling SendGrid.
+
+**The celebrity problem**: A viral tweet or a sports event can trigger a push notification to 20M followers. Fanout-on-write means 20M Kafka messages generated in a burst. The correct mitigation is a **two-stage fan-out**: the event goes to a `fanout.pending` Kafka topic, a fanout service reads follower shards from the social graph in parallel (10K followers per shard), and generates batches of push Kafka messages at a controlled rate. The fanout service itself is horizontally scalable — add more instances to increase fanout throughput. Set separate Kafka consumer lag alerts for fanout lag vs. delivery lag so you know which stage is the bottleneck.
+
+### Exactly-once and deduplication
+
+True exactly-once delivery across a Kafka consumer, a network call to FCM/SendGrid, and a Postgres write is impossible without two-phase commit — which would destroy your throughput. The practical contract is **at-least-once with client-side deduplication**.
+
+The mechanism: before queuing to Kafka, assign a `notificationId` (UUID v4). Before the channel worker calls the provider API, execute:
+
+```
+SETNX notif:{notificationId}:{userId} 1 EX 86400
+```
+
+If `SETNX` returns `0`, this notification was already sent — skip it. If it returns `1`, proceed with delivery and only acknowledge the Kafka offset after successful delivery. The 24-hour TTL covers Kafka consumer restarts, pod rescheduling, and transient network errors.
+
+FCM provides an additional layer: the `message_id` field on the FCM API response is deduplicated by Google within a 4-week window if you send the same `message_id` twice. For APNs, the `apns-id` header provides similar semantics. Use your `notificationId` as the FCM `message_id` / APNs `apns-id` to get provider-level deduplication as a second backstop. Do not rely on it as the primary mechanism — provider dedup windows vary and are not guaranteed.
+
+The Redis key structure for the idempotency store should include the channel to allow a notification to be delivered once per enabled channel:
+
+```
+notif:{notificationId}:{userId}:push    → "1"  EX 86400
+notif:{notificationId}:{userId}:email   → "1"  EX 86400
+```
+
+### Rate limiting per channel
+
+Rate limiting must happen **before queuing to Kafka**, not at delivery time. Queuing a notification to Kafka and then discarding it at the worker wastes partition space, consumer CPU, and makes your Kafka consumer lag metrics meaningless. The dispatcher checks the rate limit for each `(userId, channel)` pair before publishing the Kafka message.
+
+Implementation: Redis sliding window counter per `(userId, channel, day)`. Marketing emails capped at 1/day. Push notifications capped at 10/hour. The counter key expires at end of the window:
+
+```
+rl:marketing:email:{userId}:{date}  → count, expires midnight UTC
+rl:push:{userId}:{hour}             → count, expires top of hour
+```
+
+Transactional notifications bypass all rate limits — a password reset email must always go through, regardless of how many marketing emails were sent that day.
+
+Quiet hours are a special case of rate limiting: instead of discarding the notification, you **delay** it to the next available window. The dispatcher checks `user_preferences.quiet_hours_start/end` in the user's local timezone and, if the current time falls in the quiet window, schedules the Kafka message with a `deliver_after` timestamp. The channel worker checks this field and re-queues with a delay if the time hasn't arrived.
+
+### Retry and dead letter
+
+Channel workers use **manual Kafka acknowledgment** (`enable.auto.commit=false`). The worker only calls `ack.acknowledge()` after a successful provider API response (HTTP 200/202). On failure, it does not acknowledge — Kafka redelivers the message to the same consumer group.
+
+Retry policy: exponential backoff with jitter. Retry attempts 1–5 at 1s, 2s, 4s, 8s, 16s intervals (capped at 30s). After 5 consecutive failures, the message is forwarded to a dead letter topic: `notifications.{channel}.dlq`. A separate DLQ processor runs hourly, attempts one final delivery, and on continued failure writes the notification to the `notifications` table with `status = 'failed'` and `failure_reason` populated.
+
+DLQ depth is a primary on-call alert: a DLQ depth > 1000 for a transactional channel triggers a P1 page. A DLQ depth > 10K for a marketing channel triggers a P2 ticket.
+
+Separate retriable from non-retriable failures at the worker:
+
+- **Retriable**: HTTP 429 (provider rate limit), HTTP 503 (provider unavailable), network timeout
+- **Non-retriable**: HTTP 400 (bad payload — retry won't help), HTTP 410 (token unregistered — mark token inactive, don't retry push, fall back to email), HTTP 401 (bad API key — alert immediately, don't retry)
+
+## Java integration
+
+### Part A — Notification dispatcher
+
+```java
+package dev.pushkar.notification;
+
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Service;
+import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.Jedis;
+import java.util.UUID;
+
+@Service
+public class NotificationDispatcher {
+    private final KafkaTemplate<String, NotificationEvent> kafka;
+    private final JedisPool jedis;
+    private final UserPreferenceService prefs;
+
+    public NotificationDispatcher(KafkaTemplate<String, NotificationEvent> kafka,
+                                   JedisPool jedis, UserPreferenceService prefs) {
+        this.kafka = kafka;
+        this.jedis = jedis;
+        this.prefs = prefs;
+    }
+
+    public void dispatch(long userId, String eventType, NotificationPayload payload) {
+        var channels = prefs.getEnabledChannels(userId, eventType);
+        for (Channel channel : channels) {
+            if (!checkRateLimit(userId, channel)) continue;
+            String notifId = UUID.randomUUID().toString();
+            if (!deduplicate(notifId, userId, channel)) continue;
+            var event = new NotificationEvent(notifId, userId, channel, payload);
+            String topic = "notifications." + channel.name().toLowerCase()
+                           + "." + payload.priority().name().toLowerCase();
+            kafka.send(topic, String.valueOf(userId), event);
+        }
+    }
+
+    private boolean checkRateLimit(long userId, Channel channel) {
+        String key = "rl:" + channel.name().toLowerCase() + ":" + userId + ":" + windowKey(channel);
+        try (Jedis j = jedis.getResource()) {
+            long count = j.incr(key);
+            if (count == 1) j.expire(key, channel.windowSeconds());
+            return count <= channel.maxPerWindow();
+        }
+    }
+
+    private boolean deduplicate(String notifId, long userId, Channel channel) {
+        String key = "notif:" + notifId + ":" + userId + ":" + channel.name().toLowerCase();
+        try (Jedis j = jedis.getResource()) {
+            long result = j.setnx(key, "1");
+            if (result == 1L) j.expire(key, 86_400);
+            return result == 1L;
+        }
+    }
+
+    private String windowKey(Channel channel) {
+        return switch (channel) {
+            case EMAIL_MARKETING -> java.time.LocalDate.now().toString();
+            case PUSH            -> java.time.LocalDateTime.now()
+                                        .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMddHH"));
+            default              -> java.time.LocalDate.now().toString();
+        };
+    }
+}
+```
+
+### Part B — Email channel worker with SendGrid
+
+```java
+package dev.pushkar.notification;
+
+import com.sendgrid.*;
+import com.sendgrid.helpers.mail.*;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.support.Acknowledgment;
+import org.springframework.stereotype.Component;
+import java.time.Instant;
+
+@Component
+public class EmailNotificationWorker {
+    private final SendGrid sendGrid;
+    private final NotificationRepository repo;
+    private static final org.slf4j.Logger log =
+        org.slf4j.LoggerFactory.getLogger(EmailNotificationWorker.class);
+
+    public EmailNotificationWorker(@Value("${sendgrid.api-key}") String apiKey,
+                                    NotificationRepository repo) {
+        this.sendGrid = new SendGrid(apiKey);
+        this.repo = repo;
+    }
+
+    @KafkaListener(topics = "notifications.email.normal", groupId = "email-workers",
+                   concurrency = "10")
+    public void handle(NotificationEvent event, Acknowledgment ack) throws Exception {
+        try {
+            Email to = new Email(event.userEmail());
+            Content content = new Content("text/html", event.payload().htmlBody());
+            Mail mail = new Mail(
+                new Email("noreply@pushkar.dev"),
+                event.payload().subject(),
+                to,
+                content
+            );
+            mail.addHeader("X-Notification-Id", event.notifId());
+
+            Request req = new Request();
+            req.setMethod(Method.POST);
+            req.setEndpoint("mail/send");
+            req.setBody(mail.build());
+
+            Response resp = sendGrid.api(req);
+            if (resp.getStatusCode() == 400) {
+                log.error("Non-retriable SendGrid error for {}: {} {}",
+                    event.notifId(), resp.getStatusCode(), resp.getBody());
+                repo.markFailed(event.notifId(), "SendGrid 400: " + resp.getBody());
+                ack.acknowledge();
+                return;
+            }
+            if (resp.getStatusCode() >= 500) {
+                throw new RuntimeException("Retriable SendGrid error: " + resp.getStatusCode());
+            }
+
+            repo.markSent(event.notifId(), Instant.now());
+            ack.acknowledge();
+        } catch (Exception e) {
+            log.error("Email delivery failed for {}: {}", event.notifId(), e.getMessage());
+        }
+    }
+}
+```
+
+The critical detail: `ack.acknowledge()` is called only on success or a non-retriable failure (HTTP 400). On retriable failures — network timeouts, HTTP 5xx — the method exits without acknowledging. Kafka's consumer group will redeliver the message after `max.poll.interval.ms`. Combined with the Redis idempotency check in the dispatcher, this achieves at-least-once delivery with zero duplicates observable to users.
+
+<TradeoffTable title="Delivery channel comparison">
+
+| Channel | Latency | Cost | Deliverability | Opt-in required |
+|---|---|---|---|---|
+| Push (FCM/APNs) | < 1s | Near zero | ~70% (device off = missed) | App install |
+| In-app | 0ms (on open) | Zero | 100% (when app open) | App install |
+| Email | 1–30s | ~$0.001/email | ~95% (with good domain rep) | Email address |
+| SMS | 1–10s | ~$0.01/SMS | ~99% | Phone + explicit opt-in |
+| Webhook | < 100ms | Near zero | 100% (if endpoint up) | API integration |
+
+</TradeoffTable>
+
+<Pitfall title="Checking opt-out status at event generation time, not at delivery time">
+
+A user unsubscribes at T+1s. Your fanout already queued 50M marketing push notifications at T=0 when the campaign launched. The dispatcher read `user_preferences.enabled = true` at enqueue time and wrote the Kafka message. At T+5s, when the push worker finally processes that user's message, it calls FCM without re-checking preferences — and delivers a notification to a user who just opted out.
+
+Always check preferences **as late as possible** — at the channel worker, not the dispatcher. The dispatcher does a fast rate-limit check (Redis, sub-millisecond). The channel worker does a final preference check against Postgres (with a 5-second read-replica cache) before calling the provider API. This adds one DB read per notification per channel, which is a small price for correct opt-out semantics.
+
+</Pitfall>
+
+<Pitfall title="Retrying without idempotency keys">
+
+Network timeouts are ambiguous: you don't know if the first SendGrid API call succeeded or failed at the TCP layer. If you retry without a deduplication check, you send the same push notification three times and the user uninstalls your app. If you don't retry, you risk a missed transactional notification (password reset, fraud alert).
+
+The solution is a two-layer idempotency check: (1) your Redis `SETNX` before sending, which prevents the worker from even attempting delivery on a retry, and (2) passing your `notificationId` as the FCM `message_id` / APNs `apns-id`, which lets the provider deduplicate at their layer. The Redis check is your primary defense. The provider dedup is a backstop for the case where your Redis `SETNX` succeeded but the Redis write of the result was lost before the response reached your worker.
+
+</Pitfall>
+
+<Curveball question="A celebrity tweets and 20M followers need a push notification within 10 seconds. How do you fan out to 20M devices without a single Kafka partition becoming a bottleneck?">
+
+A single Kafka partition is ordered and single-consumer — at 10K messages/sec throughput, delivering 20M push messages through one partition takes 33 minutes. That doesn't meet the 10-second SLA.
+
+The correct design is a two-stage fan-out with a dedicated high-throughput topic. Stage 1: a single `fanout.requests` Kafka message is published containing `{eventId, userId: celebrity, type: "new_tweet"}`. Stage 2: a **Fanout Service** reads this message and shards the 20M follower list from the social graph into batches of 10K users each (2000 batches). Each batch is published as a separate Kafka message to the `notifications.push.normal` topic. With 12 partitions and 12 consumer threads, each processing 10K-user batches, you can dispatch 120K FCM API calls per second — 20M notifications in under 3 minutes.
+
+For truly sub-10-second celebrity fanout, pre-shard the follower list and maintain it in Redis Sorted Sets (score = `follower_id`). At tweet time, the Fanout Service scans the sorted set in 10K-user `ZRANGE` pages in parallel across multiple instances. With 20 Fanout Service instances, each handling 1M followers, and each partition handling 10K messages/sec, you can fan out to 20M within 10 seconds. This is essentially how Twitter's push notification system worked at scale before the architecture changes in 2022.
+
+</Curveball>
+
+<Curveball question="A user reports they received the same marketing email three times in one hour. Walk me through how you would diagnose and fix the deduplication bug.">
+
+Start with the delivery tracking table: `SELECT * FROM notifications WHERE user_id = ? AND channel = 'email' AND created_at > now() - interval '2 hours'`. If there are three rows with `status = 'delivered'`, the deduplication failed at the Redis layer. If there is one row, the email was sent once from your system but SendGrid retried internally.
+
+Check the Redis idempotency keys: `KEYS notif:*:{userId}:email` in the 24h window. If the keys exist with TTL intact, the `SETNX` check worked — the bug is upstream. If the keys don't exist, the Redis write succeeded but the TTL was not set (a race between `SETNX` and `EXPIRE`). Fix: use `SET key 1 NX EX 86400` (atomic set-with-expiry) instead of separate `SETNX` + `EXPIRE` calls.
+
+Check the Kafka consumer group lag for the email worker: if a rebalance occurred mid-processing (pod restart, GC pause exceeding `max.poll.interval.ms`), the partition was reassigned and the uncommitted offset was redelivered. The new consumer would try `SETNX` — which should return 0 (already set) and skip delivery. If it returned 1, the TTL on the first `SETNX` expired too quickly — increase TTL from 24h to 72h for marketing emails. If the notification IDs in the three emails are different UUIDs, the dispatcher generated three separate `notificationId` values for the same campaign+user, meaning the dedup key space is wrong — it should be `notif:{campaignId}:{userId}:email`, not `notif:{randomUUID}:{userId}:email`.
+
+</Curveball>
+
+<Curveball question="Your email deliverability drops from 95% to 40% overnight. What's the first thing you check, and what's your remediation plan?">
+
+A drop from 95% to 40% deliverability overnight is almost always a **domain reputation problem**, not a code bug. The first check: SendGrid's Suppression List dashboard — if thousands of addresses bounced hard (invalid addresses), ISPs blacklist your sending domain within hours. Check your domain's IP reputation on MXToolbox and Google Postmaster Tools.
+
+Common overnight triggers: (1) A marketing campaign batch was sent to a purchased list with 30% invalid addresses — hard bounces tank domain reputation. (2) A spam trap hit — someone subscribed a honeypot email address and you sent to it. (3) Your SPF/DKIM/DMARC records were changed during a DNS migration and the new records are malformed.
+
+Immediate remediation: switch to a **warm subdomain** (e.g., `notifications2.yourcompany.com`) that hasn't been blacklisted. SendGrid supports multiple sending domains — reroute traffic to the clean domain within minutes. In parallel: remove all hard-bounced addresses from your list immediately (SendGrid's Suppression List API), validate the SPF/DKIM/DMARC records for your original domain, and open a ticket with SendGrid's deliverability team for assisted IP warming. Long-term: implement double opt-in for all marketing lists to eliminate invalid addresses before they accumulate.
+
+</Curveball>
+
+<RelatedQuestions items={[
+  { slug: "twitter-timeline", title: "Design Twitter/X Timeline", difficulty: "senior" },
+  { slug: "distributed-rate-limiter", title: "Design a Distributed Rate Limiter", difficulty: "mid" },
+  { slug: "web-crawler", title: "Design a Web Crawler", difficulty: "senior" },
+]} />
+
+## Further reading
+
+- [Firebase Cloud Messaging architecture](https://firebase.google.com/docs/cloud-messaging/concept-options) — Google's official FCM documentation covering message types, delivery semantics, and the difference between notification and data messages
+- [Apple Push Notification service (APNs) best practices](https://developer.apple.com/documentation/usernotifications/sending-notification-requests-to-apns) — Apple's guide to APNs authentication, payload limits, and handling `410 Gone` for unregistered device tokens
+- [Twilio SMS best practices](https://www.twilio.com/docs/sms/best-practices) — Twilio's guide to opt-in/opt-out compliance (TCPA in the US, GDPR in the EU), carrier filtering, and short codes vs. long codes
+- [Slack's notification architecture at scale](https://slack.engineering/reducing-slacks-memory-footprint/) — Engineering blog post covering how Slack manages presence, push notification routing, and deduplication for millions of concurrent connections

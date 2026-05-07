@@ -1,0 +1,619 @@
+---
+title: "Design an A/B Testing Platform"
+slug: "ab-testing-platform"
+category: "ai"
+difficulty: "senior"
+estimatedReadMinutes: 22
+tags: ["experiment", "assignment", "statistical-significance", "SRM", "Bayesian", "feature-flags", "CUPED"]
+companyFlavors: ["Netflix", "LinkedIn", "Airbnb", "Booking.com", "Uber"]
+relatedQuestions: ["ml-inference-pipeline", "recommendation-engine", "feature-store"]
+publishedAt: "2025-01-07"
+updatedAt: "2025-01-07"
+summary: "Design an experiment platform that assigns users to A/B test variants deterministically, collects and aggregates metric events, detects Sample Ratio Mismatch, and performs statistical significance tests with variance reduction."
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+
+<Bookmark slug="ab-testing-platform" title="Design an A/B Testing Platform" />
+
+<Tldr>
+- **Deterministic assignment**: `hash(userId + experimentId) % 10000` gives stable, reproducible bucket assignment — same user always gets the same variant, with no database lookup required on the critical path.
+- **Metrics pipeline**: client events flow into Kafka, stream into Redis live counters for hourly dashboards, and are processed nightly by Spark batch aggregation into metric snapshots stored in PostgreSQL for statistical analysis.
+- **Sample Ratio Mismatch (SRM) detection**: if the actual treatment/control split deviates from the expected split (e.g., a 50/50 experiment showing 10K/8K users), the experiment is corrupted and must not be analyzed — report the SRM and stop there.
+- **Statistical testing**: Welch's t-test for continuous metrics; Chi-squared for conversion rates; use CUPED (pre-experiment covariate adjustment) to reduce variance by 20–50%, shrinking required sample sizes by the same factor.
+- **Experiment isolation**: orthogonal layering ensures experiments in separate layers don't interfere with each other; experiments within the same layer are mutually exclusive and cannot be assigned to the same user simultaneously.
+</Tldr>
+
+An A/B testing platform is the scientific instrument of the product organization — and like any instrument, its value depends entirely on whether its measurements are trustworthy. A poorly designed experiment platform produces false positives (ships regressions thinking they're improvements) and false negatives (kills winning ideas). The platform design challenge is not just "how do you assign users to variants?" but "how do you guarantee the assignment is unbiased, the metrics computation is correct, and the statistical conclusions are valid?"
+
+## Clarifying questions
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| What is the experiment unit? | User by default, but also session, device, or request depending on the experiment type | User-level experiments require consistent assignment across sessions; request-level experiments allow faster iteration but cannot measure session-level metrics like revenue per user |
+| How many concurrent active experiments? | Up to 1,000 at any given time | Drives the design of the assignment layer — 1,000 experiments means every page load may trigger up to 1,000 hash computations; in-memory evaluation is required |
+| What metric types must we support? | Binary (click/no-click), continuous (revenue, session duration), and ratio metrics (click-through rate = clicks / impressions) | Binary metrics use proportion tests; continuous use t-tests; ratio metrics require the delta method for variance estimation — three different statistical paths |
+| What is the minimum detectable effect we need to power for? | Typically 0.5% relative lift for conversion rate, 1% for revenue | MDE determines the required sample size per variant — smaller MDE requires larger samples and longer experiments |
+| Frequentist or Bayesian statistical testing? | Frequentist (fixed-horizon t-test) as the default; Bayesian as an optional mode | Frequentist requires committing to a sample size before peeking; Bayesian allows continuous monitoring without inflating false positive rate, but requires priors and has different interpretation |
+| Should the platform support automatic stopping? | Yes — both early stopping for SRM and optional sequential testing for statistically valid peeking | Automatic SRM stopping is mandatory; sequential testing for early wins is a power feature that requires special statistical machinery |
+| What are guardrail metrics? | Metrics that must not regress even if the primary metric improves (e.g., p99 latency, crash rate) | Guardrail metrics must be tracked alongside primary metrics; a statistically significant primary improvement paired with a guardrail regression is a ship-stopper |
+| Do we need multi-armed bandit support? | Not in v1 — pure A/B testing only | Multi-armed bandit requires online traffic reallocation based on observed performance, which is a significantly more complex system than fixed-allocation A/B testing |
+| How do holdout groups work? | A permanent holdout (10% of users) never receives any experiment treatment — used to measure cumulative product improvement over quarters | Holdout users must be excluded from all experiments deterministically; this is a cross-cutting concern handled in the assignment layer before any experiment lookup |
+
+## Functional requirements
+
+- **Experiment configuration**: create and configure experiments with a name, hypothesis, variant definitions, traffic allocation percentages, primary metric, guardrail metrics, and layer assignment.
+- **Deterministic variant assignment**: given any user entity and experiment ID, return a stable variant assignment that is consistent across requests, sessions, and devices without any stateful lookup.
+- **Event ingestion**: accept client-side events (clicks, conversions, revenue, latency, page views) tagged with experiment context; ingest at 100K events/sec peak without data loss.
+- **Metric computation and aggregation**: compute hourly monitoring dashboards from streaming counters; run nightly batch aggregation to produce statistically analyzable metric snapshots.
+- **Statistical significance testing**: compute p-values, confidence intervals, and lift estimates for each metric in each experiment; configurable significance threshold (default alpha = 0.05).
+- **SRM detection and alerting**: check assignment counts against expected ratios hourly; alert on SRM and suppress metric results until SRM is resolved.
+- **Experiment results export**: export per-experiment results as JSON or CSV for downstream consumption by product dashboards and data science notebooks.
+
+## Non-functional requirements
+
+- **Assignment latency**: < 1ms p99 — variant assignment is on the critical request path for every page render and must not add perceptible latency.
+- **Event ingestion throughput**: 100K events/sec peak — driven by 50M DAU × 20 events/day with a 10× peak-to-average ratio.
+- **Concurrent experiments**: support 1,000 active experiments simultaneously without degrading assignment latency.
+- **Metric freshness**: hourly monitoring updates for live dashboards; nightly (once per 24 hours) statistical analysis with full significance tests.
+- **Data retention**: retain raw metric snapshots for 2 years to support retrospective analysis and holdout comparisons; retain raw event logs for 90 days.
+- **Availability**: the assignment service must be 99.99% available — an outage means no experiment traffic can be measured; the metrics pipeline can tolerate up to 1 hour of degraded availability with backfill.
+
+<Capacity title="A/B Platform Capacity">
+
+**Event ingestion volume**
+
+$50{,}000{,}000 \text{ DAU} \times 20 \text{ events/day} = 1{,}000{,}000{,}000 \text{ events/day}$
+
+$\frac{1{,}000{,}000{,}000}{86{,}400} \approx 11{,}600 \text{ events/sec average}$
+
+Peak at 10× average: $\approx 100{,}000 \text{ events/sec}$
+
+**Kafka throughput**
+
+Each event: 200 bytes (user ID, event type, value, timestamp, experiment IDs list)
+
+$100{,}000 \text{ events/sec} \times 200 \text{ B} = 20 \text{ MB/s Kafka ingest throughput}$
+
+**Assignment lookup volume**
+
+$50{,}000{,}000 \text{ DAU} \times 50 \text{ page loads/day} = 2{,}500{,}000{,}000 \text{ assignments/day}$
+
+$\frac{2{,}500{,}000{,}000}{86{,}400} \approx 29{,}000 \text{ assignments/sec}$
+
+All assignment computation is in-memory hash arithmetic — no network I/O, sub-millisecond per lookup.
+
+**Metric snapshot storage**
+
+$1{,}000 \text{ experiments} \times 5 \text{ metrics} \times 365 \text{ days} \times 2 \text{ variants} \times 10 \text{ KB} = 36.5 \text{ GB/year}$
+
+Manageable in a single PostgreSQL instance with table partitioning by date.
+
+**Minimum sample size formula**
+
+For a two-sided test at significance level $\alpha$ and power $1 - \beta$:
+
+$$n \geq \frac{2(z_{\alpha/2} + z_\beta)^2 \sigma^2}{\delta^2}$$
+
+For click-through rate baseline $p = 0.05$, minimum detectable effect $\delta = 0.005$ (0.5 pp), $\alpha = 0.05$ (so $z_{\alpha/2} = 1.96$), power = 80% ($z_\beta = 0.84$), and $\sigma^2 = p(1-p) = 0.0475$:
+
+$$n \geq \frac{2(1.96 + 0.84)^2 \times 0.0475}{(0.005)^2} \approx 25{,}000 \text{ users per variant}$$
+
+At 50M DAU with 100% traffic allocation, 25K users per variant requires less than 1 hour of traffic. For niche features with 5% traffic allocation, this stretches to 20 hours — still under 1 day.
+
+</Capacity>
+
+## API design
+
+```text
+POST /api/v1/experiments
+  body: { name, hypothesis, variants: [{name, trafficPercent}],
+          primaryMetric, guardrailMetrics: [str], layerId,
+          trafficPercent, startAt }
+  → { experimentId }
+
+GET /api/v1/assignment?userId=X&experimentId=Y
+  → { variant: "control"|"treatment" }  — must respond < 1ms
+
+GET /api/v1/assignment/bulk?userId=X
+  → { assignments: [{experimentId, variant}] }  — all active experiments for user
+
+POST /api/v1/events
+  body: { userId, eventType, value, timestamp, experimentIds: [str] }
+  → 202 Accepted
+
+GET /api/v1/experiments/{id}/results
+  → { metrics: [{name, controlMean, treatmentMean, pValue, lift,
+                  ciLow, ciHigh, significant}],
+      srm: { detected, expectedRatio, actualRatio, pValue },
+      sampleSizes: { control, treatment } }
+
+GET /api/v1/experiments/{id}/status
+  → { status: "DRAFT"|"RUNNING"|"PAUSED"|"CONCLUDED",
+      startedAt, daysSinceStart, assignmentCounts: {control, treatment} }
+
+PATCH /api/v1/experiments/{id}
+  body: { status: "PAUSED"|"CONCLUDED" }
+  → 200 OK
+```
+
+## Data model
+
+```sql
+CREATE TABLE experiments (
+    experiment_id   UUID PRIMARY KEY,
+    name            VARCHAR(200) UNIQUE NOT NULL,
+    status          VARCHAR(20) NOT NULL,
+    traffic_percent INT NOT NULL,
+    layer_id        INT NOT NULL,
+    primary_metric  VARCHAR(100) NOT NULL,
+    started_at      TIMESTAMPTZ,
+    concluded_at    TIMESTAMPTZ
+);
+
+CREATE TABLE experiment_variants (
+    experiment_id   UUID REFERENCES experiments(experiment_id),
+    variant_name    VARCHAR(50) NOT NULL,
+    traffic_split   INT NOT NULL,
+    PRIMARY KEY (experiment_id, variant_name)
+);
+
+CREATE TABLE metric_snapshots (
+    experiment_id   UUID NOT NULL,
+    variant_name    VARCHAR(50) NOT NULL,
+    metric_name     VARCHAR(100) NOT NULL,
+    snapshot_date   DATE NOT NULL,
+    user_count      BIGINT NOT NULL,
+    sum_value       DOUBLE PRECISION NOT NULL,
+    sum_sq_value    DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (experiment_id, variant_name, metric_name, snapshot_date)
+);
+
+CREATE TABLE srm_checks (
+    experiment_id   UUID NOT NULL,
+    checked_at      TIMESTAMPTZ NOT NULL,
+    expected_ratio  FLOAT NOT NULL,
+    actual_ratio    FLOAT NOT NULL,
+    p_value         FLOAT NOT NULL,
+    is_srm          BOOLEAN NOT NULL
+);
+```
+
+The `metric_snapshots` table stores sufficient statistics — `sum_value`, `sum_sq_value`, and `user_count` — rather than raw individual observations. From these three numbers you can compute the mean, variance, and run Welch's t-test for any date range by summing across daily snapshots: $\bar{x} = \frac{\sum \text{sum\_value}}{\sum \text{user\_count}}$. This design avoids storing billions of raw event rows in PostgreSQL; the raw events live in the data lake.
+
+## Architecture diagram
+
+<Mermaid diagram={`flowchart TD
+  subgraph Clients["Client Layer"]
+    Web["Web / Mobile Client"]
+    Server["Server-Side App"]
+  end
+
+  subgraph Assignment["Assignment Service (in-process)"]
+    HashFn["hash(userId + experimentId) % 10000"]
+    ExpCache["Experiment Config\\nIn-memory (Redis-backed)"]
+  end
+
+  subgraph Ingestion["Event Ingestion"]
+    Collector["Event Collector\\nHTTP POST /events"]
+    Kafka["Kafka\\n20 MB/s, 100K events/s"]
+  end
+
+  subgraph StreamPath["Streaming Path (hourly)"]
+    StreamAgg["Streaming Aggregator\\nKafka Streams"]
+    Redis["Redis\\nLive Counters"]
+    DashAPI["Dashboard API"]
+  end
+
+  subgraph BatchPath["Batch Path (nightly)"]
+    Spark["Spark Batch Job\\n2AM UTC daily"]
+    Snapshots["metric_snapshots\\nPostgreSQL"]
+    StatEngine["Statistical Analyzer\\nWelch t-test, CUPED"]
+    ResultsAPI["Results API"]
+  end
+
+  subgraph SRMPath["SRM Detection (hourly)"]
+    SRMJob["SRM Detector\\nChi-squared test"]
+    SRMAlert["Alert + Suppress Results"]
+  end
+
+  Web --> Server
+  Server --> HashFn
+  ExpCache --> HashFn
+  HashFn --> Server
+
+  Web --> Collector
+  Server --> Collector
+  Collector --> Kafka
+
+  Kafka --> StreamAgg
+  StreamAgg --> Redis
+  Redis --> DashAPI
+
+  Kafka --> Spark
+  Spark --> Snapshots
+  Snapshots --> StatEngine
+  StatEngine --> ResultsAPI
+
+  Snapshots --> SRMJob
+  SRMJob --> SRMAlert
+`} />
+
+## Deep dive: Deterministic assignment
+
+The assignment service is the most performance-sensitive component in the platform. It runs on the critical path of every page render — if it adds even 5ms of latency, product engineers will feel it. The design goal is sub-millisecond p99 with no network I/O.
+
+**Hash-based bucketing**
+
+The bucketing algorithm uses a cryptographic hash to convert a `(userId, experimentId)` pair into a stable integer bucket from 0 to 9,999 (giving 0.01% granularity for traffic allocation):
+
+```python
+import hashlib
+
+def compute_bucket(user_id: str, salt: str) -> int:
+    key = f"{user_id}:{salt}"
+    digest = hashlib.sha256(key.encode()).hexdigest()[:8]
+    return int(digest, 16) % 10000
+```
+
+SHA-256 provides uniform distribution across the bucket space — verified empirically at Airbnb, LinkedIn, and Booking.com. MD5 is faster but has known clustering issues for certain key patterns. The first 8 hex characters (32 bits) are sufficient to produce a uniform distribution modulo 10,000.
+
+**Two-phase assignment**
+
+Assignment has two logical phases. First, eligibility: is this user in the traffic allocation for this experiment at all? Second, variant assignment: which variant does this user get?
+
+```python
+def get_variant(user_id: str, experiment: dict) -> str | None:
+    eligibility_bucket = compute_bucket(user_id, experiment["id"] + ":eligibility")
+    if eligibility_bucket >= experiment["traffic_percent"] * 100:
+        return None
+
+    assignment_bucket = compute_bucket(user_id, experiment["id"])
+    cumulative = 0
+    for variant in experiment["variants"]:
+        cumulative += variant["traffic_split"] * 100
+        if assignment_bucket < cumulative:
+            return variant["name"]
+    return experiment["variants"][-1]["name"]
+```
+
+Using a separate salt for eligibility vs. variant assignment ensures that the two hashes are statistically independent — a user in the top 50% of eligibility buckets is not systematically more likely to land in the treatment group.
+
+**Experiment layers and orthogonal design**
+
+Experiment layers solve the mutual exclusion problem. An experiment on the recommendation algorithm and an experiment on the checkout flow test completely different surfaces — it is fine for the same user to be in both simultaneously. But two experiments testing different recommendation algorithms should not assign the same user to different variants simultaneously, because you cannot attribute their behavior to either experiment cleanly.
+
+The layer model handles this with a simple rule: experiments within the same layer are mutually exclusive (a user is assigned to at most one experiment in each layer). Experiments in different layers are orthogonal (a user's bucket in Layer A is uncorrelated with their bucket in Layer B, because the hash salt includes the layer ID).
+
+```text
+Layer 1 (Recommendations):
+  Exp A (50% traffic): user → control or treatment_ranking_v2
+  Exp B (30% traffic): user → control or treatment_recs_model_v3
+  (A and B are mutually exclusive — a user can only be in one)
+
+Layer 2 (Checkout):
+  Exp C (80% traffic): user → control or treatment_new_checkout_flow
+  (A user in Exp A can also be in Exp C — different layers, independent)
+```
+
+The hash salt for layer eligibility is `f"{user_id}:layer_{layer_id}"`. Experiments within a layer share this eligibility bucket — the first experiment claims the top N% of eligible users, the second claims the next M%, and so on. Users in none of the active experiments in a layer see the default experience.
+
+**Holdout groups**
+
+A permanent holdout is a fixed slice of hash space that is never assigned to any experiment. Before running any experiment eligibility check, the assignment service computes `holdout_bucket = compute_bucket(user_id, "global_holdout")`. If `holdout_bucket < 1000` (i.e., bottom 10%), the user is a holdout and receives the default experience unconditionally. After 6 months, compare holdout users (no experiments ever) to non-holdout users to measure the cumulative improvement from all shipped experiments.
+
+## Deep dive: Metric computation and CUPED
+
+**Sufficient statistics storage**
+
+Each nightly Spark job reads the raw event logs from Kafka's S3 compaction for the past 24 hours and produces one row per `(experiment_id, variant_name, metric_name, date)` in the `metric_snapshots` table. The row stores `user_count`, `sum_value`, and `sum_sq_value` — the minimum sufficient statistics to compute mean, variance, and run hypothesis tests:
+
+```python
+mean = sum_value / user_count
+variance = (sum_sq_value / user_count) - mean ** 2
+```
+
+Accumulating across days is simple addition: `sum(sum_value)`, `sum(sum_sq_value)`, `sum(user_count)`. This means you can compute the statistical test for any date range (day 1–7, day 1–14, the full experiment) by summing a few database rows, rather than reprocessing billions of raw events.
+
+**Welch's t-test**
+
+Welch's t-test is preferred over Student's t-test because it does not assume equal variances between control and treatment. Treatment effects often change both the mean and the variance (e.g., a new UI that increases conversion rate may also increase variance in revenue). Using Student's t-test when variances differ inflates the false positive rate.
+
+The test statistic is:
+
+$$t = \frac{\bar{x}_T - \bar{x}_C}{\sqrt{\frac{s_T^2}{n_T} + \frac{s_C^2}{n_C}}}$$
+
+where $s^2$ is the sample variance and $n$ is the sample size per group. The degrees of freedom use the Satterthwaite approximation:
+
+$$\nu = \frac{\left(\frac{s_T^2}{n_T} + \frac{s_C^2}{n_C}\right)^2}{\frac{(s_T^2/n_T)^2}{n_T - 1} + \frac{(s_C^2/n_C)^2}{n_C - 1}}$$
+
+**CUPED variance reduction**
+
+CUPED (Controlled-experiment Using Pre-Experiment Data) is a variance reduction technique introduced by Microsoft Research and widely adopted at LinkedIn, Netflix, and Booking.com. The core insight: if you can observe each user's metric value before the experiment started (e.g., their click-through rate in the week before launch), that pre-experiment value is correlated with their in-experiment behavior. By subtracting out the predictable component, you reduce the noise in your measurement.
+
+The adjusted metric for each user is:
+
+$$Y_{\text{adjusted}} = Y - \theta \cdot (X - \bar{X})$$
+
+where $Y$ is the in-experiment metric, $X$ is the pre-experiment covariate (same metric, measured before experiment start), $\bar{X}$ is the population mean of the covariate, and $\theta = \frac{\text{Cov}(Y, X)}{\text{Var}(X)}$ is estimated from the data.
+
+The variance of the adjusted metric is:
+
+$$\text{Var}(Y_{\text{adjusted}}) = \text{Var}(Y)(1 - \rho^2)$$
+
+where $\rho$ is the correlation between $Y$ and $X$. For behavioral metrics (CTR, revenue), $\rho$ is typically 0.4–0.7, yielding variance reduction of 16–49%. This means you can run experiments to the same statistical power with 16–49% fewer users, or detect smaller effects in the same experiment duration.
+
+In practice, the Spark aggregation job reads pre-experiment metric values from the 7 days before the experiment's `started_at` timestamp, computes $\theta$ per metric, and produces CUPED-adjusted sufficient statistics alongside the raw statistics.
+
+## Deep dive: Sample Ratio Mismatch (SRM)
+
+**What SRM is and why it invalidates experiments**
+
+Sample Ratio Mismatch occurs when the actual number of users assigned to each variant does not match the expected ratio. If you configure a 50/50 split and observe 10,000 users in control and 8,000 in treatment, something went wrong in the assignment or data collection pipeline. The 2,000 "missing" treatment users were not randomly missing — they were systematically excluded by some bug, which means the treatment population is now a biased subset of the intended population.
+
+The consequence: any measured treatment effect is confounded. You cannot distinguish a real feature effect from a selection effect caused by the biased exclusion. A positive result in an SRM experiment must be discarded, not celebrated. Even a strong p-value is meaningless when the experimental units are not randomly and completely assigned.
+
+**Chi-squared SRM test**
+
+The SRM check uses a chi-squared goodness-of-fit test:
+
+$$\chi^2 = \sum_i \frac{(O_i - E_i)^2}{E_i}$$
+
+where $O_i$ is the observed count per variant and $E_i$ is the expected count given the configured traffic split. If the resulting p-value is below 0.01, declare SRM. Use 0.01 rather than 0.05 to reduce false SRM alarms — the experiment is unlikely to be meaningfully compromised by a 0.1% assignment deviation, but a 5% deviation is serious.
+
+**Common SRM causes**
+
+The most frequent SRM causes are: bot filtering applied to only one variant (bots are more likely to have deterministic request patterns that a WAF assigns to one side of a hash), redirect chains that fail silently (treatment users experience a redirect that some fraction abandon before the page load event fires), caching differences (if the CDN caches pages differently for treatment vs. control, some treatment users see the cached control page but log as treatment), and client-side experiment assignment that fires before an eligibility check (users who do not meet a precondition are excluded from one side only).
+
+**Response when SRM is detected**
+
+When SRM is detected, the platform must: (1) surface a prominent SRM warning in the experiment results UI — before any metric results; (2) suppress all metric significance calls and prevent the experiment from being marked as conclusive; (3) alert the experiment owner with the observed vs. expected ratio and a link to SRM debugging documentation. The experiment owner must investigate and resolve the root cause before re-running.
+
+## Deep dive: Experiment isolation and holdout groups
+
+**Orthogonal layering in detail**
+
+The proof that layering produces orthogonal assignment: user X's eligibility bucket in Layer 1 is `hash(X + "layer_1")`. Their eligibility bucket in Layer 2 is `hash(X + "layer_2")`. Because SHA-256 is a pseudorandom function, these two values are statistically independent — knowing one gives no information about the other. Concretely, if you were to plot every user's Layer 1 bucket against their Layer 2 bucket, the scatter plot would show a uniform distribution across the 10,000 × 10,000 space with no visible structure. This independence means that experiments in different layers can be analyzed as if they ran on completely separate user populations, even though they share the same users.
+
+This matters for analysis: if a user is in both Experiment A (Layer 1) and Experiment C (Layer 2), their behavior is attributed to both experiments independently. The treatment effect of Experiment A is estimated by comparing all users in treatment_A to all users in control_A — including those who are in treatment_C and those in control_C — because the Layer 2 assignment is orthogonal to Layer 1 and does not confound the Layer 1 estimate.
+
+**Permanent holdout implementation**
+
+A permanent holdout protects a fixed fraction of users from all experiments indefinitely. This lets you measure the cumulative product impact of your experimentation program, rather than just individual experiment effects.
+
+```python
+HOLDOUT_BUCKET_MAX = 1000
+
+def is_holdout(user_id: str) -> bool:
+    bucket = compute_bucket(user_id, "global_holdout_v1")
+    return bucket < HOLDOUT_BUCKET_MAX
+
+def get_variant(user_id: str, experiment: dict) -> str | None:
+    if is_holdout(user_id):
+        return None
+    return _compute_variant_assignment(user_id, experiment)
+```
+
+After 6 months, analysts query the holdout group's metrics (session duration, revenue per user, retention rate) and compare them to the non-holdout group. If the experimentation program is producing real improvements, non-holdout users should show compounding gains relative to holdout users over the 6-month period. If the gap is flat or negative, experiments are shipping neutral or harmful changes despite passing individual significance tests — which is a signal to investigate the platform's false positive rate.
+
+## Python — Part A: StatisticalAnalyzer
+
+```python
+import numpy as np
+from scipy import stats
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class MetricResult:
+    metric_name: str
+    control_mean: float
+    treatment_mean: float
+    lift_pct: float
+    p_value: float
+    ci_low: float
+    ci_high: float
+    is_significant: bool
+    sample_size_control: int
+    sample_size_treatment: int
+
+class StatisticalAnalyzer:
+    def __init__(self, alpha: float = 0.05):
+        self.alpha = alpha
+
+    def analyze_metric(self, metric_name: str,
+                       control_sum: float, control_sum_sq: float, control_n: int,
+                       treatment_sum: float, treatment_sum_sq: float,
+                       treatment_n: int) -> MetricResult:
+        ctrl_mean = control_sum / control_n
+        trt_mean = treatment_sum / treatment_n
+
+        ctrl_var = max((control_sum_sq / control_n) - ctrl_mean ** 2, 1e-10)
+        trt_var = max((treatment_sum_sq / treatment_n) - trt_mean ** 2, 1e-10)
+
+        se = np.sqrt(ctrl_var / control_n + trt_var / treatment_n)
+        t_stat = (trt_mean - ctrl_mean) / se
+
+        df = (ctrl_var / control_n + trt_var / treatment_n) ** 2 / (
+            (ctrl_var / control_n) ** 2 / (control_n - 1) +
+            (trt_var / treatment_n) ** 2 / (treatment_n - 1)
+        )
+        p_value = float(2 * stats.t.sf(abs(t_stat), df))
+
+        z = stats.norm.ppf(1 - self.alpha / 2)
+        ci_low = (trt_mean - ctrl_mean) - z * se
+        ci_high = (trt_mean - ctrl_mean) + z * se
+        lift_pct = (trt_mean - ctrl_mean) / ctrl_mean * 100 if ctrl_mean != 0 else 0.0
+
+        return MetricResult(
+            metric_name=metric_name,
+            control_mean=ctrl_mean,
+            treatment_mean=trt_mean,
+            lift_pct=lift_pct,
+            p_value=p_value,
+            ci_low=ci_low,
+            ci_high=ci_high,
+            is_significant=p_value < self.alpha,
+            sample_size_control=control_n,
+            sample_size_treatment=treatment_n,
+        )
+
+    def check_srm(self, control_n: int, treatment_n: int,
+                  expected_ratio: float = 0.5) -> tuple[bool, float]:
+        total = control_n + treatment_n
+        expected_ctrl = total * (1 - expected_ratio)
+        expected_trt = total * expected_ratio
+        _, p = stats.chisquare([control_n, treatment_n], [expected_ctrl, expected_trt])
+        return bool(p < 0.01), float(p)
+```
+
+## Python — Part B: AssignmentService
+
+```python
+import hashlib
+import json
+import redis
+from typing import Optional
+
+class AssignmentService:
+    def __init__(self, redis_client: redis.Redis):
+        self.redis = redis_client
+        self._cache: dict = {}
+
+    def get_variant(self, user_id: str, experiment_id: str) -> Optional[str]:
+        experiment = self._load_experiment(experiment_id)
+        if experiment is None or experiment["status"] != "RUNNING":
+            return None
+
+        eligibility_bucket = self._bucket(user_id, experiment_id + ":eligibility")
+        if eligibility_bucket >= experiment["traffic_percent"] * 100:
+            return None
+
+        assignment_bucket = self._bucket(user_id, experiment_id)
+        cumulative = 0
+        for variant in experiment["variants"]:
+            cumulative += variant["traffic_split"] * 100
+            if assignment_bucket < cumulative:
+                return variant["name"]
+        return experiment["variants"][-1]["name"]
+
+    def get_all_assignments(self, user_id: str) -> dict[str, str]:
+        exp_ids = self.redis.smembers("experiments:active")
+        return {
+            eid.decode(): v
+            for eid in exp_ids
+            if (v := self.get_variant(user_id, eid.decode())) is not None
+        }
+
+    def _bucket(self, user_id: str, salt: str) -> int:
+        key = f"{user_id}:{salt}"
+        return int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) % 10000
+
+    def _load_experiment(self, experiment_id: str) -> Optional[dict]:
+        if experiment_id in self._cache:
+            return self._cache[experiment_id]
+        raw = self.redis.get(f"experiment:{experiment_id}")
+        if raw is None:
+            return None
+        exp = json.loads(raw)
+        self._cache[experiment_id] = exp
+        return exp
+```
+
+The `_cache` dictionary is a process-local in-memory cache that eliminates redundant Redis round-trips within a single request. For a bulk assignment call covering 1,000 active experiments, the first call for each experiment hits Redis; subsequent calls for the same experiment within the same request object are served from the dict. A production deployment would add a TTL on this cache (e.g., invalidate entries older than 60 seconds) to pick up experiment config changes without requiring a service restart.
+
+<TradeoffTable title="Statistical Analysis Approaches">
+
+| Approach | Peeking Safe | Sample Efficiency | Complexity | Business Adaptability | Use Case |
+|---|---|---|---|---|---|
+| Frequentist (Welch t-test) | No — checking early inflates false positive rate to 20–30% if done daily | Baseline — sample size determined by power calculation at design time | Low — well-understood, simple to implement and explain to PMs | Low — must commit to experiment duration before launch; cannot reallocate traffic mid-experiment | Standard A/B tests where you can commit to a pre-determined sample size and duration |
+| Bayesian (credible intervals) | Yes — posterior updates naturally with every observation without inflation | Medium — can often stop earlier when posterior probability of improvement exceeds threshold (e.g., 95%) | Medium — requires choosing priors; results are expressed as probability statements rather than p-values, which requires PM education | High — can monitor continuously and make decisions based on current posterior; easy to explain "there is a 92% chance treatment is better" | Products where continuous monitoring is operationally important and teams are comfortable with probabilistic interpretation |
+| Sequential (SPRT / always-valid inference) | Yes — designed specifically for continuous monitoring with type I error control | High — stops as soon as sufficient evidence accumulates in either direction, often 20–40% faster than fixed-horizon | High — requires understanding of sequential test boundaries, mixture martingales, or e-values; harder to implement correctly | Medium — can stop early for wins or losses; traffic allocation remains fixed | High-velocity teams running many short experiments where speed to decision is critical and false positive control must remain strict |
+| Multi-armed bandit (Thompson sampling) | Yes — naturally adapts allocation to accumulating evidence | Very high — concentrates traffic on the winning arm as evidence builds, minimizing regret | Very high — requires online traffic reallocation infrastructure, careful handling of exploration vs. exploitation, and special analysis for inferring treatment effects | Very high — continuously shifts users to better variants; maximizes metric during the experiment, not just after shipping | Situations where the cost of showing users a worse experience is high and you want to maximize the metric during the experiment (e.g., ad CTR, revenue) |
+
+</TradeoffTable>
+
+<Pitfall title="Peeking at results before the pre-determined sample size">
+
+Every time you check an experiment's p-value and consider stopping based on what you see, you inflate your effective false positive rate beyond the nominal alpha. The mathematics is straightforward: if you check at alpha = 0.05 at the end of each of 20 days and stop whenever you see p < 0.05, the actual probability of stopping falsely when the null is true (no real effect) is approximately 20–30%, not 5%.
+
+This is called the optional stopping problem. It is not a subtle statistical curiosity — it is a systematic bias that causes teams to ship features that do not actually work. The reason is that p-values are uniformly distributed under the null hypothesis. If you run a truly null experiment for long enough, the p-value will eventually wander below 0.05 just by chance. Checking frequently and stopping when you see a crossing gives you many opportunities to catch that chance fluctuation.
+
+The disciplined fix is to commit to the experiment's sample size before it starts, based on a power calculation using the minimum detectable effect and baseline metric variance. Do not analyze the data until the pre-committed sample size is reached. If business pressure makes this untenable — PMs will always want to check early — switch to sequential testing methods (SPRT or always-valid inference) that are mathematically designed for continuous monitoring. These methods maintain the nominal false positive rate regardless of when you peek, by using a more conservative stopping boundary that grows wider the earlier you look.
+
+</Pitfall>
+
+<Pitfall title="Ignoring SRM and reporting experiment results anyway">
+
+The temptation is understandable: you have been running an experiment for three weeks, the SRM is mild (a 47/53 split instead of 50/50), and the primary metric shows a beautiful statistically significant improvement. The PM is excited. Why not ship?
+
+Because the 47/53 split is not random variation — it is evidence that the assignment or measurement pipeline is broken in a way that systematically excluded 6% of treatment users. Those 6% are not missing at random. If they were missing at random, you would not see a statistically significant SRM. They are missing because some property of the treatment experience (a redirect, a bot filter, a caching behavior) caused them to fail to log an exposure event. The treatment population you are analyzing is therefore a biased subset: it is the subset of treatment users who successfully navigated whatever obstacle the treatment introduced.
+
+The measured treatment effect is a combination of the true feature effect and the selection effect of excluding the harder-to-retain users. In practice, SRM experiments disproportionately exclude users who are struggling with the new experience — they are the ones who bounce before triggering the exposure event. This means SRM experiments systematically overstate treatment performance by removing the users most likely to have a bad experience.
+
+Always run SRM checks before reporting any metric results. In your results UI, place the SRM status at the top of the page, before the metric table. If SRM is detected, show only the SRM diagnostic information — observed vs. expected counts, chi-squared statistic, p-value — and suppress all metric results. Require the experiment owner to investigate, resolve the root cause, restart the experiment, and re-accumulate clean data before any shipping decision is made.
+
+</Pitfall>
+
+<Curveball title="p = 0.06 after 4 weeks. PM wants to extend it a few more days.">
+
+The answer is no, and the reasoning matters more than the answer.
+
+The experiment was designed with a pre-committed sample size based on a power calculation. That sample size was chosen to detect the minimum detectable effect with 80% power. After 4 weeks, the experiment has accumulated the committed sample size and the result is p = 0.06 — not significant. The PM's instinct to "run it a bit longer" stems from a natural but incorrect intuition: "we're so close to significance, we just need a little more data."
+
+Here is the problem: if the true effect equals the MDE, the p-value at the committed sample size has an 80% chance of being below 0.05 (that is what 80% power means). A p-value of 0.06 at full power is telling you that the true effect is likely smaller than the MDE — not that you are one week away from significance. Running the experiment longer at this point has two problems. First, it is peeking: you are making a stopping decision based on the current p-value, which inflates your false positive rate for this experiment. Second, it is unlikely to help: if the true effect is 0.1% and your MDE was 0.5%, you would need to run the experiment 25 times longer to detect the real effect at 80% power.
+
+The correct path is to declare this experiment inconclusive at the pre-committed sample size and design a new experiment powered for a smaller MDE if you believe there is a real but smaller effect worth chasing. The new experiment's power calculation gives you an honest estimate of how long that experiment needs to run and how much traffic it needs.
+
+</Curveball>
+
+<Curveball title="A/B testing a pricing change — how do you handle network effects?">
+
+Standard A/B testing assumes SUTVA: the Stable Unit Treatment Value Assumption. SUTVA requires that one user's treatment assignment does not affect another user's outcome. For most product experiments — button color, recommendation algorithm, checkout flow — this assumption holds comfortably. For pricing experiments, it does not.
+
+Price experiments violate SUTVA because users interact with each other through the market. In a two-sided marketplace: if you show lower prices to the treatment group, they may buy more, which reduces supply available to the control group, which changes control group outcomes. In a social network: if you change the fee structure for content creators in the treatment group, their audience (potentially in the control group) experiences different content. In ride-sharing: if treatment drivers have different incentives than control drivers, the entire local market's supply/demand equilibrium shifts, affecting all rider outcomes regardless of their assignment.
+
+The solution is cluster-level randomization. Instead of assigning individual users to treatment or control, assign entire independent clusters — typically geographic regions (cities, DMAs, zip codes), or time slots, or device types with non-overlapping user bases. The treatment and control units are now the clusters, not the individual users. Users within a cluster share the same treatment assignment, and the clusters are large enough that interference between them is negligible.
+
+The statistical tradeoff is significant: cluster-level randomization reduces the effective number of independent observations from millions of users to dozens or hundreds of clusters. A city-level pricing experiment with 30 treated cities and 30 control cities has 60 effective observations, not 60 million users. You lose most of your statistical power and need much larger effects to detect significance. This is an unavoidable consequence of interference — you can either pretend SUTVA holds and get a biased estimate of a large effect, or accept the power reduction and get an unbiased estimate of the true (possibly smaller) effect. The right call is always the unbiased estimate.
+
+</Curveball>
+
+<Curveball title="How do you support a permanent holdout group?">
+
+A permanent holdout group is a fixed subset of users who never receive any experiment treatment. They experience the product as it was at the holdout group's creation date, with no feature experiments applied. After 6 or 12 months, the holdout group's long-term metrics (retention, revenue per user, NPS) are compared to the general population. The gap measures the cumulative impact of everything the experimentation program shipped during that period.
+
+Implementation uses the same hash-based bucketing as regular experiment assignment. Before any experiment eligibility check, the assignment service computes the user's position in the global holdout hash space. Users in the bottom 10% of the holdout hash space are assigned to holdout for all time — they receive the default experience regardless of what experiments are running:
+
+```python
+HOLDOUT_BUCKET_MAX = 1000
+
+def is_holdout(user_id: str) -> bool:
+    bucket = compute_bucket(user_id, "global_holdout_v1")
+    return bucket < HOLDOUT_BUCKET_MAX
+```
+
+This check runs before any experiment lookup. If a user is a holdout, all downstream experiment lookups return `None` and the default experience is served. Holdout users' events are still collected — the holdout group's metrics can only be measured if their behavior is recorded.
+
+The holdout group must be invisible to the experiment platform's normal analysis. When computing experiment assignment counts (for SRM checks and sample size tracking), holdout users are excluded from the denominator. When computing experiment metric results, holdout users' events are excluded from all experiment metric aggregations. The holdout group's data is analyzed only in the dedicated holdout analysis pipeline, which runs quarterly and compares holdout vs. non-holdout long-term metrics.
+
+A practical consideration: after a major product redesign (new navigation, new pricing model), the holdout group comparison becomes less meaningful because the "default experience" the holdout group is receiving may no longer be a representative baseline. At that point, the holdout group is reset — a new 10% cohort is designated in the new hash space, and the cumulative measurement clock starts over.
+
+</Curveball>
+
+## Further reading
+
+Ronny Kohavi's book "Trustworthy Online Controlled Experiments: A Practical Guide to A/B Testing" (Cambridge University Press, 2020) is the definitive reference for this domain — Kohavi ran experimentation at Microsoft, Amazon, and Airbnb, and the book contains decades of hard-won lessons on SRM, peeking, metric design, and experiment culture. Netflix uses interleaving experiments for ranking tasks rather than traditional A/B splits: instead of showing user A the old ranking and user B the new ranking, interleaving shows each user a merged list that alternates items from both algorithms, and measures which algorithm's items get clicked more — this eliminates between-user variance entirely and requires far fewer users to detect ranking quality differences. LinkedIn's CUPED paper ("Improving the Sensitivity of Online Controlled Experiments by Utilizing Pre-Experiment Data," KDD 2013) introduced the covariate adjustment technique described in this article and is required reading for anyone building a production experimentation platform. Booking.com published "Three Key Checklists and Remedies for Trustworthy Analysis of Online Controlled Experiments at Scale" (KDD 2019), which systematically catalogs the ways experiment analysis goes wrong in practice — SRM, novelty effects, interaction effects, and multiple testing — and provides concrete remedies for each. Airbnb's engineering blog post "Experiment Reporting Framework" describes how Airbnb built a self-serve experiment analysis platform that automatically checks for SRM, computes CUPED-adjusted metrics, and surfaces guardrail metric regressions, giving product teams statistically rigorous results without requiring a data scientist to be involved in every experiment analysis.
+
+<RelatedQuestions items={[
+  { slug: "ml-inference-pipeline", title: "Design an ML Model Serving Infrastructure", difficulty: "staff" },
+  { slug: "recommendation-engine", title: "Design a Recommendation Engine", difficulty: "staff" },
+  { slug: "feature-store", title: "Design a Feature Store", difficulty: "staff" },
+]} />

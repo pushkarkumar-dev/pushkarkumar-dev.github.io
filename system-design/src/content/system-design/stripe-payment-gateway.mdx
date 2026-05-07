@@ -1,0 +1,635 @@
+---
+title: "Design Stripe's Payment Gateway"
+slug: "stripe-payment-gateway"
+category: "commerce"
+difficulty: "staff"
+estimatedReadMinutes: 26
+tags: ["payments", "idempotency", "webhooks", "card-processing", "pci-dss", "double-entry-ledger", "distributed-transactions"]
+companyFlavors: ["Stripe", "PayPal", "Adyen", "Braintree"]
+prerequisites: ["distributed-unique-id-generator", "distributed-locking-service", "distributed-kv-store"]
+relatedQuestions: ["amazon-product-catalog", "ticketmaster", "uber-ride-matching"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design Stripe's payment processing infrastructure: idempotent charge API, card tokenization and PCI-DSS scope isolation, the double-entry ledger for financial correctness, webhook delivery with at-least-once guarantees, and distributed money movement without distributed transactions."
+javaPackages:
+  - "org.springframework.boot:spring-boot-starter-data-jpa:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+  - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="stripe-payment-gateway" title="Design Stripe's Payment Gateway" />
+
+<Tldr>
+- **Idempotency is the core invariant**: every charge API call takes an `idempotency_key`; if the same key is submitted twice, the second call returns the cached response of the first — money moves exactly once regardless of retries, timeouts, or network partitions.
+- **Card tokenization and PCI-DSS scope isolation**: raw PAN (Primary Account Number) never touches Stripe's application servers; card details POST directly to a vault service (in a separate PCI-DSS-scoped VPC) which returns an opaque `pm_xxx` token; all subsequent operations use only the token.
+- **Double-entry ledger**: every financial movement creates exactly two ledger entries — a debit and a credit — that sum to zero; an account balance is the sum of all its entries; rows are immutable and append-only, which prevents phantom balance bugs and enables audit reconstruction at any point in history.
+- **Webhook delivery with at-least-once guarantees**: Kafka-backed event pipeline feeds a retry worker that delivers events to merchant endpoints with exponential backoff over a 72-hour window; merchants must implement idempotent event handlers to handle the guaranteed-duplicate delivery.
+- **No distributed transactions**: money movement between accounts uses a saga pattern — charge step, then transfer step — with compensating transactions for rollback; the double-entry ledger ensures consistency without two-phase commit across Stripe and the banking network.
+</Tldr>
+
+## The scale of the problem
+
+Stripe was founded in 2010 with a singular ambition: make accepting payments on the internet as simple as adding seven lines of code. By 2024, Stripe was processing more than one trillion dollars in annual payment volume for over one million businesses across 195 countries. At that throughput, the platform handles roughly 250 million API requests per day — not all of them charges, but each one requiring authentication, idempotency checking, logging, and often real-time fraud evaluation. On peak commerce events like Cyber Monday or Black Friday, charge volume can spike to five or ten times the daily average within a window of hours, and the system must absorb that surge without degradation.
+
+The correctness requirements for a payments platform are categorically different from those for a social media feed or a search index. If a tweet is delivered twice to your timeline, the experience is slightly annoying. If a customer's credit card is charged twice for the same order, it triggers a dispute, a chargeback, reputational damage to the merchant, and a violated trust with the cardholder. Double charges in a system processing $1T annually could represent billions of dollars in financial harm. This asymmetry — where false positives (duplicate charges) are far more catastrophic than false negatives (a missed charge that requires a retry) — shapes every architectural decision. Stripe's systems prioritize financial correctness above raw availability. The system prefers returning an error to the merchant over processing a charge in an ambiguous state.
+
+PCI-DSS (Payment Card Industry Data Security Standard) is not optional background reading — it is a regulatory constraint that physically partitions Stripe's architecture. Any system that stores, processes, or transmits raw card numbers (PANs) must satisfy PCI-DSS Level 1 requirements: network segmentation, HSM-managed encryption keys, quarterly penetration testing, restricted personnel access, and comprehensive audit logging. The engineering consequence is that card data collection is deliberately exfiltrated to an isolated vault service via browser-level JavaScript (Stripe.js) before it ever touches Stripe's API servers. Application engineers working on the charge API or fraud systems never handle raw card numbers — they only see opaque tokens. This scope isolation is not just a compliance checkbox; it reduces the blast radius of any future breach and massively simplifies the security audit surface.
+
+## Clarifying questions
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| What payment methods are in scope? | Focus on card payments (Visa, Mastercard, Amex); also support ACH bank transfers | Card payments use synchronous acquirer authorization; ACH is asynchronous (1–3 days) — two different flow patterns |
+| Multi-currency and FX support? | Yes, merchants charge in their local currency; Stripe handles FX conversion at settlement | Requires storing `amount_cents` + `currency` on every ledger entry; balance calculations must never mix currencies |
+| Refunds and partial refunds? | Yes, full or partial refunds up to the original charge amount | Refunds are compensating ledger entries, not reversals; requires tracking `amount_refunded` on the charge record |
+| Recurring subscriptions? | Yes; vault must store payment methods long-term for future charges without re-collection | Vault longevity requirement — tokens must survive indefinitely, not just the session; drives customer + payment_method data model |
+| Fraud detection? | Yes, Stripe Radar runs on every charge before hitting the acquiring bank | Radar adds ~5ms of ML inference latency in the critical path; must be failopen (radar failure ≠ charge blocked) |
+| Marketplace / platform payments? | Yes — a platform charges a customer, then transfers a portion to a connected merchant account | Introduces multi-leg money movement: charge leg + transfer leg; double-entry ledger must support multiple account types |
+| Geographic scope and acquiring banks? | Global; Stripe routes to the optimal acquiring bank per card BIN and region | Multiple acquirer integrations; local acquiring improves authorization rates by 5–10%; acquirer failover required |
+| 3D Secure / Strong Customer Authentication? | Yes; mandatory for EU transactions under PSD2 SCA regulations | Adds an async authentication step before authorization; charge flow has an additional redirect/challenge state |
+
+## Functional requirements
+
+- Create a charge: given a payment method token, amount, and currency, authorize and capture funds from the cardholder's account, with idempotency guarantees so retries never result in duplicate charges.
+- Tokenize a card: accept raw card details (PAN, expiry, CVC) in a PCI-DSS-isolated vault and return an opaque payment method token usable for future charges without re-collecting card data.
+- Process refunds: support full and partial refunds against a previously succeeded charge, with compensating ledger entries maintaining double-entry balance invariants.
+- Manage customers and subscriptions: store customer records with associated payment methods; support recurring billing cycles that charge stored payment methods on a schedule.
+- Deliver webhooks: notify merchant endpoints of payment lifecycle events (charge.succeeded, charge.failed, refund.created, payout.paid) with at-least-once delivery and retry guarantees.
+- Merchant payouts: aggregate settled funds and initiate bank transfers to merchant accounts on a configurable schedule (daily by default), tracking every transfer step in the ledger.
+
+## Non-functional requirements
+
+- **Volume**: $1T+ annual payment volume; 250M API calls/day; peak on Cyber Monday up to 5× baseline.
+- **Latency**: p99 charge API response under 500ms (acquirer authorization is the dominant cost at ~200ms).
+- **Correctness**: zero double-charges; financial correctness is a harder constraint than availability — the system must prefer failing safely over processing ambiguously.
+- **Availability**: 99.99% for the charge API (less than 53 minutes of downtime per year); multi-region active-active with regional failover.
+- **Compliance**: PCI-DSS Level 1 certification; raw PAN must never be stored outside the vault; audit log for every financial event must be retained for 7 years.
+- **Durability**: no financial event lost once acknowledged; double-entry ledger entries are immutable and replicated across at least three availability zones.
+
+<Capacity title="Stripe Payment Gateway Capacity Estimates">
+- **Charge rate**: $\frac{250\text{M API calls/day}}{86{,}400\text{ s/day}} \approx 2{,}894$ API calls/s; peak (Cyber Monday 5×) $\approx 14{,}470$ API calls/s sustained.
+- **Ledger writes**: each charge creates exactly 2 ledger entries; $2{,}894\text{ charges/s} \times 2 = 5{,}788$ ledger rows/s. Annual accumulation: $5{,}788 \times 86{,}400 \times 365 \approx 182\text{B}$ rows/year. At ~50 bytes per row (fixed-width financial record): $182\text{B} \times 50 = 9.1\text{ TB/year}$ of ledger data, append-only.
+- **Idempotency cache**: $2{,}894$ unique charges/s × 24h TTL window = $\approx 250\text{M}$ cached responses simultaneously in Redis. At avg 200 bytes per serialized ChargeObject: $250\text{M} \times 200 = 50\text{ GB}$ Redis memory — well within a single Redis Cluster.
+- **Webhook delivery**: 1 Kafka event per charge $\times 2{,}894$/s = $2{,}894$ webhooks/s baseline; with an average of 3 delivery attempts per event (including retries): $2{,}894 \times 3 = 8{,}682$ delivery attempts/s to merchant endpoints.
+- **Card vault storage**: 500M stored payment methods × 200 bytes per record = **100 GB** — storage is inexpensive; the vault's bottleneck is HSM throughput (encryptions per second) not disk.
+- **Acquirer connections**: assuming 10 acquiring banks worldwide; each sustains $\approx 1{,}447$ charge authorizations/s at baseline — well within modern ISO 8583 connection pool capacity (each bank link handles thousands/s).
+</Capacity>
+
+## API design
+
+**POST /v1/charges**
+
+```json
+{
+  "amount": 2999,
+  "currency": "usd",
+  "payment_method": "pm_1OvXxY2eZvKYlo2CnBtOWePa",
+  "customer": "cus_NhD8HD2bY8dP3V",
+  "description": "Order #12345 — Acme Corp",
+  "metadata": { "order_id": "12345" },
+  "capture_method": "automatic"
+}
+```
+
+Headers: `Authorization: Bearer sk_live_...`, `Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000`
+
+Response: `ChargeObject` with `id` (ch_xxx), `status` (pending / succeeded / failed), `amount`, `currency`, `payment_method_details`, `created`, `balance_transaction`.
+
+**POST /v1/payment_methods**
+
+Accepts raw card data: `{ "type": "card", "card": { "number": "4242...", "exp_month": 12, "exp_year": 2027, "cvc": "314" } }`. This endpoint is served directly by the Vault Service — it never reaches Stripe's standard API servers. Returns `PaymentMethodObject` with `id` (pm_xxx), `card.last4`, `card.brand`, `card.fingerprint`.
+
+**POST /v1/refunds**
+
+```json
+{ "charge": "ch_1OvXxY2eZvKYlo2CPbLRVmVH", "amount": 1000 }
+```
+
+Partial refunds (amount < original charge) are supported. Returns `RefundObject` with `id` (re_xxx), `amount`, `status`, `charge`, `created`.
+
+**`GET /v1/charges/{id}`**
+
+Retrieve a charge with full status history and linked refunds, balance transactions, and dispute information.
+
+**POST /v1/webhooks**
+
+Register a merchant endpoint: `{ "url": "https://merchant.com/stripe-webhooks", "enabled_events": ["charge.succeeded", "charge.refunded", "payout.paid"] }`. Returns a `webhook_secret` for HMAC-SHA256 signature verification.
+
+**POST /v1/payouts**
+
+Initiate a merchant payout to a linked bank account: `{ "amount": 97000, "currency": "usd", "destination": "ba_1OvXxY..." }`. Returns `PayoutObject` with multi-step status tracking (initiated → pending → in_transit → paid).
+
+## Data model
+
+**charges (PostgreSQL)**
+
+```sql
+CREATE TABLE charges (
+  charge_id        VARCHAR(32) PRIMARY KEY,
+  customer_id      VARCHAR(32) NOT NULL,
+  merchant_id      VARCHAR(32) NOT NULL,
+  amount_cents     BIGINT NOT NULL CHECK (amount_cents > 0),
+  currency         CHAR(3) NOT NULL,
+  status           VARCHAR(16) NOT NULL DEFAULT 'pending',
+  payment_method_id VARCHAR(32) NOT NULL,
+  idempotency_key  VARCHAR(255) NOT NULL,
+  acquirer_id      VARCHAR(16),
+  acquirer_auth_code VARCHAR(8),
+  acquirer_response_code VARCHAR(4),
+  amount_refunded  BIGINT NOT NULL DEFAULT 0,
+  description      TEXT,
+  metadata         JSONB,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT uq_idempotency UNIQUE (merchant_id, idempotency_key)
+);
+CREATE INDEX idx_charges_customer ON charges(customer_id, created_at DESC);
+CREATE INDEX idx_charges_merchant ON charges(merchant_id, created_at DESC);
+```
+
+The `UNIQUE (merchant_id, idempotency_key)` constraint is the database-level safety net for idempotency — even if Redis fails, a duplicate insert will fail with a unique constraint violation, and the handler can return the existing charge.
+
+**ledger_entries (PostgreSQL, append-only)**
+
+```sql
+CREATE TABLE ledger_entries (
+  entry_id         BIGSERIAL PRIMARY KEY,
+  account_id       VARCHAR(32) NOT NULL,
+  amount_cents     BIGINT NOT NULL,
+  currency         CHAR(3) NOT NULL,
+  reference_id     VARCHAR(32) NOT NULL,
+  reference_type   VARCHAR(16) NOT NULL,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_ledger_account ON ledger_entries(account_id, created_at DESC);
+CREATE INDEX idx_ledger_reference ON ledger_entries(reference_id);
+```
+
+No `UPDATE` or `DELETE` ever executes against this table. Corrections are new entry pairs (a reversal debit + credit). This immutability makes the ledger auditable: you can reconstruct any account's balance at any historical timestamp with `SUM(amount_cents) WHERE account_id = ? AND created_at <= ?`.
+
+**payment_methods (Vault DB — PCI-DSS isolated)**
+
+```sql
+CREATE TABLE payment_methods (
+  pm_id            VARCHAR(32) PRIMARY KEY,
+  customer_id      VARCHAR(32) NOT NULL,
+  encrypted_blob   BYTEA NOT NULL,
+  last4            CHAR(4) NOT NULL,
+  brand            VARCHAR(16) NOT NULL,
+  exp_month        SMALLINT NOT NULL,
+  exp_year         SMALLINT NOT NULL,
+  fingerprint      VARCHAR(64) NOT NULL,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX idx_pm_fingerprint ON payment_methods(customer_id, fingerprint);
+```
+
+`encrypted_blob` holds the HSM-encrypted PAN. `fingerprint` is a keyed HMAC of the PAN (using a separate vault key) that allows detecting duplicate card additions by the same customer without decrypting. The Vault DB lives in a separate VPC with no public-internet route; it is reachable only from the Vault Service via mTLS on internal CA certificates.
+
+**idempotency_cache (Redis)**
+
+```text
+Key:   "idempotent:{merchant_id}:{idempotency_key}"
+Value: serialized JSON ChargeObject (gzip-compressed)
+TTL:   24 hours
+```
+
+Separate lock key: `"lock:idempotent:{merchant_id}:{idempotency_key}"` — SET NX with 30-second TTL, released after charge completes.
+
+**webhook_events (PostgreSQL + Kafka)**
+
+```sql
+CREATE TABLE webhook_events (
+  event_id         VARCHAR(32) PRIMARY KEY,
+  merchant_id      VARCHAR(32) NOT NULL,
+  type             VARCHAR(64) NOT NULL,
+  payload          JSONB NOT NULL,
+  delivery_status  VARCHAR(16) NOT NULL DEFAULT 'pending',
+  attempt_count    SMALLINT NOT NULL DEFAULT 0,
+  next_retry_at    TIMESTAMPTZ,
+  delivered_at     TIMESTAMPTZ,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+A Kafka topic `webhook-events` (partitioned by `merchant_id`) feeds the delivery worker fleet. The PostgreSQL table is the authoritative record; Kafka is the delivery mechanism.
+
+## System flow
+
+<Mermaid diagram={`flowchart TD
+    A[Browser / Mobile App] -->|Stripe.js iframe POST card details| V[Vault Service PCI-isolated VPC]
+    V -->|HSM encrypt PAN| HSM[HSM Hardware Security Module]
+    HSM -->|AES-256 ciphertext| V
+    V -->|INSERT payment_methods| VDB[(Vault DB)]
+    V -->|return pm_xxx token| A
+    A -->|POST /v1/charges amount + pm_xxx + Idempotency-Key| API[Charge API]
+    API -->|GET idempotent cache key| RC[(Redis Cache)]
+    RC -->|cache HIT| API
+    API -->|cache HIT: return cached ChargeObject| A
+    API -->|cache MISS: SET NX lock key 30s| RC
+    RC -->|lock acquired| API
+    API -->|INSERT charge status=pending| PG[(PostgreSQL)]
+    API -->|RPC tokenAuthorize pm_xxx| V
+    V -->|decrypt PAN from HSM| HSM
+    V -->|PAN + amount + currency| ACQ[Acquiring Bank ISO 8583]
+    ACQ -->|auth_code + response_code 200ms| V
+    V -->|acquirer response| API
+    API -->|UPDATE charge status=succeeded| PG
+    API -->|INSERT 2 ledger entries debit+credit| PG
+    API -->|SET idempotency cache 24h TTL| RC
+    API -->|DEL lock key| RC
+    API -->|Produce charge.succeeded| KF[Kafka webhook-events]
+    API -->|return ChargeObject 200 OK| A
+    KF -->|consume| WW[Webhook Worker]
+    WW -->|fetch endpoint URL + HMAC secret| PG
+    WW -->|POST event + Stripe-Signature header| ME[Merchant Endpoint]
+    ME -->|200 OK| WW
+    WW -->|UPDATE delivery_status=delivered| PG
+    ME -->|5xx or timeout| WW
+    WW -->|exponential backoff retry schedule| WW`} />
+
+**Card charge flow (step by step)**
+
+1. The browser renders a payment form inside a Stripe.js-managed iframe hosted on `js.stripe.com` — card numbers are typed into an iframe Stripe controls, so raw card data never appears in the merchant's DOM or JavaScript context.
+2. On form submit, Stripe.js POSTs card details directly to the Vault Service endpoint (not the merchant's server and not Stripe's main API). The Vault Service tokenizes the PAN via HSM-managed AES-256 encryption and returns a `pm_xxx` token.
+3. The merchant's client code sends `pm_xxx` + `amount` + `currency` + `Idempotency-Key` header to `POST /v1/charges` on Stripe's API.
+4. The Charge API computes `cache_key = "idempotent:{merchant_id}:{idempotency_key}"` and checks Redis. On a cache hit, the cached `ChargeObject` is returned immediately — no money moves again.
+5. On a cache miss, the API acquires a distributed lock (`SET NX` on `lock:{cache_key}` with 30-second TTL). If lock acquisition fails, the request waits briefly and re-checks the cache (the lock holder may have completed).
+6. The API persists a `charge` row in PostgreSQL with `status = pending` — this is the durable record of intent before any money moves.
+7. The API makes an RPC to the Vault Service: "authorize payment method `pm_xxx` for `$29.99 USD`." The Vault Service decrypts the PAN via the HSM and submits an ISO 8583 authorization request to the acquiring bank.
+8. The acquiring bank responds in ~200ms with an authorization code and response code. The Vault Service returns this to the Charge API without ever exposing the PAN.
+9. In a single database transaction, the API updates `charges.status = succeeded` and inserts two `ledger_entries` rows: `(customer_account, -2999, 'usd')` and `(stripe_revenue_pool, +2999, 'usd')`.
+10. The API writes the serialized `ChargeObject` to Redis with a 24-hour TTL, releases the lock, publishes a `charge.succeeded` event to the Kafka topic, and returns the `ChargeObject` to the merchant.
+
+**Webhook delivery flow**
+
+A Kafka consumer group of Webhook Workers consumes from the `webhook-events` topic. For each event: (1) fetch the merchant's endpoint URL and HMAC secret from a config store; (2) serialize the event payload as JSON; (3) compute `Stripe-Signature: t=<timestamp>,v1=<HMAC-SHA256(secret, timestamp.payload)>`; (4) POST to the merchant's endpoint with a 5-second timeout. A 2xx response marks the event delivered. Any other result schedules a retry with exponential backoff: 1 minute, 5 minutes, 30 minutes, 2 hours, 8 hours, 24 hours, up to three additional 24-hour attempts (72 hours total). After 72 hours without a successful delivery, the event is marked `failed` and the merchant is alerted via dashboard notification.
+
+## Deep dives
+
+### Idempotency: the most important invariant
+
+Consider the failure scenario that idempotency is designed to prevent. A merchant's server sends a charge request to Stripe. The network times out after 5 seconds — the merchant receives no response. From the merchant's perspective, the charge may or may not have succeeded. If they retry without an idempotency key, they create a second charge. If they do not retry, they may miss capturing a successful payment. This ambiguity is the core problem.
+
+With `Idempotency-Key`, the protocol becomes: the client generates a UUID **before** the request (not the charge ID, which is server-generated). The UUID represents this payment intent. Every retry for the same intent carries the same UUID. Stripe's algorithm:
+
+1. Compute `cache_key = "idempotent:{merchant_id}:{idempotency_key}"`.
+2. Check Redis for `cache_key`. If found, return the cached `ChargeObject` immediately. The merchant sees the same response they would have seen on the first successful call. Money moved exactly once.
+3. If not in Redis, acquire distributed lock `SET NX lock:{cache_key} 1 EX 30`. This serializes concurrent requests with the same idempotency key — a client that retries immediately (before the first request completes) waits on the lock, then hits the cache on release.
+4. After acquiring the lock, re-check Redis (double-check locking). If a previous holder of the lock already completed and populated the cache, return early.
+5. Execute the charge. On success or failure, write the `ChargeObject` to Redis (`SET cache_key <serialized> EX 86400`) before releasing the lock.
+
+The database-level `UNIQUE (merchant_id, idempotency_key)` constraint is the last line of defense if Redis fails between step 2 and step 5. A duplicate `INSERT` into `charges` will raise a unique constraint violation; the handler catches this, reads the existing charge by `(merchant_id, idempotency_key)`, and returns it as the idempotent response.
+
+The key insight here is that idempotency cache + distributed lock together make the charge endpoint behave as if it were atomic, even though the underlying sequence — Redis check, lock acquire, DB write, bank call, DB update, cache write — is not atomic. The lock prevents concurrent races; the cache prevents redundant processing after the fact; the DB constraint prevents the rare case where both fail.
+
+### PCI-DSS scope isolation
+
+PCI-DSS Level 1 (required for Stripe's volume) mandates that any system storing, processing, or transmitting cardholder data must satisfy 12 requirement domains including network segmentation, access control, cryptography, monitoring, and testing. The engineering response is to minimize PCI scope to the smallest possible subsystem.
+
+The architecture achieves this in layers. First, **client-side isolation via Stripe.js**: the payment form renders inside an `<iframe>` served from `js.stripe.com` — a Stripe-controlled origin. The parent merchant page cannot access the iframe's DOM via JavaScript due to same-origin policy. Card numbers entered in the iframe are posted directly from the iframe to Stripe's vault endpoint; the card data never appears in the merchant's JavaScript heap, never touches the merchant's servers, and never flows through the merchant's network. This keeps the merchant entirely out of PCI scope.
+
+Second, **vault service network isolation**: the Vault Service runs in a separate VPC with no public-internet inbound routes. It is reachable only via internal mTLS connections from authorized Stripe services (the Charge API, the Subscription billing service). The Vault DB (containing encrypted PANs) has no outbound internet route; its only connection is to the HSM cluster on a dedicated hardware segment. Audit logs of every decrypt operation are written to an append-only log store with tamper-detection checksums.
+
+Third, **HSM key management**: AES-256 encryption keys are generated and stored inside Hardware Security Modules (e.g., Thales Luna HSMs). The key material never appears in plaintext in any software process. The Vault Service calls the HSM API to encrypt/decrypt — the HSM performs the operation in hardware and returns only the ciphertext or plaintext. Key rotation is automated quarterly without re-encrypting stored PANs (envelope encryption: a data encryption key (DEK) per record, wrapped with the HSM-managed key encryption key (KEK); only the KEK needs rotation, which re-wraps all DEKs without touching ciphertext).
+
+The operational cost of this isolation is that the Vault Service is a synchronous RPC call in the critical path of every charge. Vault service p99 latency must be under 50ms to keep the overall charge API under 500ms. The vault fleet is horizontally scalable and stateless (all state is in the Vault DB and HSM), so capacity scales with pod count.
+
+### Double-entry ledger
+
+The double-entry bookkeeping system, invented in 15th-century Venice, encodes a mathematical invariant: for every financial transaction, the sum of debits equals the sum of credits. Stripe implements this as a database-level constraint: every financial event writes exactly two rows to `ledger_entries`, and these two rows must sum to zero in the same currency.
+
+A $29.99 charge to a customer:
+
+```
+entry_id | account_id              | amount_cents | reference_id | reference_type
+---------|-------------------------|--------------|--------------|---------------
+1001     | customer:cus_NhD8...    | -2999        | ch_1OvX...   | charge
+1002     | stripe:revenue_pool_usd | +2999        | ch_1OvX...   | charge
+```
+
+A subsequent $3.00 platform fee and $26.99 merchant payout:
+
+```
+entry_id | account_id              | amount_cents | reference_id | reference_type
+---------|-------------------------|--------------|--------------|---------------
+1003     | stripe:revenue_pool_usd | -300         | tr_1OvX...   | platform_fee
+1004     | stripe:fee_revenue_usd  | +300         | tr_1OvX...   | platform_fee
+1005     | stripe:revenue_pool_usd | -2699        | po_1OvX...   | payout
+1006     | merchant:acct_...       | +2699        | po_1OvX...   | payout
+```
+
+The invariant: `SELECT SUM(amount_cents) FROM ledger_entries` = 0 always. This is auditable at any point in time. An account balance is `SELECT SUM(amount_cents) WHERE account_id = ?`. A balance at a historical timestamp is `SELECT SUM(amount_cents) WHERE account_id = ? AND created_at <= '2024-01-01'`. The immutability of ledger rows means there are no phantom updates — you cannot accidentally corrupt the ledger by running an errant `UPDATE`. Corrections are always new reversal pairs.
+
+The two rows of a double-entry pair are written in a single database transaction. If the transaction commits, both rows exist and sum to zero. If the transaction rolls back, neither row exists. There is no intermediate state where one row exists without the other. This transactionality is why the ledger uses PostgreSQL (ACID) rather than a NoSQL store.
+
+### Distributed money movement without two-phase commit
+
+Moving money from Stripe's reserve to a merchant's bank account via ACH involves an external party (a bank) that does not participate in database transactions. This is the canonical challenge of distributed money movement: you cannot wrap a bank transfer in a `BEGIN ... COMMIT` block.
+
+Stripe uses a saga pattern — a sequence of local transactions with compensating transactions for rollback. For a merchant payout:
+
+1. **Initiate payout**: INSERT a `payouts` row with `status = initiated`. This is idempotent — the payout record has a unique ID and the INSERT fails if retried with the same payout ID.
+2. **Debit Stripe reserve**: INSERT two `ledger_entries` rows (debit `stripe:revenue_pool_usd`, credit `payout:po_xxx_pending`). Payout is now "reserved" in the ledger.
+3. **Submit ACH instruction**: call the bank's API with the payout amount and merchant's routing/account numbers. Receive a bank reference number. Store the reference number on the payout record.
+4. **Await bank confirmation**: ACH transfers settle within 1–3 business days. A background poller queries the bank API (or processes SFTP file drops) for settlement confirmation.
+5. **Mark settled**: on confirmation, UPDATE `payouts.status = paid`, INSERT final `ledger_entries` rows (debit `payout:po_xxx_pending`, credit `merchant_bank:external`), publish `payout.paid` Kafka event.
+
+**Failure handling**: if step 3 fails (bank API returns an error), execute a compensating transaction: INSERT two `ledger_entries` rows reversing step 2 (re-credit `stripe:revenue_pool_usd`, debit `payout:po_xxx_pending` to zero it out), UPDATE `payouts.status = failed`. If step 4 times out (bank does not respond), the background poller continues retrying using the stored bank reference number — the ACH instruction was submitted, so Stripe does not resubmit (bank reference prevents duplicate wire transfers). If step 5 fails (DB write fails), the background poller retries the confirmation processing — idempotent because writing the same ledger entries with the same `reference_id` will trigger the `(reference_id, reference_type)` unique index.
+
+The key insight: no component in this flow requires a distributed transaction across Stripe's database and the bank's systems. Each step is a local, ACID transaction. The saga's state machine is persisted in the `payouts` table. Failure at any step either leaves a consistent intermediate state (that the poller can recover from) or is immediately compensated.
+
+### Fraud detection with Stripe Radar
+
+Every charge passes through Stripe Radar synchronously before the Vault Service submits an authorization to the acquiring bank. Radar's value proposition is network-wide signal: a card that committed fraud against Merchant A five minutes ago is blocked before it reaches Merchant B's charge, because Stripe observes transactions across all one million of its merchants.
+
+The Radar evaluation pipeline for a charge:
+
+1. **Feature extraction** (~1ms): card fingerprint, BIN-level risk attributes, IP geolocation vs billing address country, device fingerprint (from Stripe.js fingerprinting), velocity metrics from Redis (charges on this card fingerprint in the last 1h/24h/7d), 3DS2 authentication result if present.
+2. **Rule evaluation** (~1ms): merchant-defined custom rules (e.g., "block all transactions above $500 from high-risk countries") evaluated against an in-memory rule engine; also Stripe's built-in rule set.
+3. **ML inference** (~3–5ms): gradient boosting model trained on Stripe's global transaction history; outputs a risk score 0–100. Thresholds: score < 30 = allow, 30–75 = review, > 75 = block (configurable per merchant).
+4. **Block list check** (~0.5ms): Redis SET of blocked card fingerprints; `SISMEMBER blocked_fingerprints <fingerprint>`.
+
+Total Radar latency budget: ~8ms. This is synchronous in the critical path — Radar must respond before the authorization request is submitted. If Radar's ML service is unavailable, the system is fail-open: the charge proceeds without ML scoring (rule evaluation still runs). A missed fraud detection is recoverable via chargeback; a blocked legitimate transaction is not — fail-open minimizes merchant revenue impact.
+
+## Java integration
+
+**Part A — IdempotentChargeService.java**
+
+```java
+package com.stripe.payments.service;
+
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import java.util.concurrent.TimeUnit;
+
+@Service
+public class IdempotentChargeService {
+
+    private final StringRedisTemplate redis;
+    private final ChargeRepository chargeRepository;
+    private final LedgerRepository ledgerRepository;
+    private final AcquirerClient acquirerClient;
+    private final ObjectMapper mapper;
+
+    public IdempotentChargeService(StringRedisTemplate redis,
+                                   ChargeRepository chargeRepository,
+                                   LedgerRepository ledgerRepository,
+                                   AcquirerClient acquirerClient,
+                                   ObjectMapper mapper) {
+        this.redis = redis;
+        this.chargeRepository = chargeRepository;
+        this.ledgerRepository = ledgerRepository;
+        this.acquirerClient = acquirerClient;
+        this.mapper = mapper;
+    }
+
+    public ChargeResult processCharge(ChargeRequest request) throws Exception {
+        String cacheKey = "idempotent:" + request.merchantId() + ":" + request.idempotencyKey();
+        String lockKey  = "lock:" + cacheKey;
+
+        String cached = redis.opsForValue().get(cacheKey);
+        if (cached != null) {
+            return mapper.readValue(cached, ChargeResult.class);
+        }
+
+        Boolean locked = redis.opsForValue()
+                .setIfAbsent(lockKey, "1", 30, TimeUnit.SECONDS);
+        if (!locked) {
+            Thread.sleep(200);
+            cached = redis.opsForValue().get(cacheKey);
+            if (cached != null) return mapper.readValue(cached, ChargeResult.class);
+            throw new RetryableException("Lock contention on idempotency key");
+        }
+
+        try {
+            ChargeResult result = executeCharge(request);
+            redis.opsForValue().set(cacheKey, mapper.writeValueAsString(result),
+                    24, TimeUnit.HOURS);
+            return result;
+        } finally {
+            redis.delete(lockKey);
+        }
+    }
+
+    @Transactional
+    private ChargeResult executeCharge(ChargeRequest request) {
+        ChargeEntity charge = chargeRepository.save(
+                ChargeEntity.pending(request));
+        AcquirerResponse resp = acquirerClient.authorize(
+                request.paymentMethodId(), request.amountCents(), request.currency());
+        if (resp.approved()) {
+            charge.markSucceeded(resp.authCode());
+            chargeRepository.save(charge);
+            ledgerRepository.saveAll(LedgerEntry.forCharge(charge));
+            return ChargeResult.success(charge);
+        } else {
+            charge.markFailed(resp.declineCode());
+            chargeRepository.save(charge);
+            return ChargeResult.failure(charge, resp.declineCode());
+        }
+    }
+
+    public record ChargeRequest(String merchantId, String idempotencyKey,
+                                String paymentMethodId, long amountCents,
+                                String currency, String customerId) {}
+
+    public record ChargeResult(String chargeId, String status,
+                               long amountCents, String currency,
+                               String declineCode) {
+        static ChargeResult success(ChargeEntity c) {
+            return new ChargeResult(c.getChargeId(), "succeeded",
+                    c.getAmountCents(), c.getCurrency(), null);
+        }
+        static ChargeResult failure(ChargeEntity c, String code) {
+            return new ChargeResult(c.getChargeId(), "failed",
+                    c.getAmountCents(), c.getCurrency(), code);
+        }
+    }
+}
+```
+
+**Part B — ChargeController.java**
+
+```java
+package com.stripe.payments.controller;
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/v1")
+public class ChargeController {
+
+    private final IdempotentChargeService chargeService;
+    private final RefundService refundService;
+    private final MerchantAuthService authService;
+    private final KafkaTemplate<String, String> kafka;
+
+    public ChargeController(IdempotentChargeService chargeService,
+                            RefundService refundService,
+                            MerchantAuthService authService,
+                            KafkaTemplate<String, String> kafka) {
+        this.chargeService = chargeService;
+        this.refundService = refundService;
+        this.authService = authService;
+        this.kafka = kafka;
+    }
+
+    @PostMapping("/charges")
+    public ResponseEntity<ChargeResponse> createCharge(
+            @RequestHeader("Idempotency-Key") String idempotencyKey,
+            @RequestHeader("Authorization") String authHeader,
+            @RequestBody ChargeRequest body) throws Exception {
+
+        if (idempotencyKey == null || idempotencyKey.isBlank())
+            return ResponseEntity.badRequest().build();
+
+        Merchant merchant = authService.authenticate(authHeader);
+        validate(body);
+
+        IdempotentChargeService.ChargeRequest req =
+                new IdempotentChargeService.ChargeRequest(
+                        merchant.id(), idempotencyKey,
+                        body.paymentMethod(), body.amount(),
+                        body.currency(), body.customer());
+
+        IdempotentChargeService.ChargeResult result =
+                chargeService.processCharge(req);
+
+        String eventType = "succeeded".equals(result.status())
+                ? "charge.succeeded" : "charge.failed";
+        kafka.send("webhook-events", merchant.id(),
+                WebhookEvent.toJson(eventType, result));
+
+        return ResponseEntity.ok(ChargeResponse.from(result));
+    }
+
+    @PostMapping("/refunds")
+    public ResponseEntity<RefundResponse> createRefund(
+            @RequestHeader("Authorization") String authHeader,
+            @RequestBody RefundRequest body) {
+
+        Merchant merchant = authService.authenticate(authHeader);
+        RefundResult refund = refundService.processRefund(
+                merchant.id(), body.charge(), body.amount());
+        kafka.send("webhook-events", merchant.id(),
+                WebhookEvent.toJson("charge.refunded", refund));
+        return ResponseEntity.ok(RefundResponse.from(refund));
+    }
+
+    private void validate(ChargeRequest body) {
+        if (body.amount() <= 0)
+            throw new ValidationException("amount must be positive");
+        if (!Currency.isValid(body.currency()))
+            throw new ValidationException("invalid currency code");
+    }
+}
+```
+
+## Tradeoffs
+
+<TradeoffTable
+  headers={["Approach", "Double-Charge Risk", "Financial Correctness", "Latency", "Complexity"]}
+  rows={[
+    [
+      "No idempotency (naive retry)",
+      "Critical — every retry on timeout creates a new charge; double charges are a routine failure mode, not an edge case",
+      "None — the system has no mechanism to detect or prevent duplicate money movement",
+      "Low — no extra lookups; charge on every request",
+      "Low to build, extremely high to operate — support queues fill with dispute and refund requests"
+    ],
+    [
+      "Client-side dedup only",
+      "High — the client can dedup its own retries but cannot prevent two different client instances (browser tab + mobile app) from submitting the same payment intent simultaneously",
+      "Weak — client-controlled logic is outside your system boundary and subject to bugs, crashes, and races",
+      "Low — no server-side overhead beyond the charge itself",
+      "Low server complexity; high client complexity; fragile across client restarts and session loss"
+    ],
+    [
+      "Idempotency key + DB UNIQUE constraint (no Redis)",
+      "Low — DB constraint catches exact duplicates; concurrent races resolved by DB serialization",
+      "Strong — DB constraint is ACID; a duplicate INSERT fails deterministically",
+      "Medium — duplicate requests hit the DB for a constraint check before returning; no caching benefit",
+      "Medium — requires careful error handling for constraint violations; no lock mechanism means concurrent races block on DB row lock"
+    ],
+    [
+      "Idempotency key + Redis cache + distributed lock (Stripe's approach)",
+      "Very low — cache prevents hitting DB for known-duplicate requests; lock prevents concurrent races on the same key; DB constraint is final fallback",
+      "Very strong — three-layer defense (Redis, lock, DB constraint) with clear recovery path for each failure mode",
+      "Optimal — duplicate requests return in &lt;1ms from Redis cache hit; first request adds ~2ms for Redis round trips",
+      "High — requires Redis availability for cache + lock; double-check locking pattern must be implemented correctly; lock TTL tuning required"
+    ]
+  ]}
+/>
+
+<Pitfall>
+**Using the `charge_id` as the idempotency key.** The `charge_id` (e.g., `ch_1OvX...`) is generated server-side — typically at the moment the charge row is inserted into the database. If the server crashes after generating the ID and inserting the row but before returning the response to the client, the client has no `charge_id` to retry with. A retry with no idempotency key creates a second charge. The idempotency key must be **client-generated before the request is sent** — typically a UUID v4 generated by the merchant's application when the user initiates checkout. The client stores this UUID locally and includes it on every retry attempt for the same payment intent.
+</Pitfall>
+
+<Pitfall>
+**Storing raw card numbers (PAN) in your application database.** This is an immediate PCI-DSS Level 1 audit failure and a catastrophic security risk. A database breach that exposes plaintext PANs affects every cardholder who has ever used your service. The correct architecture is to use Stripe.js (or an equivalent vault SDK) so raw card data is posted directly to the vault service from the browser — it never passes through your application server, never appears in your application logs, and is never written to your database. All your application ever sees is the opaque `pm_xxx` token, the `last4` digits for display, and the card brand. If you find yourself writing `INSERT INTO users (card_number, ...)`, stop immediately and redesign the data flow.
+</Pitfall>
+
+<Curveball>
+**Your charge API is handling 14,000 requests/second on Cyber Monday peak and the Redis cluster for idempotency cache goes down completely. How do you degrade gracefully without allowing double charges?**
+
+The Redis layer serves two idempotency functions: the cache (fast path for duplicates) and the distributed lock (serialization of concurrent requests with the same key). Losing Redis means losing both.
+
+The first layer of defense is the database `UNIQUE (merchant_id, idempotency_key)` constraint. With Redis down, every charge request falls through to the DB. On the first request for a given idempotency key, a `charges` row is inserted — this succeeds. On a concurrent or retry request with the same key, the `INSERT` raises a unique constraint violation. The error handler catches `DataIntegrityViolationException`, queries `SELECT * FROM charges WHERE merchant_id = ? AND idempotency_key = ?`, and returns the existing charge. This is slower (DB round trips on every "duplicate" request) and provides weaker concurrency guarantees (DB row-level locking rather than a proper distributed lock), but it does not double-charge.
+
+The degraded experience: p99 latency increases as duplicate requests hit the database rather than Redis; the DB primary becomes a bottleneck if duplicate-request volume is high (Cyber Monday retry storms are real). Mitigation: pre-configure read replicas to serve the idempotency key SELECT queries; shed load via the rate limiter; implement a local in-process cache (Caffeine, 100ms TTL) as a partial substitute for Redis that covers same-process duplicates.
+
+Alert on Redis degradation immediately and implement an auto-recovery playbook that promotes a replica to primary — the idempotency cache TTL is 24 hours, so a 2-minute Redis outage means ~0.2% of idempotency keys are lost (the ones set in that window). For those, the DB constraint is the backstop.
+</Curveball>
+
+<Curveball>
+**A merchant reports that their customer was charged twice for the same order, but your idempotency cache shows only one charge and your `charges` table has only one row. The customer's bank statement shows two charges from different acquiring banks. What happened and how do you fix it?**
+
+This is one of the most insidious failure modes in payments infrastructure. The symptom — two bank charges, one Stripe charge record — indicates the double charge originated outside Stripe's system, likely from a misconfigured merchant integration or a rogue retry at the merchant's application layer that used two different idempotency keys.
+
+Investigation checklist: (1) retrieve both bank charges' authorization codes; (2) query Stripe's charge table for both auth codes — if two `charges` rows exist with different `charge_id` values but the same `customer_id` and `amount_cents` within a narrow time window, the merchant submitted two separate charge requests with different idempotency keys; (3) check the merchant's API request logs for both charge requests; (4) examine the time delta — if the two charges are ~30 seconds apart, it suggests a client-side retry with a newly generated idempotency key (a bug in their retry logic that re-generates the UUID on each retry instead of persisting it).
+
+The root cause is almost always a merchant-side bug: the idempotency key is generated inside the retry loop rather than outside it. The fix on the merchant side is straightforward: generate the UUID once, persist it in the order record, and reuse it on all retries for that order.
+
+Stripe's systemic mitigation: expose a `payment_intent` abstraction (which Stripe introduced in 2019). A `PaymentIntent` represents a payment attempt for a specific order and is the canonical idempotency unit — the `PaymentIntent` ID is the effective idempotency key for all state transitions. Merchants who use `PaymentIntents` correctly cannot accidentally create this failure because the `PaymentIntent` state machine (requires_payment_method → requires_confirmation → processing → succeeded) prevents submitting a charge twice against the same intent.
+
+For the immediate resolution: refund one of the two charges; reach out to the merchant with a detailed explanation and code sample showing correct idempotency key management.
+</Curveball>
+
+<Curveball>
+**Stripe wants to add "Link" — a one-click checkout feature where a user's payment method is stored with Stripe centrally and auto-filled on any Stripe merchant checkout, authenticated by their email or phone number. How does this change your vault architecture and what new security concerns arise?**
+
+Link fundamentally changes the vault's access pattern. Today, a payment method stored in the vault is scoped to a single merchant (the merchant whose customer tokenized the card). Link requires that a user's payment method be retrievable by any Stripe merchant, authenticated by the user's identity (email + OTP or passkey) rather than a merchant-scoped customer ID.
+
+**Vault architecture changes**: introduce a `link_users` table with a globally unique `link_user_id` per email address. Payment methods are associated with `link_user_id` instead of (or in addition to) `merchant_customer_id`. Vault lookups for Link-enabled checkouts authenticate the user via the Link identity service and then retrieve payment methods by `link_user_id`. The Vault DB's access control policies must be updated: previously, a Vault RPC was authorized by `merchant_api_key + customer_id`; with Link, authorization is based on a short-lived, user-authenticated session token issued by the Link identity service.
+
+**New security concerns**: (1) The blast radius of a vault breach increases — a single compromised vault record previously affected one merchant's customer; with Link, a compromised `link_user_id` affects that user's payment method across all merchants they've transacted with. HSM-per-user-scope key derivation (derive a user-specific DEK from a master KEK and the `link_user_id`) limits cross-user exposure. (2) Account takeover (ATO) risk is higher — if an attacker can authenticate to Link as a victim user (via SIM swap, email compromise, or OTP phishing), they gain access to the victim's payment method on any Stripe merchant. Mandatory passkey authentication (WebAuthn, phishing-resistant) rather than SMS OTP significantly reduces this risk. (3) OAuth consent: when Link auto-fills a payment method on a new merchant's checkout, the user must have explicitly consented to sharing their payment method with that merchant (EU PSD2 / GDPR requirement). Stripe must store a per-user per-merchant consent record and check it before every Link-powered charge.
+
+**Regulatory implication**: under PSD2 SCA, any charge where Link auto-fills the payment method may require step-up authentication (3DS2 challenge) if the transaction risk is above a threshold — Link's convenience must be balanced against the regulatory requirements for customer authentication.
+</Curveball>
+
+## Further reading
+
+- Kleppmann M.: **"Designing Data-Intensive Applications"** — Chapter 9 (Consistency and Consensus) — the theoretical foundation for why distributed transactions are so hard and why saga patterns with compensating transactions are the practical alternative.
+- Stripe Engineering Blog: **"Designing robust and predictable APIs with idempotency"** — the definitive internal reference on how Stripe implements idempotency keys, the lock-then-cache pattern, and the database constraint backstop.
+- PCI Security Standards Council: **PCI-DSS v4.0** — the full compliance framework; Requirements 3 (protect stored account data) and 4 (protect cardholder data in transit) are the most directly relevant to vault and transport architecture.
+- Stripe Engineering Blog: **"Double-entry bookkeeping as a distributed systems problem"** — how the double-entry ledger invariant (`SUM(all entries) = 0`) provides a continuous consistency check on the entire financial system and how Stripe detects and alerts on invariant violations.
+
+<RelatedQuestions items={[
+  { slug: "amazon-product-catalog", title: "Design Amazon's Product Catalog", difficulty: "senior" },
+  { slug: "ticketmaster", title: "Design Ticketmaster", difficulty: "senior" },
+  { slug: "uber-ride-matching", title: "Design Uber Ride Matching", difficulty: "senior" },
+]} />

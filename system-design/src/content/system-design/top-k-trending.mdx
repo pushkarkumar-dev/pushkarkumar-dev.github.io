@@ -1,0 +1,533 @@
+---
+title: "Design a Top-K / Trending System"
+slug: "top-k-trending"
+category: "foundations"
+difficulty: "senior"
+estimatedReadMinutes: 19
+tags: ["count-min-sketch", "hyperloglog", "heavy-hitters", "streaming", "kafka", "redis", "approximate-counting"]
+companyFlavors: ["Twitter Trending", "YouTube Trending", "Google Trends", "TikTok", "LinkedIn"]
+prerequisites: []
+relatedQuestions: ["distributed-rate-limiter", "design-a-cache", "twitter-timeline"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Design a system that identifies the top-K most frequent items (trending hashtags, popular videos, heavy-hitter IPs) in a stream of billions of events — covering Count-Min Sketch for frequency estimation, HyperLogLog for distinct count, and a two-tier aggregation pipeline."
+javaPackages: ["org.apache.kafka:kafka-streams:3.7.0", "redis.clients:jedis:5.1.3", "org.springframework.boot:spring-boot-starter:3.3.0", "com.clearspring.analytics:stream:2.9.10"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="top-k-trending" title="Design a Top-K / Trending System" />
+
+<Tldr>
+- You cannot keep exact counts for 100B events/day in RAM — use Count-Min Sketch (CMS): O(w×d) space where w×d ≈ a few MB, with at most ε overcount and 1-δ probability of correctness
+- Top-K is a two-tier problem: (1) identify candidates using CMS or Lossy Counting, (2) maintain exact counts for only the top 10K candidates in a Redis sorted set
+- "Trending" ≠ "most popular all-time" — trending needs a decay function (exponential decay: `score = count × e^(-λt)`) to surface recently hot items over stale popular ones
+- HyperLogLog for distinct counts (unique users who viewed a video): O(1.5 KB) per counter, ~0.81% standard error vs an exact set which costs O(n) memory
+- Two-stage pipeline: local aggregation in Kafka Streams (per partition, 10-second tumbling windows) → global aggregation in Redis → serve from a precomputed cache
+</Tldr>
+
+## The problem with exact counting
+
+Exact frequency counting at internet scale hits a fundamental wall, and the math makes it obvious. At 100B events per day, the ingest rate is approximately 1.16M events per second at steady state, with burst peaks several times that. Each event is a `(userId, itemId)` pair — a user tweeted this hashtag, a viewer watched this video, a client hit this URL. The naive approach is a `HashMap<String, Long>` accumulating counts in memory. The problem is key space cardinality: a platform like Twitter may have 100M unique hashtags across all languages. An exact map for those requires roughly `100M × (8 bytes key pointer + average 20 bytes key string + 8 bytes count value + ~40 bytes JVM HashMap overhead per entry) ≈ 7.6 GB` per aggregation window — and that is a best-case estimate ignoring hash collision chains, JVM object headers, and GC pressure.
+
+Scale that across multiple aggregation windows (1h, 24h, 7d) and multiple dimensions (global, per-country, per-demographic) and you have pushed past what any single machine can hold, period. Partitioning the HashMap across a cluster introduces a new problem: every event must be routed to the single shard that owns that key, which concentrates hot items — the hashtag `#WorldCup` during a match will hammer one shard at millions of ops/sec while others sit idle. This is the classic heavy-hitter skew problem.
+
+The deeper issue is that exact counting is solving the wrong problem. Most applications that ask for "top-K" do not actually need the exact count — they need a ranked list whose ordering is correct with high probability. If `#WorldCup` has 50.2M occurrences and `#Champions` has 49.8M, nobody cares which is rank 1 versus rank 2 within that margin. This is the insight that probabilistic data structures exploit: by trading a small, bounded error for a dramatic reduction in memory, you can process the full event stream in a constant-size structure that fits comfortably in RAM on a single node. Count-Min Sketch is the canonical solution. HyperLogLog solves the complementary problem of distinct counts. Together they form the backbone of every production trending system.
+
+## Clarifying questions
+
+Eight questions to ask before drawing any boxes. The answers collapse a large design space down to a concrete architecture.
+
+| Question | Ideal answer to probe for | Why it matters |
+|---|---|---|
+| What does "top-K" mean — all-time, last 24h, last 1h, or trending (recency-weighted)? | Usually "trending" = last 1h with decay; all-time is a different problem | Drives whether you need a decay function or a simple sorted counter |
+| What is K? (Top 10, top 100, top 1000?) | Top 10–1000 is typical; top 10M is a different product | Determines how many candidates to track in Redis and how aggressively to prune |
+| What is the event stream rate? | 1M events/sec or 100B/day is the canonical interview number | Determines whether a single Kafka topic or a sharded cluster is needed |
+| What exactly are we counting? (hashtag uses, video views, URL clicks, IP addresses) | Item type determines cardinality and key size | Low-cardinality items (1K hashtags) allow exact counting; high-cardinality (100M URLs) require CMS |
+| Do we need exact counts or approximate? | Approximate ± 1% is almost always acceptable for trending | Opens the door to probabilistic structures; exact requires far more memory |
+| What is the latency requirement for the trending list — real-time (< 1s) or near-real-time (< 30s)? | < 30s is achievable with Kafka Streams; < 1s requires streaming into Redis directly | Determines pipeline complexity and consistency model |
+| Do we need per-country or per-demographic trending? | Per-country is common; per-demographic is expensive | Multiplies sketch count; may require separate Kafka consumers per segment |
+| Is historical trending data needed — e.g., what was trending at 3pm last Tuesday? | Yes for analytics, no for live serving | If yes, you need a snapshot store (Cassandra) in addition to the live Redis serving layer |
+
+## Functional requirements
+
+The core functionality the system must deliver:
+
+- **Top-K query**: return the current trending list for a given time window and optional geographic filter, ranked by score descending
+- **Event ingestion**: accept a real-time stream of events at 1M+ events/sec with no data loss
+- **Configurable time windows**: support 1h, 24h, and 7d trending windows simultaneously; the query specifies which window to read
+- **Trending score**: rank items by a recency-weighted score rather than raw count, so that a hashtag trending hard in the last 10 minutes outranks one that was popular 20 hours ago and has since flatlined
+
+## Non-functional requirements
+
+Concrete numbers to design toward:
+
+- **Ingest throughput**: sustain 1M events/sec at steady state with 3× burst headroom
+- **Top-K query latency**: p99 < 100ms, served from a precomputed cache
+- **Trending list freshness**: updated every 30 seconds — the window between a hashtag exploding and it appearing in the trending list is at most 30s
+- **Top-K depth**: support returning up to top-1000 trending items per window per region
+- **Availability**: 99.99% for the read path (serving trending lists); 99.9% for the write path (ingest can tolerate brief buffering in Kafka)
+- **Consistency**: eventual — the trending list reflects events processed up to ~30 seconds ago
+
+## Capacity estimation
+
+<Capacity title="Back-of-envelope: 1M events/sec, top-1000 trending, 3 windows">
+
+**Event stream volume**
+
+$$
+\text{events/hour} = 1{,}000{,}000 \times 3600 = 3.6 \times 10^9 \; \text{events}
+$$
+
+$$
+\text{Kafka throughput} = 1{,}000{,}000 \; \text{events/s} \times 100 \; \text{bytes/event} = 100 \; \text{MB/s}
+$$
+
+10 Kafka partitions at 10 MB/s each covers this with headroom. Retention at 24h: `100 MB/s × 86400s ≈ 8.6 TB` — manageable with tiered storage.
+
+**Count-Min Sketch memory (per aggregation window, per node)**
+
+$$
+w = 2000 \; \text{counters}, \quad d = 5 \; \text{hash functions}
+$$
+
+$$
+\text{sketch size} = w \times d \times 4 \; \text{bytes} = 2000 \times 5 \times 4 = 40 \; \text{KB per sketch}
+$$
+
+Three windows (1h, 24h, 7d) × 10 Kafka Streams partitions = 30 sketches total:
+
+$$
+30 \times 40 \; \text{KB} = 1.2 \; \text{MB total sketch memory across the cluster}
+$$
+
+This fits in L3 cache on a single node — CMS memory is not the bottleneck.
+
+**Error bound validation**
+
+For 1% error with 99% confidence: $w = \lceil e/\varepsilon \rceil = \lceil 2.718/0.01 \rceil = 272$ and $d = \lceil \ln(1/\delta) \rceil = \lceil \ln(100) \rceil = 5$. Our w=2000 is 7× more conservative — actual error will be well under 1%.
+
+**Redis sorted set for top-K candidates**
+
+$$
+10{,}000 \; \text{candidates} \times 100 \; \text{bytes/member} = 1 \; \text{MB per ZSET}
+$$
+
+Three windows × 50 countries + global = ~150 ZSETs at 1 MB each = 150 MB total. Trivially fits in a single Redis node; one `r7g.large` ($0.48/hr) is sufficient for serving.
+
+**HyperLogLog for distinct user counts**
+
+$$
+1.5 \; \text{KB per HLL} \times 10{,}000 \; \text{tracked items} = 15 \; \text{MB}
+$$
+
+Run HLL only for the top-K candidates (not all items), updated on the fly via `PFADD`. Three windows = 45 MB — well within budget.
+
+</Capacity>
+
+## API design
+
+Four endpoints cover all client needs:
+
+```
+GET  /trending?window=1h&k=100&country=US
+     → 200 OK
+     {
+       "window": "1h",
+       "generatedAt": "2026-05-07T15:30:00Z",
+       "items": [
+         { "rank": 1, "itemId": "#WorldCup", "score": 482310.5, "distinctUsers": 92400 },
+         { "rank": 2, "itemId": "#Champions", "score": 371200.1, "distinctUsers": 71050 },
+         ...
+       ]
+     }
+
+POST /events  (internal — Kafka producer wrapper, not public)
+     Body: { "timestamp": 1746614400000, "userId": "u_xyz", "itemId": "#WorldCup",
+             "itemType": "hashtag", "country": "US", "metadata": {} }
+     → 202 Accepted
+
+GET  /count/{itemId}?window=1h
+     → 200 OK { "itemId": "#WorldCup", "approxCount": 4823105, "window": "1h" }
+
+WS   /trending/live?window=1h&country=US
+     → Server pushes updated trending list every 30 seconds as a JSON frame
+```
+
+The `GET /trending` endpoint is the hot path — it reads from a precomputed Redis ZSET and returns in < 5ms before CDN caching brings it to < 1ms for most clients. The WebSocket endpoint is for dashboards that need live updates without polling.
+
+## Data model
+
+**Kafka event topic**
+
+```
+Topic: events
+Partition key: itemId (ensures same item always goes to same partition for local CMS)
+Schema:
+  {
+    timestamp:  int64   // epoch millis
+    userId:     string  // hashed for privacy
+    itemId:     string  // hashtag, videoId, URL, etc.
+    itemType:   enum    // HASHTAG | VIDEO | URL | SEARCH_QUERY
+    country:    string  // ISO 3166-1 alpha-2
+    metadata:   map     // extensible: { "source": "mobile", "lang": "en" }
+  }
+```
+
+**Redis sorted set (live trending)**
+
+```
+Key pattern:  trending:{window}:{country}
+              e.g. trending:1h:US, trending:24h:global
+Type:         ZSET
+Score:        decayed frequency score (float64)
+Member:       itemId (string)
+TTL:          2× window duration (auto-expire stale windows)
+```
+
+**Redis HLL (distinct user counts)**
+
+```
+Key pattern:  hll:{window}:{country}:{itemId}
+              e.g. hll:1h:US:#WorldCup
+Type:         HyperLogLog string
+Commands:     PFADD (ingest), PFCOUNT (query), PFMERGE (cross-shard merge)
+```
+
+**Cassandra snapshot table (historical audit)**
+
+```sql
+CREATE TABLE trending_snapshots (
+  window      text,        -- '1h', '24h', '7d'
+  snapshot_ts timestamp,   -- when this snapshot was captured
+  country     text,
+  rank        int,
+  item_id     text,
+  approx_count bigint,
+  score       double,
+  PRIMARY KEY ((window, country), snapshot_ts, rank)
+) WITH CLUSTERING ORDER BY (snapshot_ts DESC, rank ASC)
+  AND default_time_to_live = 604800;  -- 7-day TTL
+```
+
+Cassandra is write-optimized and handles the append-heavy snapshot workload — one write per ranked item every 30 seconds — without contention.
+
+## High-level architecture
+
+<Mermaid caption="Two-tier aggregation pipeline: Kafka Streams local CMS → Redis global ZSET → CDN-cached API" diagram={`graph LR
+  Events[Event Stream\\n1M events/sec] --> Kafka[Kafka\\n10 partitions\\nkey=itemId]
+  Kafka --> KStreams[Kafka Streams\\nLocal CMS aggregation\\n10s tumbling windows]
+  KStreams --> Candidates[Candidates Topic\\ntop-1000 per partition\\nper window close]
+  Candidates --> Aggregator[Global Aggregator\\nSpring Boot service]
+  Aggregator --> Redis[Redis\\nGlobal ZSET\\ntop-10K candidates\\ndecayed scores]
+  Aggregator --> Cassandra[Cassandra\\nHistorical snapshots\\nTTL 7d]
+  Redis --> API[Trending API\\nGET /trending]
+  API --> CDNCache[CDN Cache\\n30s TTL]
+  CDNCache --> Clients[Clients / Mobile / Web]
+  Redis --> WS[WebSocket Server\\npush every 30s]
+  WS --> Dashboards[Live Dashboards]`} />
+
+The architecture deliberately separates concerns: Kafka Streams handles the CPU-intensive frequency estimation close to where data lands (on the partition), the global aggregator merges candidates and applies decay, Redis serves reads at microsecond latency, and CDN absorbs the read amplification so the Redis cluster never sees raw client traffic.
+
+## Deep dives
+
+### Count-Min Sketch internals
+
+Count-Min Sketch is a two-dimensional array of counters: `d` rows (one per hash function) and `w` columns (one per hash bucket). The total memory is exactly `d × w × sizeof(counter)` — fixed at initialization, completely independent of the number of distinct items seen.
+
+**Increment** (adding an event for `itemId`):
+
+```
+for i in range(d):
+    col = hash_function[i](itemId) % w
+    table[i][col] += 1
+```
+
+Each of the `d` hash functions maps the item to a column in its row and increments that cell. One item increments exactly `d` cells total.
+
+**Query** (estimating count for `itemId`):
+
+```
+return min(table[i][hash_function[i](itemId) % w] for i in range(d))
+```
+
+The minimum across all `d` rows. Why minimum? Because a cell can only be inflated by hash collisions (other items that collide into the same bucket) — never deflated. The minimum picks the row with the fewest collisions affecting that item's bucket, giving the tightest upper bound on the true count.
+
+**Error guarantees**: With `w = ⌈e/ε⌉` and `d = ⌈ln(1/δ)⌉`, the estimated count is at most `true_count + ε × N` with probability at least `1 - δ`, where `N` is the total number of events processed. Crucially, CMS only overcounts — it never undercounts. For 1% error (ε = 0.01) with 95% confidence (δ = 0.05): `w = 272`, `d = 3`. For 1% error with 99% confidence: `w = 272`, `d = 5`. Using `w = 2000` gives a 7× error buffer in exchange for 40 KB instead of ~4 KB — a worthwhile tradeoff given the negligible memory cost.
+
+**Why CMS beats a HashMap here**: A HashMap with 100M unique keys requires 100M allocations and O(n) memory that grows with cardinality. CMS uses 40 KB regardless of whether you've seen 1M or 1B distinct items. The tradeoff is the bounded overcount — a constraint that is irrelevant for trending, where approximate ranking is the goal.
+
+### Trending score with exponential decay
+
+Top-K by raw cumulative count is not trending — it is "most popular all-time". A hashtag that got 10M uses over the past year will always beat one that exploded with 1M uses in the last hour. Trending requires recency weighting, and the standard tool is exponential decay.
+
+The score at query time is:
+
+$$
+\text{score}(t) = \text{count} \times e^{-\lambda \times (t_{\text{now}} - t_{\text{first\_seen}})}
+$$
+
+where `λ` controls the decay rate. A half-life of approximately 1 hour corresponds to:
+
+$$
+\lambda = \frac{\ln 2}{T_{1/2}} = \frac{0.693}{3600} \approx 0.000193
+$$
+
+In practice, rather than storing `first_seen` per item and recomputing on every read, the decay is applied incrementally to the Redis ZSET scores on a fixed schedule. Every 30 seconds, a background job multiplies all scores by the decay factor for that interval:
+
+$$
+\text{decay\_factor} = e^{-\lambda \times 30} = e^{-0.000193 \times 30} \approx 0.9942
+$$
+
+Items whose score drops below a threshold (e.g., 0.01) are evicted from the ZSET entirely, keeping the working set bounded. This is why items eventually fall off the trending list naturally — they decay out rather than requiring explicit deletion.
+
+The practical effect: an item that received 100K events 23 hours ago has a score of `100000 × e^(-0.000193 × 82800) ≈ 100000 × 0.0996 ≈ 9960`. An item that received 10K events in the last 5 minutes has a score of `10000 × e^(-0.000193 × 300) ≈ 10000 × 0.944 ≈ 9440`. They are comparable in score despite a 10× difference in raw count — the new item is appropriately surfaced. Adjust `λ` to tune how aggressively your platform favors recency over volume.
+
+### Two-stage aggregation
+
+The pipeline has two distinct aggregation tiers, each serving a different purpose.
+
+**Stage 1 — Local aggregation (Kafka Streams, per partition)**
+
+Because Kafka partitions events by `itemId`, all events for a given item land on the same partition. Each Kafka Streams instance maintains its own CMS sketch for that partition's slice of the key space. A 10-second tumbling window closes every 10 seconds; at window close, the Streams instance scans its local sketch to identify the top-1000 candidates by estimated count and emits them to a downstream `candidates` topic.
+
+This stage handles the full 1M events/sec ingest rate. Each Kafka Streams instance sees only its partition's share of traffic (100K events/sec for 10 partitions) and processes it in memory without any network round-trips. The local CMS ensures that even items which appear at high frequency within one partition are captured accurately.
+
+**Stage 2 — Global aggregation (Redis, single logical view)**
+
+The `candidates` topic receives at most `10 partitions × 1000 candidates × 6 windows/min = 60K candidate records per minute` — a tiny fraction of the original ingest volume. The global aggregator service consumes this topic and for each candidate record calls `ZINCRBY trending:{window} {count} {itemId}` on the Redis ZSET. After each batch:
+
+- `ZREMRANGEBYRANK trending:{window} 0 -(10001)` — prune to top 10K candidates
+- Decay job runs every 30s multiplying scores by the decay factor
+- `ZRANGE trending:{window} 0 999 WITHSCORES REV` — serve the top 1000
+
+This two-stage design is why Redis never sees the raw 1M events/sec. The Kafka Streams layer acts as a high-throughput filter, and only the candidates that matter reach Redis.
+
+### HyperLogLog for distinct users
+
+Raw frequency counts answer "how many times was this hashtag used?" HyperLogLog answers "how many distinct users used this hashtag?" — a fundamentally different cardinality problem. The naive solution (a Redis Set per item containing all userIds) requires O(n) memory where n is the number of distinct users — potentially millions of entries per item, multiplied across thousands of trending items and multiple windows. That is dozens of GB for a moderately active trending system.
+
+HyperLogLog (HLL) solves this with a probabilistic cardinality estimator that uses O(1.5 KB) per counter regardless of the set size, with a standard error of approximately 0.81%. Redis implements HLL natively.
+
+```
+PFADD hll:1h:US:#WorldCup user_id_abc123       -> 1 (new element)
+PFADD hll:1h:US:#WorldCup user_id_xyz789       -> 1
+PFADD hll:1h:US:#WorldCup user_id_abc123       -> 0 (already counted, no change)
+PFCOUNT hll:1h:US:#WorldCup                    -> 2 (approx distinct count)
+```
+
+Across a sharded Redis deployment, HLLs merge without loss of accuracy:
+
+```
+PFMERGE hll:1h:global:#WorldCup hll:1h:US:#WorldCup hll:1h:EU:#WorldCup hll:1h:APAC:#WorldCup
+PFCOUNT hll:1h:global:#WorldCup    -> global distinct user count
+```
+
+This is the key property that makes HLL composable for multi-region deployments — you can merge regional counters into a global view without re-processing events.
+
+The practical use case: a video trending on YouTube has 2M views but only 800K distinct viewers (the rest are replays). HLL gives you the 800K distinct viewer count with 0.81% error in 1.5 KB. The exact Set would require 800K × ~50 bytes per UUID = 40 MB per video, multiplied across 10K trending videos = 400 GB. HLL keeps this at 10K × 1.5 KB = 15 MB.
+
+## Java integration
+
+### Kafka Streams local aggregation
+
+The Kafka Streams application maintains one CMS sketch per partition per window. At window close, it identifies the top-1000 candidates from the local sketch and emits them downstream for global aggregation.
+
+```java
+package dev.pushkar.trending;
+
+import org.apache.kafka.streams.KafkaStreams;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.kstream.*;
+import com.clearspring.analytics.stream.frequency.CountMinSketch;
+import java.time.Duration;
+import java.time.Instant;
+
+@Component
+public class TrendingAggregator {
+
+    private static final int W = 2000;     // sketch width (columns)
+    private static final int D = 5;        // sketch depth (hash functions)
+    private static final int TOP_K = 1000; // candidates to emit per window
+
+    @Bean
+    public KafkaStreams buildStreams(Properties config) {
+        var builder = new StreamsBuilder();
+
+        builder.<String, TrendingEvent>stream("events")
+            .groupBy((k, v) -> v.itemId())
+            .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofSeconds(10)))
+            .aggregate(
+                () -> new CountMinSketch(D, W, 42),
+                (key, event, sketch) -> {
+                    sketch.add(key, 1);
+                    return sketch;
+                },
+                Materialized.with(Serdes.String(), CountMinSketchSerde.INSTANCE)
+            )
+            .toStream()
+            .foreach((windowedKey, sketch) -> {
+                long count = sketch.estimateCount(windowedKey.key());
+                emitCandidate(windowedKey.key(), count, windowedKey.window().startTime());
+            });
+
+        return new KafkaStreams(builder.build(), config);
+    }
+
+    private void emitCandidate(String itemId, long count, Instant window) {
+        // Publish to the candidates topic; the global aggregator consumes this
+        // CandidateEvent { itemId, approxCount, windowStartMs }
+    }
+}
+```
+
+The `CountMinSketch` from the `com.clearspring.analytics:stream` library implements the exact algorithm described above. Partitioning by `itemId` ensures all events for a given item go to the same sketch instance — no cross-partition merging is needed at this stage. The `Materialized.with(...)` call persists sketch state to RocksDB on disk so the Kafka Streams application can recover after a restart without losing accumulated counts mid-window.
+
+### Redis global aggregation and decay
+
+The global aggregator service consumes the candidates topic and maintains the authoritative Redis ZSETs. A scheduled job applies exponential decay every 30 seconds to keep scores recency-weighted.
+
+```java
+@Service
+public class TrendingService {
+
+    private final JedisPool jedis;
+    private static final String ZSET_KEY = "trending:1h";
+    private static final int TOP_K = 1000;
+    private static final double LAMBDA = 0.000193; // half-life ~1 hour
+
+    @Scheduled(fixedDelay = 10_000)
+    public void decayScores() {
+        // Apply exponential decay: multiply all scores by e^(-λ × 10s)
+        double decayFactor = Math.exp(-LAMBDA * 10);
+        try (Jedis j = jedis.getResource()) {
+            j.zrangeWithScores(ZSET_KEY, 0, -1).forEach(tuple -> {
+                double newScore = tuple.getScore() * decayFactor;
+                if (newScore < 0.01) {
+                    j.zrem(ZSET_KEY, tuple.getElement());
+                } else {
+                    j.zadd(ZSET_KEY, newScore, tuple.getElement());
+                }
+            });
+            // Hard prune: keep only top-K to bound memory
+            j.zremrangeByRank(ZSET_KEY, 0, -(TOP_K + 1));
+        }
+    }
+
+    public void ingestCandidate(String itemId, long count) {
+        try (Jedis j = jedis.getResource()) {
+            j.zincrby(ZSET_KEY, count, itemId);
+        }
+    }
+
+    public List<TrendingItem> getTopK(int k) {
+        try (Jedis j = jedis.getResource()) {
+            return j.zrevrangeWithScores(ZSET_KEY, 0, k - 1).stream()
+                .map(t -> new TrendingItem(t.getElement(), (long) t.getScore()))
+                .toList();
+        }
+    }
+
+    record TrendingItem(String itemId, long score) {}
+}
+```
+
+Two important production details in this implementation. First, `decayScores()` fetches all ZSET members with `zrangeWithScores` and re-writes each one — this is an O(n) operation where n is the number of candidates (at most 10K). At 10K entries, this is a sub-millisecond Redis operation even on modest hardware. If the ZSET were unbounded, this approach would not scale, but the `ZREMRANGEBYRANK` prune keeps it bounded. Second, the decay job runs on a 10-second interval but the `@Scheduled` annotation uses `fixedDelay` (not `fixedRate`) to prevent concurrent executions if a decay run takes longer than expected.
+
+<TradeoffTable title="Frequency estimation approach comparison">
+
+| Approach | Memory | Error | Ordering | Best for |
+|---|---|---|---|---|
+| Exact HashMap | O(n) — unbounded | None | Exact rank | Small key space (< 1M unique items) |
+| Count-Min Sketch | O(w×d) — fixed | ε overcount only, never undercount | Approximate rank | Large key space, streaming, unknown cardinality |
+| Lossy Counting | O(1/ε) — fixed | ε overcount + ε undercount | Approximate | Guaranteed coverage of items appearing > ε×N times |
+| Space Saving | O(k) — fixed | Guaranteed for monitored top-K | Exact for monitored set | Known K upfront, want guarantees for top-K specifically |
+
+</TradeoffTable>
+
+**When to choose which**: CMS is the most common choice in streaming pipelines because it is parallelizable (sketches from different nodes can be merged by element-wise addition), has no configuration dependency on K, and only overcounts — meaning the top-K extracted from it will not miss any truly high-frequency items. Space Saving gives stronger guarantees for known K but requires maintaining a sorted structure that is harder to parallelize. Lossy Counting is elegant on paper but rarely deployed because its error bounds are two-sided (both over and under), making the top-K extraction less reliable.
+
+<Pitfall title="Confusing 'top-K most frequent' with 'trending'">
+
+Top-K by total cumulative count always returns the same few mega-popular items indefinitely. On Twitter this would be `#football`, `#love`, and `#music` every single day — items that have accumulated billions of mentions over years. This is the "rich get richer" problem with raw counts: once an item has a large head start, nothing can displace it.
+
+Trending requires a decay function. Exponential decay with a 1-hour half-life ensures that a hashtag must continue generating activity to maintain its rank. An item that generated 10M mentions two weeks ago and zero since then will have a decayed score of `10M × e^(-0.000193 × 1209600) ≈ 10M × 7.6×10^{-102} ≈ 0` — effectively zero, evicted from the ZSET. This is the mechanism that allows genuinely fresh content to surface.
+
+The interview failure mode is implementing a Redis ZSET with `ZINCRBY` and calling it "trending" without ever applying decay. Ask yourself: if an item stops receiving events, does its rank ever decrease? If not, it is not a trending system.
+
+</Pitfall>
+
+<Pitfall title="Using a single global Redis ZSET with ZINCRBY per raw event">
+
+At 1M events/sec, calling `ZINCRBY trending:1h {item} 1` for every event would generate 1M Redis operations per second. A single Redis instance handles approximately 100K–500K ops/sec at sub-millisecond latency. Even a large Redis Cluster would be saturated by the write volume alone, leaving no headroom for reads or decay operations.
+
+The two-stage pipeline exists precisely to solve this. Kafka Streams aggregates events locally in memory (zero Redis operations during local aggregation) and emits at most 1000 candidates per partition per 10-second window. With 10 partitions and 6 window closes per minute, Redis receives at most 60K updates per minute — a 1000× reduction from the raw event rate. Always do local aggregation first; Redis is the fan-in point for pre-aggregated candidates, not a per-event counter.
+
+</Pitfall>
+
+<Curveball question="A coordinated bot attack sends 10M requests for a specific hashtag in 5 minutes, making it artificially trend. How do you detect and filter bot traffic before it pollutes the trending list?">
+
+Bot detection must happen upstream of the frequency estimation pipeline. Three complementary layers work together.
+
+First, at the event ingestion layer, apply a per-user rate limit: no single userId should contribute more than N events per minute for a single item (N might be 5 for a hashtag use). The rate limiter can be a Redis sliding window counter per `(userId, itemId)` pair — events beyond the limit are tagged as suspect and written to a separate topic rather than the main events topic.
+
+Second, track the ratio of distinct users to total events using HyperLogLog. A legitimate trending hashtag has a high distinct-users-to-event ratio (many unique people using it). A bot attack typically shows a low ratio (many events from few accounts) or a very high ratio if using throwaway accounts (perfectly uniform distribution is also suspicious). If `PFCOUNT(hll:1h:hll:{item}) / raw_count(item) < 0.1`, flag for investigation.
+
+Third, maintain a behavioral fingerprint: the event timestamp distribution for an organic trend follows a gradual ramp-up and natural decay. A bot attack produces a sharp rectangular spike — uniform event rate with an abrupt start and stop. A simple change-point detection algorithm (CUSUM) on the 10-second event rate per item can trigger an anomaly alert. Items under active investigation can be suppressed from the trending output pending human review.
+
+None of these approaches are foolproof in isolation. Bot operators adapt. The operational reality is a continuous arms race — the key is to make artificial trending expensive enough (in accounts banned, in effort required) that the ROI for attackers drops below the threshold of viability.
+
+</Curveball>
+
+<Curveball question="You need per-country trending. You have 50 countries. Does that mean 50× Redis memory and 50× Kafka Streams instances?">
+
+Not necessarily, and the answer depends on traffic distribution. A few design patterns manage this without 50× cost.
+
+**Partition by country in Kafka, not by item**: Use a composite partition key `{country}:{itemId}` instead of just `{itemId}`. This co-locates all events for a given `(country, item)` pair on the same Kafka Streams instance, which maintains one CMS sketch per country per window. With 10 partitions and 50 countries, each partition handles ~5 countries on average. Kafka Streams memory scales by `50 countries × 3 windows × 40 KB per sketch = 6 MB` — completely negligible.
+
+**Redis ZSETs scale linearly but remain small**: 50 countries × 3 windows × 1 MB per ZSET = 150 MB. Still fits on a single `r7g.large`. If individual countries have very sparse data (a small-market country might have 50 trending items rather than 1000), the actual memory is lower.
+
+**Country roll-up via HLL merge**: Global trending is derived by merging country-level HLLs — `PFMERGE global:hll:1h:#item country1:hll:1h:#item country2:hll:1h:#item ...` — rather than by maintaining a separate global event pipeline. This means you run 51 ZSETs (50 countries + 1 global derived) for the price of 51× the ZSET memory — which, as computed above, is still only 150 MB.
+
+The true scaling concern is not memory but write amplification: every event must update both the country ZSET and the global ZSET. That doubles the Redis write rate, which remains manageable at the candidate level. If you need to add demographic cuts (age, language, device), apply the same pattern — the candidate fan-out grows but remains polynomial, not exponential.
+
+</Curveball>
+
+<Curveball question="A K-pop fan army organizes a mass-tweet event — 5M tweets in 10 minutes for a hashtag. Your decay function handles gradual trends well, but this is a coordinated spike. How do you differentiate 'organic trending' from 'coordinated spike'?">
+
+This is one of the genuinely hard problems in trending system design, and the honest answer is that no single signal reliably separates organic virality from coordinated campaigns — both produce rapid growth in a short window.
+
+The practical approach layers several secondary signals alongside the primary frequency count.
+
+**Velocity derivative**: Compute both the score and the rate of change of the score (first derivative). Organic trends accelerate gradually. A coordinated campaign produces a near-instantaneous jump from 0 to peak rate. Track the 10-second event rate per item as a time series. A z-score above 5 on the rate-of-change (i.e., the rate is 5 standard deviations above the trailing 60-minute baseline) is a strong anomaly signal.
+
+**Account age distribution**: Coordinated campaigns often use newly created accounts. When a hashtag is being boosted, join the event stream with an account metadata stream and compute the median account age of contributors. If median account age for `#BTS_Forever` is 3 days while the typical trending hashtag has a median age of 2 years, the signal is clear.
+
+**Geographic concentration**: Organic trends tend to spread geographically over time. A fan army attack often originates from a concentrated geographic cluster (or, conversely, from a perfectly uniform global distribution that is statistically implausible for organic content). Use HLL-based distinct-country counting alongside total event count.
+
+**Suppression vs. labeling**: The product decision is whether to suppress the hashtag from trending entirely or to let it trend with a label (Twitter does this with "Trending · Discussion active" labels). Complete suppression risks false positives on genuine viral moments. Labeling is a softer intervention that maintains user trust while adding context. Design the system to support both modes, with the suppression decision delegated to a human review queue for borderline cases.
+
+The key architectural implication: the trending pipeline must emit not just `(itemId, score)` but also a rich feature vector `(score, velocity, distinctUsers, accountAgeMedian, geoConcentration, botSignalScore)` so that downstream filtering policies can be adjusted without re-engineering the pipeline.
+
+</Curveball>
+
+<RelatedQuestions items={[
+  { slug: "distributed-rate-limiter", title: "Design a Distributed Rate Limiter", difficulty: "mid" },
+  { slug: "design-a-cache", title: "Design a Distributed Cache", difficulty: "senior" },
+  { slug: "twitter-timeline", title: "Design Twitter/X Timeline", difficulty: "senior" },
+]} />
+
+## Further reading
+
+- [An Improved Data Stream Summary: The Count-Min Sketch and its Applications](https://dimacs.rutgers.edu/~graham/pubs/papers/cm-full.pdf) — Cormode & Muthukrishnan (2005), the original CMS paper; remarkably readable and contains the full error bound proofs
+- [HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm](http://algo.inria.fr/flajolet/Publications/FlFuGaMe07.pdf) — Flajolet, Fusy, Gandouet & Meunier (2007); explains the probabilistic hashing construction behind HLL and its 0.81% error bound
+- [Heavy Hitters and the Count-Min Sketch](https://web.stanford.edu/class/cs168/l/l2.pdf) — Stanford CS168 lecture notes; excellent pedagogical treatment of the heavy-hitter problem and why approximate solutions are necessary
+- [Kafka Streams DSL documentation](https://kafka.apache.org/documentation/streams/) — Official reference for `KGroupedStream`, windowed aggregations, and state stores; the `Materialized` API for persistent sketches is covered in the developer guide under "Stateful Transformations"
+- [Twitter's approach to trending topics](https://blog.twitter.com/engineering/en_us/a/2015/building-a-more-accurate-and-real-time-trending-topics-system) — Engineering blog post describing how Twitter moved from batch MapReduce to streaming computation for trending; covers the decay function design and the challenge of separating organic trends from coordinated amplification

@@ -1,0 +1,63 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: system-design/package-lock.json
+
+      - name: Install dependencies
+        working-directory: system-design
+        run: npm ci
+
+      - name: Build Astro (system-design section)
+        working-directory: system-design
+        run: npm run build
+
+      - name: Assemble deploy directory
+        run: |
+          # Start with all existing static files at repo root
+          mkdir -p _site
+          cp -r index.html blog.html dsa.html headshot.jpg blog dsa-assets _site/ 2>/dev/null || true
+
+          # Copy Astro build output into /system-design/ subfolder
+          mkdir -p _site/system-design
+          cp -r system-design/dist/. _site/system-design/
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,555 @@
+---
+title: "Design S3-like Object Storage"
+slug: "s3-object-storage"
+category: "storage"
+difficulty: "staff"
+estimatedReadMinutes: 26
+tags: ["erasure-coding", "multi-region-replication", "eventual-consistency", "object-storage", "CAS", "metadata-service", "multipart-upload"]
+companyFlavors: ["AWS S3", "Google Cloud Storage", "Azure Blob Storage", "MinIO", "Ceph"]
+prerequisites: ["consistent-hashing"]
+relatedQuestions: ["dropbox-google-drive", "hdfs-distributed-file-system", "photo-storage-haystack"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Design a petabyte-scale object storage system supporting 11 nines of durability using erasure coding, multi-region replication, and an eventually-consistent bucket listing — covering data placement, multipart upload, storage classes, and lifecycle policies."
+javaPackages: ["software.amazon.awssdk:s3:2.25.0", "org.springframework.boot:spring-boot-starter-webflux:3.3.0"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="s3-object-storage" title="Design S3-like Object Storage" />
+
+<Tldr>
+- **11 nines of durability (99.999999999%) via erasure coding**: Reed-Solomon (6+3) splits each object into 6 data shards and 3 parity shards stored on 9 different storage nodes — any 4 can fail simultaneously and the object is still recoverable. Three-way replication delivers the same durability class at 3× storage cost; erasure coding achieves it at 1.5×.
+- **Separate metadata from data**: a small, highly available, Raft-based metadata service tracks `{bucket, key} → {data node locations, size, ETag, storageClass}`. Data nodes are intentionally dumb — they store raw shard bytes and know nothing about object semantics. Keeping the control plane lean is what enables the metadata service to fit in RAM on a handful of nodes.
+- **Eventual consistency for LIST operations**: `LIST` does not reflect objects uploaded in the last few milliseconds because the metadata index is distributed and sharded by key prefix. This is a deliberate architectural trade-off — a strongly consistent global index across 100 million objects per bucket would require coordinated writes to a single shard on every PUT, creating a throughput bottleneck of catastrophic proportions.
+- **Multipart upload for large objects**: split any object larger than 100 MB into parts, upload each part independently (even from different clients or machines), and commit the final object in a single atomic request. Individual failed parts can be retried without restarting the entire upload, and parts are assembled at commit time rather than streamed serially.
+- **Storage classes drive economics at scale**: hot (SSD, sub-millisecond access), standard (HDD, millisecond access), infrequent access (50% cheaper, retrieval fee applies), and Glacier (10× cheaper, 4-hour restore). Lifecycle policies automate transitions between classes based on age and access frequency — the same data that starts its life as a hot object is automatically archived to Glacier after 180 days without a single line of application code change.
+</Tldr>
+
+## Why object storage is architecturally different
+
+Object storage exists because POSIX filesystems were never designed for internet scale. A POSIX filesystem has a hierarchical namespace — directories contain files, directories can be nested arbitrarily, and operations like `rename` are atomic. At petabyte scale, a hierarchical namespace becomes a coordination nightmare: renaming a directory with 100 million files requires updating 100 million directory entries atomically, which is either catastrophically slow or requires distributed locking across every node holding those entries. Object storage dissolves the hierarchy entirely. Buckets are flat namespaces — there are no real directories, only key prefixes that look like paths. The forward-slash in `photos/2024/july/image.jpg` is just a character in the key string, not a structural relationship. This means there is no rename, no atomic directory operation, and no POSIX inode table. What you gain is horizontal scalability of the namespace: a bucket with 100 billion objects has the same PUT latency as a bucket with 1 object, because the metadata lookup for `{bucket, key}` is a point read in a distributed KV store, not a traversal of a tree structure.
+
+Objects are immutable. Unlike a file, you cannot seek to byte 500 in an object and overwrite 100 bytes. Every "update" to an object is a full replacement — you write a new object with the same key, and the old object is atomically replaced (or versioned, if versioning is enabled). Immutability is the foundational property that makes erasure coding tractable: computing parity shards over a mutable object would require recomputing all parity on every byte-range update, which is O(object size) work per small write. Since objects are only replaced wholesale, the erasure coding computation happens exactly once per write — at upload time. Immutability also trivializes caching: a CDN can cache an object indefinitely without cache invalidation complexity, because the URL-to-content mapping never changes once the object is written. Every design decision downstream flows from this single constraint.
+
+The internet-scale read pattern of object storage — millions of concurrent clients fetching the same popular object — is fundamentally incompatible with POSIX file locking semantics. S3-like systems achieve high read throughput by eliminating all locks on the read path: any data node can serve any shard of any object without coordinating with any other node. Reads are served from local disk with no inter-node RPC after the initial metadata lookup. The metadata lookup itself is a point read that can be served from a Raft follower with relaxed consistency, adding single-digit milliseconds to the time-to-first-byte. This read architecture — metadata lookup followed by parallel shard fetches from dumb storage nodes — is why S3 can sustain terabytes per second of aggregate read throughput across millions of simultaneous clients. A traditional NFS or HDFS namenode would collapse under that fan-out.
+
+## Clarifying questions
+
+Nail down these eight questions before drawing a single box. Each one changes the architecture in a non-trivial way.
+
+| Question | Ideal answer | Why it matters |
+|---|---|---|
+| What durability target? (11 nines? 9 nines?) | 11 nines — production S3 equivalent | 11 nines requires erasure coding; 9 nines can be achieved with 3× replication. EC fundamentally changes the read and write paths. |
+| What object size range? (bytes to TBs?) | 1 byte to 5 TB, median object ~1 MB | Small objects require batching to avoid per-object overhead; large objects require multipart upload. The metadata schema and storage layout differ significantly across the size range. |
+| What are the access patterns? (hot vs. cold?) | 80% of objects accessed once at upload, long-tail cold | Hot objects should live on SSD with 3× replication for low-latency reads; cold objects on HDD or tape with erasure coding. Storage class design is gated on this answer. |
+| What consistency model for reads after write? | Read-after-write consistency for GET, eventual for LIST | GET-after-PUT consistency is achievable by always reading from the metadata primary. LIST-after-PUT strong consistency requires a globally ordered index — prohibitively expensive at scale. |
+| Multi-region replication? | Yes — cross-region replication (CRR) within 60 seconds | CRR adds an async replication agent, conflict resolution policy (last-write-wins or versioning), and replication lag SLA. Changes the failure domain discussion significantly. |
+| Versioning required? | Yes — versioning as an optional per-bucket feature | Versioning multiplies storage consumption and requires version-aware lifecycle policies. Every DELETE becomes a delete marker rather than a physical deletion. |
+| Public access and presigned URLs? | Yes — presigned URLs with configurable TTL | Presigned URLs must be generated by the metadata service signing the request with a secret key. Expiry is enforced by checking the timestamp in the signature, not by revoking a token. |
+| Lifecycle policies? | Yes — auto-archive and auto-delete by age and access | Lifecycle evaluation requires a background scanner that reads object metadata and compares last-modified and last-accessed timestamps. This is a separate service from the read/write path. |
+
+## Functional requirements
+
+- `PUT /{bucket}/{key}` — upload an object atomically; object is immutable after write; returns ETag (MD5 of object content for integrity verification)
+- `GET /{bucket}/{key}` — download an object in full or by byte range (Range header support); return ETag and content metadata
+- `DELETE /{bucket}/{key}` — delete an object; if versioning is enabled, writes a delete marker rather than physically removing data
+- Bucket management — create bucket, configure versioning, attach lifecycle policies, configure access policies
+- Multipart upload — initiate upload (get `uploadId`), upload N parts independently, complete upload atomically, abort incomplete upload
+- Versioning — every PUT to an existing key creates a new version ID; GET without a version ID returns the latest; GET with `?versionId=X` returns a specific version
+- Lifecycle policies — rules that transition objects to cheaper storage classes or delete them based on age, version count, or last-access recency
+- Access control — IAM-style policies per bucket, presigned URLs with expiry, block public access configuration
+- Event notifications — emit events (to SQS, Lambda, EventBridge) on PUT, DELETE, and multipart complete
+
+## Non-functional requirements
+
+- **Durability**: 11 nines (99.999999999%) annually — erasure coding with 6+3 Reed-Solomon across 9 nodes in 3 availability zones
+- **Availability**: 99.99% for GET and PUT operations; LIST operations degrade gracefully to 99.9% under metadata partition
+- **Latency**: time-to-first-byte (TTFB) < 50 ms p99 for hot objects on SSD; < 200 ms p99 for standard HDD objects; Glacier restore within 4 hours
+- **Object size**: 1 byte to 5 TB per object; multipart upload required for objects > 100 MB
+- **Throughput**: 10,000 PUT or GET requests per second per bucket; aggregate cluster throughput > 1 TB/sec read and 100 GB/sec write
+- **Scale**: support 100 trillion objects across the fleet; 100 million objects per bucket without degradation
+- **Replication**: cross-region replication lag < 60 seconds for 99th percentile of objects under 100 MB
+
+## Capacity estimation
+
+<Capacity title="Storage overhead, metadata footprint, and ingress throughput at S3 scale">
+
+**Metadata footprint**
+
+At 100 trillion objects with 1 KB of metadata per object (bucket name, key, size, ETag, storageClass, shardLocations, createdAt, contentType):
+
+$$
+\text{raw metadata} = 10^{14} \times 1\ \text{KB} = 10^{14}\ \text{KB} = 100\ \text{TB}
+$$
+
+100 TB of metadata is large but manageable — it fits on a distributed KV store with commodity NVMe SSDs. With 3× replication of metadata for durability, the metadata cluster requires 300 TB of storage, which is ~50 nodes with 6 TB NVMe each.
+
+**Erasure coding storage overhead**
+
+With Reed-Solomon (6+3): each object is split into 6 equal data shards and 3 parity shards. Total shards stored = 9. Effective storage overhead:
+
+$$
+\text{EC overhead} = \frac{6 + 3}{6} = 1.5\times
+$$
+
+Compare to 3× replication for the same durability class:
+
+$$
+\text{replication overhead} = 3.0\times
+$$
+
+For a 1 exabyte (EB) dataset, erasure coding saves:
+
+$$
+\Delta = (3.0 - 1.5) \times 1\ \text{EB} = 1.5\ \text{EB of storage}
+$$
+
+At $0.023 per GB per month (S3 Standard pricing), that is roughly $35 million per month in storage savings per exabyte of raw data.
+
+**Durability math for EC (6+3)**
+
+With an annual failure rate (AFR) of 1% per disk, the probability of losing any single disk in a year is $p = 0.01$. For EC (6+3), data is lost only if 4 or more of 9 shards fail simultaneously (we can reconstruct from any 6). The probability of exactly $k$ failures out of 9 follows a binomial distribution:
+
+$$
+P(\text{lose data}) = \sum_{k=4}^{9} \binom{9}{k} p^k (1-p)^{9-k}
+$$
+
+$$
+\approx \binom{9}{4}(0.01)^4(0.99)^5 \approx 126 \times 10^{-8} \times 0.951 \approx 1.2 \times 10^{-6}\ \text{per object per year}
+$$
+
+With rack-awareness ensuring shards span 3 AZs, correlated failures within an AZ reduce this further by several orders of magnitude — arriving at the $10^{-11}$ range that defines 11 nines.
+
+**Write throughput and ingress**
+
+At 1 million PUT/sec with average object size 1 MB:
+
+$$
+\text{ingress} = 10^6\ \text{PUT/sec} \times 1\ \text{MB} = 1\ \text{TB/sec}
+$$
+
+Each PUT fans out to 9 data nodes (one shard per node):
+
+$$
+\text{data node write RPCs/sec} = 10^6 \times 9 = 9 \times 10^6\ \text{RPCs/sec}
+$$
+
+With 10,000 data nodes, each node receives:
+
+$$
+\text{RPCs per node} = \frac{9 \times 10^6}{10{,}000} = 900\ \text{write RPCs/sec}
+$$
+
+900 write RPCs/sec per data node is extremely low — modern NVMe SSDs sustain 500,000 IOPS, so data nodes are network-bound, not disk-bound. The bottleneck at scale is the network fabric between the API layer and the data nodes.
+
+</Capacity>
+
+## API design
+
+The API is S3-compatible REST — HTTP verbs map directly to object operations. The API layer is stateless; every request carries enough information for any API node to service it.
+
+```
+PUT /{bucket}/{key}
+  Headers: Content-Type, Content-Length, Content-MD5 (optional, for integrity)
+           x-amz-storage-class: STANDARD | STANDARD_IA | GLACIER
+           x-amz-meta-*: arbitrary user metadata (up to 2 KB total)
+  Body:    object bytes
+  Returns: 200 OK
+           ETag: "d41d8cd98f00b204e9800998ecf8427e"
+           x-amz-version-id: "3/L4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY+MTRCxf3vjVBH40Nr8X8g..."
+
+GET /{bucket}/{key}
+  Headers: Range: bytes=0-1023   (optional, for partial object fetch)
+           If-None-Match: "etag" (conditional GET)
+  Returns: 200 OK / 206 Partial Content / 304 Not Modified
+           Content-Type, Content-Length, ETag, Last-Modified
+           Body: object bytes (or partial range)
+
+DELETE /{bucket}/{key}
+  Query:   ?versionId=X  (deletes a specific version; omit to write delete marker)
+  Returns: 204 No Content
+           x-amz-version-id: delete marker version ID (if versioning enabled)
+
+POST /{bucket}/{key}?uploads
+  Returns: 200 OK
+           Body: <InitiateMultipartUploadResult>
+                   <UploadId>VXBsb2FkIElEIGZvciA2aWWpbmcncyBteS1tb3ZpZS5tMnRzIHVwbG9hZA</UploadId>
+                 </InitiateMultipartUploadResult>
+
+PUT /{bucket}/{key}?partNumber=N&uploadId=X
+  Headers: Content-Length (required), Content-MD5 (recommended)
+  Body:    part bytes (5 MB minimum, except last part)
+  Returns: 200 OK
+           ETag: "part etag"
+
+POST /{bucket}/{key}?uploadId=X
+  Body:    <CompleteMultipartUpload>
+             <Part><PartNumber>1</PartNumber><ETag>"..."</ETag></Part>
+             ...
+           </CompleteMultipartUpload>
+  Returns: 200 OK
+           ETag: "final object etag"
+
+GET /{bucket}?list-type=2&prefix=P&delimiter=/&max-keys=1000&continuation-token=T
+  Returns: 200 OK
+           Body: <ListBucketResult> with <Contents> and <CommonPrefixes>
+                 NextContinuationToken for pagination
+```
+
+Presigned URL generation is handled server-side: the API layer signs a canonical request string with the bucket owner's secret key and an expiry timestamp using HMAC-SHA256. The resulting signature is appended to the URL as a query parameter. On request, the receiving API node recomputes the signature from the request and compares it — no token store, no revocation check, no database lookup. Expiry is enforced by verifying that the current time does not exceed the `X-Amz-Expires` value embedded in the URL.
+
+## Data model
+
+**Object metadata record** — stored in the distributed metadata service, keyed by `{bucketId, key, versionId}`:
+
+```
+ObjectMetadata {
+  bucketId:      String          // bucket UUID
+  key:           String          // object key, up to 1024 bytes
+  versionId:     String          // lexicographically sortable (ULID)
+  etag:          String          // MD5 of object content (hex)
+  size:          Long            // object size in bytes
+  storageClass:  Enum            // STANDARD, STANDARD_IA, GLACIER
+  dataNodeIds:   List<String>    // 9 node IDs holding the 9 EC shards
+  shardLayout:   ShardLayout     // {dataShards: 6, parityShards: 3, shardSize: N}
+  contentType:   String
+  createdAt:     Instant
+  lastModified:  Instant
+  userMetadata:  Map<String,String>   // x-amz-meta-* headers, max 2 KB
+  isDeleteMarker: Boolean
+}
+```
+
+**Bucket table** — stored in the metadata service, keyed by `{ownerId, bucketName}`:
+
+```
+Bucket {
+  bucketId:          String
+  name:              String          // globally unique, DNS-compatible
+  ownerId:           String          // IAM principal
+  region:            String
+  versioningEnabled: Boolean
+  lifecycleRules:    List<LifecycleRule>
+  replicationConfig: ReplicationConfig   // null if CRR disabled
+  accessPolicy:      String              // IAM policy JSON
+  blockPublicAccess: BlockPublicAccessConfig
+  createdAt:         Instant
+}
+```
+
+**Multipart upload state** — stored in the metadata service, keyed by `uploadId`:
+
+```
+MultipartUpload {
+  uploadId:    String
+  bucketId:    String
+  key:         String
+  storageClass: Enum
+  contentType: String
+  initiatedAt: Instant
+  parts: List<{
+    partNumber: Int,
+    etag:       String,
+    size:       Long,
+    dataNodeIds: List<String>   // part shards already committed to data nodes
+  }>
+}
+```
+
+**Data node storage** — each data node stores raw shard files on its local filesystem, named `{objectId}_{shardIndex}`. The data node has no knowledge of buckets, keys, or object semantics — it accepts writes to a shard path and serves reads from that path. The indirection through the metadata service is the only way to locate shards.
+
+## High-level architecture
+
+<Mermaid caption="Object storage system: the API layer orchestrates metadata lookups and shard placement. Data nodes are dumb — they store shard bytes and serve them on demand. The replication agent handles async cross-region copy." diagram={`graph TB
+  Client --> LB[Load Balancer]
+  LB --> API[API Layer\nRequest Router]
+  API --> Meta[Metadata Service\nRaft cluster — 5 nodes]
+  API --> DN1[Data Node 1\nShard storage]
+  API --> DN2[Data Node 2\nShard storage]
+  API --> DN3[...Data Nodes N\nShard storage]
+  Meta --> Placement[Data Placement\nConsistent Hash + Rack-aware]
+  Placement --> DN1
+  Placement --> DN2
+  Placement --> DN3
+  API --> Replication[Replication Agent\nAsync CRR]
+  Replication --> RemoteRegion[Remote Region\nFull mirror]
+  Meta --> LifecycleSvc[Lifecycle Scanner\nBackground service]
+  LifecycleSvc --> DN1`} />
+
+<Mermaid caption="PUT flow: the API layer encodes the object into 9 EC shards and writes them to 9 data nodes in parallel. After 6 acks (the minimum for reconstruction), it commits the object metadata and returns 200 to the client." diagram={`sequenceDiagram
+  autonumber
+  participant C as Client
+  participant A as API Node
+  participant M as Metadata Service
+  participant D1 as Data Node 1-6
+  participant D2 as Data Node 7-9
+
+  C->>A: PUT /bucket/key (bytes)
+  A->>A: Compute EC shards (6 data + 3 parity)
+  A->>M: allocate 9 data nodes for object
+  M-->>A: [node1..node9] via consistent hash + rack-aware placement
+  A->>D1: Write shard 1-6 (parallel)
+  A->>D2: Write shard 7-9 (parallel, parity)
+  D1-->>A: ACK x6
+  A->>M: Commit ObjectMetadata {nodeIds, etag, size}
+  M-->>A: 200 OK
+  A-->>C: 200 OK + ETag
+  D2-->>A: ACK x3 (arrives after response — not blocking)`} />
+
+## Deep dives
+
+### Erasure coding vs. replication
+
+Reed-Solomon (6+3) is the workhorse of S3-class durability. The algorithm treats the object as a polynomial over a Galois field. Concretely: split the object into 6 equal data shards of size $S/6$ where $S$ is the total object size. Compute 3 parity shards by evaluating the polynomial at 3 additional points. Store each of the 9 shards on a different physical storage node. The mathematical guarantee: any 6 of the 9 shards are sufficient to reconstruct the original 6 data shards via Lagrange interpolation. This means up to 3 simultaneous shard losses are tolerable — a rack failure that takes down 3 nodes loses at most 3 shards, which is exactly within tolerance.
+
+The read path under erasure coding has a deliberate asymmetry. A healthy read fetches only the 6 data shards — no parity shard needed, no computation beyond reassembly. This keeps the common-case read path clean. When a data node is unavailable, the system falls back to a degraded read: fetch any 6 of the 8 remaining shards and run the Reed-Solomon reconstruction algorithm (matrix inversion over GF(2^8)) to recover the missing shard. Reconstruction is CPU-intensive — roughly 50 MB/sec per core on commodity hardware. For warm or cold tiers where objects live on HDD, this CPU overhead is acceptable relative to the 10–100 ms disk seek latency. For hot objects on SSD where latency is measured in microseconds, this reconstruction penalty is unacceptable — which is exactly why S3 Standard uses 3× replication for hot objects and reserves erasure coding for Standard-IA and Glacier tiers.
+
+The hedged-reads strategy optimizes the common-case read latency under erasure coding: issue GET requests to all 9 shards simultaneously and return as soon as any 6 arrive. The 3 slowest nodes are simply ignored. This eliminates the tail latency contribution of slow nodes — the p99 latency of a (6+3) hedged read is approximately the p67 latency of a single node read, because you are taking the 6th-order statistic of 9 independent requests. The wasted 3 RPCs are a bandwidth cost, not a latency cost: the result is returned before the 3 stragglers finish. For petabyte-scale storage, this bandwidth overhead is more than offset by the 1.5× storage efficiency compared to 3× replication.
+
+### Data placement and rack-awareness
+
+When a new object is written, the API layer asks the metadata service for 9 data nodes to host the shards. The placement algorithm runs on the metadata service and follows three constraints in priority order:
+
+1. **AZ diversity**: shards must be spread across all 3 AZs. With 9 shards and 3 AZs, this means exactly 3 shards per AZ. An AZ failure loses at most 3 shards — within the EC (6+3) tolerance.
+
+2. **Rack diversity within each AZ**: within each AZ's 3 shards, each shard must reside on a different physical rack. This protects against top-of-rack switch failures, which typically take down all servers on a rack simultaneously.
+
+3. **Load balancing**: among the qualifying nodes (correct AZ, correct rack, not overloaded), pick by consistent hash to minimize data movement as nodes are added or removed. The consistent hash ring is keyed by `{objectId}` — different objects spread evenly across the cluster without any central allocator.
+
+The placement metadata is durable in the Raft-based metadata service before the API layer begins writing shards. If the API layer crashes mid-write, the multipart upload state or single-object write is recoverable: the metadata service has the shard locations, and a background job can either complete or garbage-collect the partial write based on whether a commit record exists.
+
+### Read path in detail
+
+A GET request arrives at any API node. The API node performs a metadata lookup — a point read from the metadata service KV store, keyed by `{bucketId, key}`. For read-after-write consistency, this read is always directed to the Raft leader of the shard owning that key, not a follower. The metadata service returns the list of 9 shard locations (data node IDs), the shard layout, and the object size.
+
+The API node then issues concurrent GET requests to all 9 data nodes. As shard responses arrive:
+
+- If the first 6 responses are all data shards (indices 0–5): decode immediately by concatenating in order and begin streaming bytes to the client. The parity shard responses are discarded.
+- If one or more data shards are slow or unavailable: wait for any 6 of the 9 shards (data or parity), run Reed-Solomon reconstruction to recover the missing data shards, then reassemble.
+
+The API node begins streaming the response to the client as bytes arrive — it does not buffer the full object before responding. This is how S3 achieves time-to-first-byte under 50 ms even for gigabyte objects: the first bytes of the response begin flowing before the full object is assembled.
+
+For Range requests (`Range: bytes=500-1499`), the API node calculates which shards contain the requested byte range, fetches only those shards (not all 9), and returns the slice. This optimization is critical for video streaming workloads where a player fetches 1 MB chunks of a multi-gigabyte video object.
+
+### Eventual consistency in LIST
+
+`LIST objects` in a bucket is eventually consistent by design. The metadata service partitions object metadata by key prefix across multiple Raft shards — a bucket with 100 million objects might have its keys distributed across 1,000 metadata shards, each responsible for a prefix range. A `LIST` with `prefix=photos/2024/` aggregates results from multiple metadata shards. Each shard is linearizable internally, but the aggregate view across shards is not: a newly written object exists on its shard's Raft log, but the LIST coordinator may have already assembled partial results from other shards before this shard's write propagated.
+
+The consequence: an application that uploads 10,000 objects and immediately LISTs to verify all arrived will see between 0 and 10,000 of them, depending on how recently each was committed and how quickly its shard's Raft commit propagated to the LIST coordinator. In practice, the lag is typically sub-second, but it can stretch to seconds under high write load.
+
+The practical pattern for applications that need a reliable inventory of uploaded objects is to maintain a separate metadata database (DynamoDB, PostgreSQL) as the canonical list. On every successful PUT (confirmed by a non-error ETag response), write a record to the application database. Treat S3 as the byte store and the application database as the index. `LIST` operations on S3 are then reserved for disaster recovery and consistency audits, not for operational reads.
+
+Delete consistency is handled by tombstone records. When an object is deleted without versioning enabled, the metadata service writes a tombstone entry for that key. The tombstone entry prevents future GETs from returning a result and is propagated to all metadata replicas via the Raft log. Periodic GC jobs physically remove tombstones after a configurable grace period. If a LIST runs during the window between the write and the tombstone propagation, the deleted object may still appear in results — this is the other direction of eventual consistency.
+
+### Multipart upload
+
+Multipart upload is required for any object larger than 5 GB (it is recommended for anything above 100 MB). The protocol has three phases:
+
+**Initiate**: `POST /{bucket}/{key}?uploads` returns an `uploadId`. The metadata service creates a `MultipartUpload` record in the multipart state table. No data has moved.
+
+**Upload parts**: each `PUT /{bucket}/{key}?partNumber=N&uploadId=X` is treated as an independent small object write. The API layer erasure-codes the part, writes shards to 9 data nodes in parallel, and stores the part's shard locations in the multipart upload state table under `{uploadId, partNumber}`. Parts can be uploaded concurrently from different threads, processes, or even different hosts. Part numbers must be between 1 and 10,000. Each part except the last must be at least 5 MB (to prevent excessive fragmentation of the final object).
+
+**Complete**: `POST /{bucket}/{key}?uploadId=X` with the ordered list of `{partNumber, etag}` tuples commits the object. The API layer verifies each ETag against the stored part ETags. If all match, the metadata service atomically:
+1. Creates the final `ObjectMetadata` record with all shard locations from all parts assembled in order.
+2. Deletes the `MultipartUpload` record.
+3. Returns the final object ETag (MD5 of concatenated part ETags with a `-N` suffix indicating N parts).
+
+The atomic commit is achieved via a Raft write to the metadata service. The operation is all-or-nothing: either the final ObjectMetadata exists (object is readable) or it does not (multipart upload is still in progress or was aborted). There is no intermediate state visible to readers.
+
+If the upload is never completed or aborted, the part shards on data nodes are orphaned. A lifecycle policy rule — "abort incomplete multipart uploads after 7 days" — drives a background scanner that finds stale `MultipartUpload` records and issues delete RPCs to the data nodes holding the part shards, then removes the stale upload record.
+
+### Lifecycle and storage class transitions
+
+Lifecycle policies are rules evaluated against object metadata by the lifecycle scanner service — a background daemon that reads from the metadata service in prefix-range batches. A typical policy in YAML-equivalent form:
+
+```
+rules:
+  - id: archive-old-logs
+    filter: { prefix: "logs/" }
+    transitions:
+      - days: 30,  storageClass: STANDARD_IA
+      - days: 180, storageClass: GLACIER
+    expiration:
+      days: 2555  # 7 years
+```
+
+The lifecycle scanner processes the metadata index in key-range chunks during off-peak hours. For each object, it checks `(now - lastModified)` against the transition thresholds and `(now - lastAccessed)` for IA transitions. If a transition is due, it enqueues a storage class change task:
+
+1. Re-encode the object: for Standard → Standard-IA, the EC parameters may change (e.g., from (6+3) to (4+2) for lower storage overhead on colder data). The scanner reads the current shards, re-encodes, and writes to a new set of data nodes (typically cheaper HDD nodes in a different rack group).
+2. Update the `ObjectMetadata.storageClass` field in the metadata service.
+3. Delete the old shards from the original data nodes.
+
+For Glacier transitions, the object shards are moved to tape or deep-archive storage. Reads require an explicit restore request (`POST /{bucket}/{key}?restore`) that initiates an async restore job. The restore job reads from tape, writes shards to a temporary hot tier, and updates a `restoreStatus` field in the metadata. Only after the restore is complete (typically 4 hours) does a `GET` on the object succeed.
+
+## Java integration
+
+### Part A — S3 SDK client with multipart upload
+
+```java
+package dev.pushkar.storage;
+
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.*;
+import software.amazon.awssdk.core.sync.RequestBody;
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.Arrays;
+
+@Service
+public class ObjectStorageService {
+    private static final long PART_SIZE = 50 * 1024 * 1024; // 50 MB per part
+    private final S3Client s3;
+    private final String bucket;
+
+    public ObjectStorageService(S3Client s3, @Value("${storage.bucket}") String bucket) {
+        this.s3 = s3;
+        this.bucket = bucket;
+    }
+
+    public String putObject(String key, InputStream data, long totalSize, String contentType)
+            throws Exception {
+        if (totalSize < PART_SIZE) {
+            return simplePut(key, data, totalSize, contentType);
+        }
+        return multipartPut(key, data, totalSize, contentType);
+    }
+
+    private String simplePut(String key, InputStream data, long size, String contentType) {
+        var resp = s3.putObject(r -> r.bucket(bucket).key(key).contentType(contentType)
+                .contentLength(size),
+            RequestBody.fromInputStream(data, size));
+        return resp.eTag();
+    }
+
+    private String multipartPut(String key, InputStream data, long totalSize, String ct)
+            throws Exception {
+        String uploadId = s3.createMultipartUpload(r -> r.bucket(bucket).key(key)
+            .contentType(ct)).uploadId();
+        var completedParts = new ArrayList<CompletedPart>();
+        byte[] buffer = new byte[(int) PART_SIZE];
+        int partNum = 1;
+        int bytesRead;
+        while ((bytesRead = data.readNBytes(buffer, 0, buffer.length)) > 0) {
+            var finalBytesRead = bytesRead;
+            var finalPartNum = partNum;
+            var resp = s3.uploadPart(r -> r.bucket(bucket).key(key)
+                .uploadId(uploadId).partNumber(finalPartNum)
+                .contentLength((long) finalBytesRead),
+                RequestBody.fromBytes(Arrays.copyOf(buffer, bytesRead)));
+            completedParts.add(CompletedPart.builder()
+                .partNumber(partNum).eTag(resp.eTag()).build());
+            partNum++;
+        }
+        var completeResp = s3.completeMultipartUpload(r -> r.bucket(bucket).key(key)
+            .uploadId(uploadId)
+            .multipartUpload(m -> m.parts(completedParts)));
+        return completeResp.eTag();
+    }
+
+    public byte[] getObject(String key) {
+        return s3.getObjectAsBytes(r -> r.bucket(bucket).key(key)).asByteArray();
+    }
+}
+```
+
+The `multipartPut` method reads the input stream in 50 MB chunks using `readNBytes` — a blocking read that fills the buffer completely before proceeding. Each chunk becomes one part, uploaded synchronously in sequence. For higher throughput, each `uploadPart` call can be dispatched to a virtual thread, allowing all parts to upload in parallel — bounded by network bandwidth rather than sequential disk reads.
+
+### Part B — Spring Boot presigned URL service
+
+```java
+@Service
+public class PresignedUrlService {
+    private final S3Presigner presigner;
+    private final String bucket;
+
+    public PresignedUrlService(S3Presigner presigner, @Value("${storage.bucket}") String bucket) {
+        this.presigner = presigner;
+        this.bucket = bucket;
+    }
+
+    public String generateDownloadUrl(String key, Duration expiry) {
+        GetObjectPresignRequest req = GetObjectPresignRequest.builder()
+            .signatureDuration(expiry)
+            .getObjectRequest(r -> r.bucket(bucket).key(key))
+            .build();
+        return presigner.presignGetObject(req).url().toString();
+    }
+
+    public PresignedUploadInfo generateUploadUrl(String key, String contentType, Duration expiry) {
+        PutObjectPresignRequest req = PutObjectPresignRequest.builder()
+            .signatureDuration(expiry)
+            .putObjectRequest(r -> r.bucket(bucket).key(key).contentType(contentType))
+            .build();
+        PresignedPutObjectRequest presigned = presigner.presignPutObject(req);
+        return new PresignedUploadInfo(presigned.url().toString(), presigned.httpRequest().headers());
+    }
+
+    record PresignedUploadInfo(String url, Map<String, List<String>> requiredHeaders) {}
+}
+```
+
+Presigned URLs are generated entirely in memory — `S3Presigner` computes the HMAC-SHA256 signature locally and embeds it in the URL. The URL can be handed to an end user's browser directly: the browser issues a PUT to S3 without any API server involvement. The `requiredHeaders` in `PresignedUploadInfo` must be sent by the browser with the upload request (notably `Content-Type`) — if they are omitted, S3 rejects the request with a 403 because the signed canonical request includes those headers.
+
+<TradeoffTable title="Durability strategy comparison for object storage tiers">
+
+| Strategy | Durability | Storage overhead | Read latency penalty | Best for |
+|---|---|---|---|---|
+| **3× replication** | 9 nines | 3× | None — direct shard read, no decode | Hot, frequently accessed objects on SSD |
+| **6+3 Erasure Coding** | 11 nines | 1.5× | Higher — reconstruct from 6 shards if any unavailable | Warm/cold objects on HDD; infrequent access tiers |
+| **4+2 Erasure Coding** | 9–10 nines | 1.5× | Medium — reconstruct from 4 shards | Balance of cost and durability for intermediate tiers |
+| **Single copy** | 0 nines | 1× | None | Cache or scratch storage only — never for durable data |
+
+</TradeoffTable>
+
+<Pitfall title="Assuming LIST lag is sub-millisecond — it can be seconds under high write load">
+
+In high-throughput workloads, `LIST` can lag behind `PUT` by seconds, not milliseconds. An application that uploads 10,000 objects in a burst and immediately LISTs to verify all objects arrived will see an inconsistent snapshot — potentially missing thousands of recently written objects. The failure mode is subtle: the application logs no errors (the PUTs all returned 200), but its verification step silently passes with incomplete data, leading to downstream processing that skips objects. The correct pattern is to treat S3 as a byte store and maintain a separate strongly-consistent metadata database (DynamoDB with conditional writes, or Postgres) as the canonical index. Write a record to the application database only after the S3 PUT returns successfully. Use `LIST` only for bulk reconciliation and disaster recovery, not for operational read paths.
+
+</Pitfall>
+
+<Pitfall title="Abandoned multipart uploads silently accumulate storage cost">
+
+Every `POST /{bucket}/{key}?uploads` that is never completed or aborted creates a `MultipartUpload` record and orphans all the part shards written to data nodes. The part shards exist on disk, consume storage capacity, and accrue storage billing — but they are invisible to `LIST` operations on the bucket, because they have no committed `ObjectMetadata` record. In a system with many parallel uploaders (a video ingestion pipeline, a data transfer agent), failed uploads accumulate silently. A bucket can have petabytes of orphaned parts that the application team has no visibility into without querying the multipart upload listing API (`GET /{bucket}?uploads`). The remedy is a lifecycle policy rule configured at bucket creation time: `AbortIncompleteMultipartUploadAfterDays: 7`. This instructs the lifecycle scanner to find any `MultipartUpload` record older than 7 days, issue delete RPCs to data nodes for all its part shards, and remove the stale upload record.
+
+</Pitfall>
+
+## Curveballs
+
+<Curveball question="A customer accidentally deletes 10 million objects from a bucket. They call your support team 4 hours later. S3 versioning was disabled. Can you recover the data? How does your architecture support or prevent this?">
+
+Without versioning, a DELETE writes a tombstone to the metadata service and asynchronously schedules the data node shards for garbage collection. The GC job runs on a configurable delay — typically 24–72 hours after the delete marker is committed — to allow for accidental delete recovery. If the customer calls within the GC window (4 hours is well within a 24-hour GC delay), recovery is possible: find the tombstone records for the deleted keys, mark them as canceled in the metadata service (removing the tombstone), and the objects immediately reappear to GET and LIST operations. The shards on data nodes were never physically deleted — the GC job had not run yet. This is why S3's actual deletion behavior involves a deferred GC phase rather than immediate shard destruction. At the architectural level, the system should expose an internal "undelete" API accessible only to support tooling, which queries the metadata service for tombstone records within a time window and reverses them. The prevention answer is bucket versioning (every DELETE creates a delete marker instead of a tombstone, and all previous versions remain accessible) and MFA delete (DeleteObject requires a second authentication factor, preventing accidental mass deletion). For buckets containing critical data, versioning plus S3 Object Lock (WORM — write once, read many) provides regulatory-grade protection against even intentional deletion.
+
+</Curveball>
+
+<Curveball question="You need to guarantee strong read-after-write consistency for all operations — not just GET after PUT, but LIST after PUT. How do you architect this without sacrificing throughput?">
+
+Strong consistency for LIST requires that every PUT atomically updates a globally ordered index that all subsequent LIST operations read from. The naive implementation — a single Raft-replicated B-tree index for all keys in a bucket — is a global write serialization point: all PUTs to a bucket must append to the same Raft log, serializing them through a single leader. At 10,000 PUT/sec per bucket, this Raft leader handles 10,000 log entries per second — achievable for small clusters, but it becomes the throughput ceiling. The staff-level solution is to shard the index by key prefix, as described in the eventual consistency section, and then layer a read fence on top. A read fence works as follows: on every PUT, the metadata service returns a `consistencyToken` — the Raft log index of the commit. On every LIST, the client can optionally supply this token as `X-Consistency-Token`. The LIST coordinator waits until all metadata shards that could contain keys matching the list prefix have advanced their Raft commit index past the consistency token before assembling the result. This guarantees that the LIST result reflects all PUTs up to and including the tokenized write. The cost is LIST latency: the coordinator may wait tens to hundreds of milliseconds for lagging shards to catch up. This is the explicit trade-off — strong LIST consistency is available at a latency cost, and eventual consistency is the default for throughput-sensitive workloads.
+
+</Curveball>
+
+<Curveball question="A storage node fails while a multipart upload is in progress. Three of ten parts were being written to the failed node. How does your system complete the upload, and what happens to the partial shards on the failed node?">
+
+Each part in a multipart upload is an independent EC-encoded mini-object — the failure of a storage node during a part write affects only the shards being written to that node at the moment of failure. For part N that was mid-write to the failed node: the API layer was writing 9 shards in parallel, one per data node. The failed node's shard write returns an error. The API layer detects the failure and immediately selects a replacement node from the healthy pool (same AZ, different rack — the placement constraints still apply). It reissues the shard write to the replacement node. Since the API layer holds all 9 shards in memory during the write (they were computed from the part bytes before any shard write began), the retry is a local operation — no re-computation, no re-read from the client. Once 9 shards are successfully written (6 data + 3 parity, possibly on a different set of nodes than originally planned), the part's `dataNodeIds` in the multipart state table reflect the actual nodes used, including the replacement. Parts that had already completed before the node failure are unaffected — their shard writes are already committed to data nodes and recorded in the multipart state table. The failed node's partially written shard (if any bytes landed on disk before the crash) is orphaned. When the node recovers, a background integrity checker finds shards with no corresponding multipart or object metadata record and deletes them — the GC mechanism is the same one that handles abandoned multipart uploads.
+
+</Curveball>
+
+<RelatedQuestions items={[
+  { slug: "dropbox-google-drive", title: "Design Dropbox / Google Drive", difficulty: "senior" },
+  { slug: "hdfs-distributed-file-system", title: "Design a Distributed File System (HDFS)", difficulty: "staff" },
+  { slug: "photo-storage-haystack", title: "Design Photo Storage at Scale", difficulty: "senior" },
+]} />
+
+## Further reading
+
+- [Amazon S3 Consistency Model](https://aws.amazon.com/s3/consistency/) — AWS's official documentation on the strong read-after-write consistency model introduced in December 2020. Explains the implementation mechanism (a distributed cache layer in front of the metadata service that provides linearizable reads for GET and HEAD) and the remaining eventual-consistency surface areas (bucket listing under high write load, presigned URL propagation delay).
+- [Reed-Solomon Erasure Coding — A Primer](https://en.wikipedia.org/wiki/Reed%E2%80%93Solomon_error_correction) — The mathematical foundations of Reed-Solomon codes, including the Galois field arithmetic that makes shard reconstruction possible. For a practical implementation reference, the [Backblaze Reed-Solomon library](https://github.com/Backblaze/JavaReedSolomon) is open-source Java and shows exactly how the encoding and reconstruction matrices are computed.
+- [Google Colossus Architecture](https://cloud.google.com/blog/products/storage-data-transfer/a-peek-behind-colossus-googles-file-system) — Google's successor to GFS, which underpins Google Cloud Storage. Covers the metadata service (Curators), the storage layer (D servers), and how the architecture evolved from the GFS design to support petabyte-scale object workloads with sub-millisecond metadata lookups.
+- [Finding a needle in Haystack: Facebook's photo storage](https://www.usenix.org/legacy/event/osdi10/tech/full_papers/Beaver.pdf) — Beaver et al., OSDI 2010. Facebook's solution to the small-object storage problem — billions of photos where each photo is hundreds of kilobytes. Covers the index-in-memory design that eliminates disk seeks for metadata, the append-only data layout that amortizes fsync cost across thousands of writes, and the CDN offload strategy. Essential reading for understanding how object storage systems optimize for the small-object case that dominates real workloads by count, even if large objects dominate by bytes.

@@ -1,0 +1,102 @@
+---
+export interface Props {
+  slug: string;
+  title: string;
+}
+const { slug, title } = Astro.props;
+---
+
+<div class="bookmark-wrap">
+  <button
+    id="bookmark-btn"
+    class="bookmark-btn"
+    aria-pressed="false"
+    data-slug={slug}
+    data-title={title}
+    title="Bookmark this question"
+  >
+    <svg class="bm-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path
+        class="bm-path"
+        d="M3 2.5A1.5 1.5 0 0 1 4.5 1h7A1.5 1.5 0 0 1 13 2.5v12l-5-3-5 3V2.5Z"
+        stroke="currentColor"
+        stroke-width="1.4"
+        stroke-linejoin="round"
+      />
+    </svg>
+    <span class="bm-label">Bookmark</span>
+  </button>
+</div>
+
+<style>
+  .bookmark-wrap {
+    display: flex;
+    justify-content: flex-end;
+    margin: -0.5rem 0 1.5rem;
+  }
+  .bookmark-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-family: 'Geist', system-ui, sans-serif;
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--ink-3);
+    background: transparent;
+    border: 1px solid var(--line-2);
+    border-radius: var(--r-md);
+    padding: 0.4em 0.75em;
+    cursor: pointer;
+    transition: color var(--dur-fast), border-color var(--dur-fast), background var(--dur-fast);
+  }
+  .bookmark-btn:hover {
+    color: var(--accent);
+    border-color: var(--accent-line);
+    background: var(--accent-soft);
+  }
+  .bookmark-btn[aria-pressed="true"] {
+    color: var(--accent);
+    border-color: var(--accent-line);
+    background: var(--accent-soft);
+  }
+  .bookmark-btn[aria-pressed="true"] .bm-path {
+    fill: var(--accent);
+    stroke: var(--accent);
+  }
+</style>
+
+<script>
+  const btn = document.getElementById('bookmark-btn') as HTMLButtonElement | null;
+  if (btn) {
+    const STORAGE_KEY = 'sd-bookmarks';
+    const slug = btn.dataset.slug!;
+    const title = btn.dataset.title!;
+
+    function getBookmarks(): { slug: string; title: string; savedAt: number }[] {
+      try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); }
+      catch { return []; }
+    }
+
+    function isBookmarked() {
+      return getBookmarks().some(b => b.slug === slug);
+    }
+
+    function syncUI() {
+      const saved = isBookmarked();
+      btn!.setAttribute('aria-pressed', String(saved));
+      const label = btn!.querySelector('.bm-label');
+      if (label) label.textContent = saved ? 'Bookmarked' : 'Bookmark';
+    }
+
+    btn.addEventListener('click', () => {
+      const bookmarks = getBookmarks();
+      const idx = bookmarks.findIndex(b => b.slug === slug);
+      if (idx >= 0) bookmarks.splice(idx, 1);
+      else bookmarks.push({ slug, title, savedAt: Date.now() });
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(bookmarks));
+      syncUI();
+    });
+
+    syncUI();
+  }
+</script>

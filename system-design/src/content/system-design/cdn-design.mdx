@@ -1,0 +1,508 @@
+---
+title: "Design a CDN"
+slug: "cdn-design"
+category: "infra"
+difficulty: "senior"
+estimatedReadMinutes: 21
+tags: ["anycast", "cache-hierarchy", "purge", "origin-shield", "edge-computing", "bgp", "pop"]
+companyFlavors: ["Cloudflare", "Akamai", "AWS CloudFront", "Fastly", "Bunny CDN"]
+prerequisites: []
+relatedQuestions: ["api-gateway", "youtube-design", "distributed-logging-system"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Design a global CDN that serves static assets with < 20ms latency worldwide using Anycast routing, a multi-tier cache hierarchy, and intelligent cache purge propagation — covering PoP placement, origin shield, cache key design, and edge computing for dynamic content."
+javaPackages: ["org.springframework.boot:spring-boot-starter-web:3.3.0", "com.github.ben-manes.caffeine:caffeine:3.1.8"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="cdn-design" title="Design a CDN" />
+
+<Tldr>
+- **Anycast**: multiple PoPs share the same IP prefix; BGP routing sends users to the nearest PoP automatically — no DNS-based geo-routing needed for the initial TCP connection
+- **Cache hierarchy**: L1 (edge PoP, small SSD), L2 (regional shield, large HDD), L3 (origin). Cache-miss at L1 checks L2 before hitting origin — reduces origin traffic by 99%
+- **Cache key = URL + Vary header value** (e.g., `Accept-Encoding`, `Accept-Language`). Never include cookies or auth tokens in the cache key or you risk caching personalized pages
+- **Purge propagation**: tag-based purge (Cloudflare Cache Tags, Fastly surrogate keys) is O(tags) not O(URLs) — one `product:123` tag can invalidate 1,000 URLs instantly via Pub/Sub fan-out
+- **Origin shield**: designate one regional PoP as the shield for all other PoPs in the region — single stream to origin instead of N parallel cache misses during a cache-fill storm
+</Tldr>
+
+## Why CDNs exist
+
+The speed of light is not negotiable. A photon traveling through fiber optic cable moves at roughly 200,000 km/s — about two-thirds the speed of light in a vacuum due to the refractive index of glass. The round-trip distance between New York and London is approximately 11,000 km through undersea cables, which imposes a physical minimum latency floor of ~55 ms for a single round trip. Add TCP handshake, TLS negotiation, and server processing time, and a trans-Atlantic HTTPS request to a London origin from a New York client realistically costs 200–300 ms before a single byte of content is returned. For a page requiring 50 sub-resources, that latency compounds catastrophically.
+
+CDNs solve this by moving content replicas geographically close to users. A PoP (Point of Presence) in New York serving a cached asset to a New York user faces perhaps 2–5 ms of network round-trip time — a 40–100x improvement over fetching from a London origin. This is not a caching trick or a software optimization: it is a fundamental shift in the physics of the request path. The network distance between the user and the serving node is the irreducible cost, and the CDN's job is to minimize that distance.
+
+The secondary benefit — and equally important for large platforms — is origin capacity protection. Without a CDN, every user request hits origin servers directly. A viral event, a product launch, or a sudden traffic spike can overwhelm origin infrastructure regardless of how well it is provisioned. A CDN with a 95%+ cache hit ratio absorbs 19 out of every 20 requests at the edge, meaning origin capacity needs to handle only 5% of peak traffic. This turns origin infrastructure from a capacity-planning problem into a much smaller and more manageable baseline provisioning problem. Companies like Netflix serve over 100 Tbps of video traffic globally through CDN infrastructure — scaling that on owned origin hardware would be economically and operationally intractable.
+
+## Clarifying questions
+
+Lock down these eight questions before sketching any architecture. Each answer gates at least one major design decision.
+
+| Question | Ideal answer | Why it matters |
+|---|---|---|
+| What content types will be served? | Static assets (images, JS, CSS, video), some API responses | Static content is highly cacheable; API responses require cache key precision and shorter TTLs; live video requires streaming-specific cache strategies |
+| What is the target cache hit ratio? | > 95% for static assets, > 80% for API responses | Drives cache storage sizing, origin shield design, and TTL strategy — lower targets mean smaller PoP caches are acceptable |
+| What is the geographic distribution of users? | Global, heaviest in North America, Europe, Southeast Asia | Determines PoP placement priority and how many Anycast prefix announcements are needed per region |
+| What is the dynamic vs. static content ratio? | 70% static, 30% dynamic or personalized | Dynamic content requires edge logic (Workers/Lambda@Edge), shorter TTLs, or cache bypass — directly impacts architecture complexity |
+| What is the purge latency requirement? | < 5 seconds globally for product catalog updates | Determines whether TTL-only invalidation is acceptable or whether real-time tag-based purge infrastructure is required |
+| Does SSL termination happen at the edge? | Yes — users must see CDN's cert, not origin cert | Edge TLS means the CDN must hold TLS certificates for customer domains; requires certificate management infrastructure and SNI support |
+| What happens if origin is down? | Serve stale content for up to 24 hours | Requires stale-while-revalidate and stale-if-error cache directives; PoPs must be configured to serve expired cache entries rather than surfacing 502 errors to users |
+| Is custom logic at the edge required? | Yes — A/B testing, auth token validation, geo-redirects | Edge computing (Cloudflare Workers, Fastly Compute) adds a programmable layer at each PoP; no persistent state at edge means external KV stores are needed for sticky assignments |
+
+## Functional requirements
+
+- Serve requests from the nearest PoP via Anycast routing; fall back to next-nearest PoP on PoP failure
+- Cache content at edge with configurable TTL per content type and per URL pattern matching rules
+- Cache purge by URL (single URL or URL pattern glob) and by cache tag (surrogate key)
+- Origin failover: if origin is unreachable, serve stale cached content rather than returning an error
+- Edge logic: execute request and response transformation functions at the PoP (header manipulation, A/B routing, auth validation, geo-based redirects)
+- HTTPS termination at the edge with support for custom domains via SNI; TLS 1.3 minimum
+
+## Non-functional requirements
+
+- **Latency**: p99 < 20 ms for cached content to end users worldwide (excludes origin fetch time on cache miss)
+- **Availability**: 99.99% globally; individual PoP failure must be transparent to users within 60 seconds via BGP failover
+- **Cache hit ratio**: > 95% for static assets after warm-up period; > 80% for API responses with proper cache key design
+- **Purge propagation**: cache tag purge must reach all PoPs globally in < 5 seconds
+- **Throughput**: 10 million requests per second per PoP during peak; CDN network aggregate in the hundreds of Tbps
+- **Durability of configuration**: cache rules and purge operations must be acknowledged and durable — a PoP that comes back online after a restart must not serve content that was purged before the restart
+
+## Capacity estimation
+
+<Capacity title="Bandwidth, storage, and origin traffic sizing for a global CDN">
+
+**Global traffic volume**
+
+Netflix serves approximately 100 Tbps of CDN traffic globally at peak. Using a more modest baseline of a large video-heavy platform:
+
+$$
+\text{avg object size} = 100\ \text{KB (mix of images, JS, CSS, video segments)}
+$$
+
+$$
+\text{global requests/sec} = 10\ \text{M req/s} \Rightarrow \text{bandwidth} = 10 \times 10^6 \times 100\ \text{KB} = 1\ \text{TB/s}
+$$
+
+**Per-PoP throughput**
+
+With 200 PoPs distributed globally, assuming traffic is distributed proportionally by regional population weight:
+
+$$
+\text{avg requests/PoP} = \frac{10\ \text{M req/s}}{200\ \text{PoPs}} = 50{,}000\ \text{req/s per PoP}
+$$
+
+Peak PoPs (e.g., Ashburn, Frankfurt, Singapore) handle 3–5× the average — roughly 150K–250K req/s. Each PoP runs 20–50 cache servers in an active cluster with consistent hashing across servers.
+
+**Cache storage per PoP**
+
+To maintain a 95% hit ratio, the working set that fits in the PoP's cache must cover 95% of requests. If the hot working set is 10 TB:
+
+$$
+\text{L1 SSD per PoP} = 10\ \text{TB (NVMe SSD for low-latency reads)}
+$$
+
+The L2 regional shield holds the full working set plus a longer tail of less-popular objects:
+
+$$
+\text{L2 HDD per shield} = 100\ \text{TB (high-density HDD — latency is acceptable since L2 serves only L1 misses)}
+$$
+
+**Origin shield traffic reduction**
+
+Without a shield, every L1 miss at 200 PoPs hits origin directly:
+
+$$
+\text{L1 miss rate} = 5\% \Rightarrow \text{origin requests} = 0.05 \times 10\ \text{M} = 500{,}000\ \text{req/s to origin}
+$$
+
+With a regional shield serving 20 PoPs, the 500K L1 misses are absorbed by shields. Each shield has its own L2 cache with a 95% hit ratio:
+
+$$
+\text{shield} \to \text{origin requests} = 0.05 \times 500{,}000 = 25{,}000\ \text{req/s to origin}
+$$
+
+Origin traffic is reduced from 500K req/s to 25K req/s — a **20× reduction** purely from the shield tier, on top of the 20× reduction already achieved by L1 caches.
+
+</Capacity>
+
+## API design
+
+The CDN exposes two planes: the **data plane** (transparent to users, handled by edge servers) and the **control plane** (used by customers to configure caching rules and trigger purges).
+
+```
+GET /<path>?<queryParams>
+  Headers: If-None-Match: "<etag>"
+           Accept-Encoding: gzip, br
+  Returns: 200 OK — full response body from cache
+           304 Not Modified — if ETag matches (conditional request)
+           X-Cache: HIT | MISS | STALE
+           X-Cache-Age: <seconds since cached>
+           X-Served-By: <pop-id>
+
+POST /api/purge
+  Body: { "urls": ["https://example.com/image.png"] }
+  Returns: 202 Accepted — purge queued for propagation
+
+POST /api/purge/tags
+  Body: { "tags": ["product:123", "category:electronics"] }
+  Returns: 202 Accepted — all objects tagged with any listed tag are invalidated
+
+PUT /api/config/rules
+  Body: {
+    "rules": [
+      { "match": "/assets/*", "ttl": 31536000, "immutable": true },
+      { "match": "/api/*", "ttl": 60, "cacheKeyParams": ["locale", "version"] }
+    ]
+  }
+  Returns: 200 OK — rule applied to all PoPs within 30 seconds
+
+GET /api/analytics/cache-stats?popId=<id>&window=1h
+  Returns: { "hitRatio": 0.97, "requestsServed": 180000000, "bandwidthSaved": "18TB" }
+```
+
+The `X-Cache` response header is the primary observability signal for debugging cache behavior in production. The `X-Served-By` header identifies which PoP handled the request, which is essential for correlating edge logs with cache miss investigations.
+
+## Data model
+
+**Cache entry** (stored on NVMe SSD at each PoP):
+
+```
+CacheEntry {
+  cacheKey:      String          // normalized URL + Vary dimensions (see below)
+  body:          Blob            // compressed response body on disk
+  statusCode:    int             // cached HTTP status (typically 200, 206 for range)
+  headers:       Map<String, String>  // response headers to replay
+  ttl:           Duration        // max age from origin Cache-Control
+  expiresAt:     Instant         // absolute expiry = fetchedAt + ttl
+  fetchedAt:     Instant         // when this entry was populated from origin/shield
+  etag:          String          // for conditional revalidation with origin
+  lastModified:  Instant
+  sizeBytes:     long
+  cacheTagList:  List<String>    // e.g. ["product:123", "category:electronics"]
+  hitCount:      long            // for LRU/LFU eviction scoring
+}
+```
+
+**Cache key normalization** is where most cache poisoning bugs originate. The key is constructed as:
+
+```
+cacheKey = scheme + "://" + host + normalizedPath + "?" + sortedAllowedParams
+           + "|vary:" + varyHeaderValues
+```
+
+Query parameters are sorted alphabetically and filtered to an allowlist. The `Vary` header values (typically `Accept-Encoding`, `Accept-Language`) are appended after a separator. Cookies, session tokens, and `Authorization` headers are explicitly excluded.
+
+**PoP metadata** (stored in a distributed configuration store, replicated to all PoPs):
+
+```
+PopMetadata {
+  popId:        String       // e.g. "iad-01" (Ashburn datacenter 1)
+  region:       String       // "us-east"
+  asn:          int          // BGP Autonomous System Number
+  ipRanges:     List<CIDR>   // IP ranges announced via Anycast for this PoP
+  shieldPopId:  String       // ID of the regional shield PoP for L1 misses
+  capacity:     PopCapacity  // { requestsPerSec, bandwidthGbps, storageTB }
+  healthStatus: Enum { HEALTHY, DEGRADED, OFFLINE }
+  updatedAt:    Instant
+}
+```
+
+**Cache tag index** (maintained per PoP for O(1) tag-based purge lookup):
+
+```
+TagIndex {
+  tag:          String          // e.g. "product:123"
+  cacheKeys:    Set<String>     // all cache keys bearing this tag
+}
+```
+
+The tag index is an inverted index: given a tag, find all cache keys that must be invalidated. This is what makes tag-based purge O(tags) rather than O(URLs) — a single tag lookup returns the full set of affected keys instantly.
+
+## High-level architecture
+
+<Mermaid caption="Global CDN request flow: Anycast BGP routing sends the user's TCP connection to the nearest PoP. L1 cache miss falls through to regional shield (L2), which falls through to origin only on L2 miss. The shield coalesces concurrent misses via request collapse." diagram={`graph LR
+  User --> Anycast["Anycast IP\nBGP nearest PoP"]
+  Anycast --> EdgePoP["Edge PoP\nL1 Cache SSD"]
+  EdgePoP -->|"L1 miss"| Shield["Regional Shield\nL2 Cache HDD"]
+  Shield -->|"L2 miss"| Origin["Origin Servers"]
+  Origin --> Shield
+  Shield --> EdgePoP
+  EdgePoP --> User`} />
+
+<Mermaid caption="Cache purge propagation: a tag purge request is received by the control plane API, fanned out via Pub/Sub to all PoP purge agents, and acknowledged once all PoPs confirm invalidation. The purge agent uses the local tag index to find and evict affected cache entries." diagram={`sequenceDiagram
+  autonumber
+  participant Customer as Customer API
+  participant Control as Control Plane
+  participant PubSub as Pub/Sub Bus
+  participant Pop1 as PoP (US-East)
+  participant Pop2 as PoP (EU-West)
+  participant Pop3 as PoP (AP-SE)
+
+  Customer->>Control: POST /api/purge/tags {tags: ["product:123"]}
+  Control->>PubSub: publish PurgeEvent{tags, purgeId, timestamp}
+  PubSub-->>Pop1: PurgeEvent
+  PubSub-->>Pop2: PurgeEvent
+  PubSub-->>Pop3: PurgeEvent
+  Pop1->>Pop1: tagIndex.lookup("product:123") -> evict matching keys
+  Pop2->>Pop2: tagIndex.lookup("product:123") -> evict matching keys
+  Pop3->>Pop3: tagIndex.lookup("product:123") -> evict matching keys
+  Pop1-->>Control: ACK purgeId
+  Pop2-->>Control: ACK purgeId
+  Pop3-->>Control: ACK purgeId
+  Control-->>Customer: 200 OK {propagatedIn: "2.1s", popsAcked: 200}`} />
+
+## Deep dives
+
+### Anycast routing
+
+Anycast is the mechanism that makes a CDN's IP address geography-aware without requiring any application-level routing logic. The CDN announces the same IP prefix (e.g., `203.0.113.0/24`) from every PoP location using BGP (Border Gateway Protocol). ISPs receive BGP advertisements for this prefix from multiple physical locations and route each packet to the topologically closest PoP by AS (Autonomous System) hop count. From a user's perspective, they make a TCP connection to a single IP address, and the internet's routing infrastructure delivers that connection to the nearest PoP automatically.
+
+The practical implications are significant. First, there is no DNS lookup involved in routing to the nearest PoP — the routing decision is made at the IP layer by routers along the path, not by a DNS resolver that might cache a stale geo-IP mapping. This eliminates the DNS TTL propagation delay that plagues traditional DNS-based geographic load balancing. Second, failover is automatic and handled by BGP: if a PoP goes offline or becomes unhealthy, the CDN withdraws its BGP announcement for that prefix from that location. BGP convergence across the internet typically takes 30–90 seconds, after which all traffic previously destined for the failed PoP is rerouted by ISPs to the next-closest announcing location. No DNS changes, no application layer intervention — the routing fabric handles it.
+
+The nuance that trips up interview candidates: Anycast routes TCP connections, not individual packets. Once a TCP connection is established between a user's client and a PoP, all packets for that connection stay on the same path — BGP routing cannot mid-flight redirect an established TCP stream to a different PoP without breaking the connection. This means that if a PoP fails mid-request, active TCP connections to that PoP are dropped and clients must reconnect (which will then be routed to the next PoP). Anycast provides connection-level routing, not packet-level routing for established flows. This is why CDNs complement Anycast with health-check-based circuit breakers at the BGP advertisement layer: the PoP's BGP daemon is configured to withdraw the announcement automatically when local health checks fail, before the PoP becomes fully unreachable.
+
+### Cache hierarchy and origin shield
+
+Without an origin shield, consider what happens when a popular new object — say, a viral image — is first requested and is not yet cached at any PoP. If 200 edge PoPs all receive a request for this object within the same second, and all 200 experience a cache miss, they will all simultaneously issue a GET request to the origin. This is the **cache-fill storm**, also called the **thundering herd** for CDN. The origin, which is provisioned to handle the small fraction of traffic that normally bypasses the CDN, receives 200× its expected load instantaneously.
+
+The origin shield prevents this. All edge PoPs in a region are configured to send their L1 misses to a designated **shield PoP** rather than directly to origin. The shield PoP maintains an L2 cache. When the first edge PoP misses and the shield also misses, the shield issues one request to origin. While that origin fetch is in flight, subsequent requests from other edge PoPs in the same region for the same object are **coalesced** at the shield — the shield holds them pending the single in-flight origin fetch, then fans the response out to all waiting PoPs simultaneously. This is **request collapse**: N simultaneous L1 misses result in exactly 1 origin request.
+
+The shield provides a second benefit during normal operation: it absorbs the long-tail traffic that L1 PoPs cannot cache due to limited SSD capacity. A less-popular object that is evicted from a busy edge PoP's L1 cache (due to LRU pressure from more popular objects) will still be found in the regional shield's larger HDD-backed L2 cache. The L1 miss becomes an L2 hit at the shield, not an origin request. The shield's larger storage footprint (100 TB HDD vs. 10 TB SSD at the edge) covers a much wider working set, improving the effective hit ratio of the overall system.
+
+The trade-off is latency on L1 misses: instead of the L1 PoP making a direct request to origin, it goes through the shield, adding an extra network hop. In practice this is 5–15 ms within a region — acceptable because the shield-to-origin path is the bottleneck, not the edge-to-shield hop. The latency cost is paid only on cache misses, which by design are 5% or less of total traffic.
+
+### Cache invalidation strategies
+
+Cache invalidation is famously hard. TTL-based expiry is the foundation — every cached object has a `max-age` that limits how long stale content can be served. But TTL alone means that after a content update, users may see stale data for up to `max-age` seconds. For product pricing pages with 1-hour TTLs, that is an hour of users seeing wrong prices after a sale starts.
+
+URL-based purge solves the staleness problem for individual objects. When a product image is updated, the origin sends a `POST /api/purge?url=...` request to the CDN control plane, which propagates the invalidation to all PoPs. The limitation is scale: a large e-commerce site with 5 million product pages cannot purge them individually — a bulk purge of 5M URLs generates 5M purge messages fanned out to 200 PoPs, totaling 1 billion internal messages.
+
+Tag-based purge (Cloudflare Cache Tags, Fastly Surrogate-Key) solves the scale problem. At response time, the origin attaches a `Surrogate-Key` header listing all semantic tags for that content:
+
+```
+Surrogate-Key: product:123 category:electronics brand:apple
+```
+
+Each PoP indexes the cache key under all its tags. When product 123's data changes, the origin sends a single purge for the tag `product:123`. The CDN control plane fans this tag purge to all PoPs via Pub/Sub. Each PoP's purge agent performs a local tag index lookup — an O(1) hash map read — to find all cache keys bearing that tag, then evicts them all. Ten thousand product pages tagged with `product:123` (listing pages, recommendation widgets, search results) are all invalidated with a single API call. The purge message count is O(PoPs × tags), not O(PoPs × URLs).
+
+Versioned URLs are the highest-performance invalidation strategy and require no explicit purge at all. Instead of `/app.js`, assets are deployed as `/app.a1b2c3d4.js` where the hash is computed from the file content at build time. The CDN caches this forever (`Cache-Control: max-age=31536000, immutable`). When the file changes, the hash changes, the URL changes, and the new URL starts as a cold miss. The old URL is never purged — it simply expires after a year or is evicted by LRU pressure. The trade-off is that the deploy pipeline must generate new hashed filenames and update all references atomically, which requires a coordinated build and deploy process.
+
+### Edge computing
+
+Modern CDNs expose a programmable execution layer at each PoP: Cloudflare Workers, Fastly Compute@Edge, AWS Lambda@Edge, Vercel Edge Functions. These runtimes execute JavaScript (V8 isolates) or WebAssembly at the edge with cold-start times under 1 ms (isolate-based, not container-based). The key use cases are:
+
+**Request transformation**: normalize URLs, strip tracking query parameters before they reach the cache key, add security headers, rewrite paths for A/B testing.
+
+**Auth token validation at edge**: instead of forwarding every request to an origin auth service, the edge function validates a JWT locally. A 256-byte HMAC-SHA256 JWT validation takes under 0.1 ms at the edge. This eliminates a 50–200 ms round trip to an origin auth service on every authenticated request.
+
+**Geo-based routing**: the edge function receives the user's IP-derived country code as a request variable (`cf-ipcountry` on Cloudflare Workers) and can redirect to a country-specific subdomain, serve a localized response, or block requests from sanctioned regions — all without the request reaching origin.
+
+The architectural constraint for edge computing: **no persistent in-process state**. Each edge PoP runs hundreds of isolates concurrently across many machines; there is no shared memory between them. Sticky data (A/B test assignments, feature flags, rate-limit counters) must be stored in an external edge KV store (Cloudflare KV, Fastly Config Store) that is replicated to all PoPs with eventual consistency. This KV store has higher read latency than in-process memory (1–5 ms vs. nanoseconds) but is globally consistent within seconds and survives worker restarts. The rule: if a piece of state must survive across multiple requests or must be consistent across workers on the same PoP, it belongs in the edge KV store, not in a module-level JavaScript variable.
+
+## Java integration
+
+### Part A — Cache-Control header generation and surrogate key tagging
+
+The origin is responsible for generating correct `Cache-Control` headers and attaching surrogate keys. This is the single most impactful thing an origin can do to maximize CDN effectiveness.
+
+```java
+package dev.pushkar.cdn;
+
+import org.springframework.http.CacheControl;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+@RestController
+public class AssetController {
+
+    private final AssetService assetService;
+    private final CdnPurgeService cdnPurgeService;
+
+    public AssetController(AssetService assetService, CdnPurgeService cdnPurgeService) {
+        this.assetService = assetService;
+        this.cdnPurgeService = cdnPurgeService;
+    }
+
+    @GetMapping("/assets/{filename:.+}")
+    public ResponseEntity<byte[]> getAsset(
+            @PathVariable String filename,
+            @RequestHeader(value = "If-None-Match", required = false) String ifNoneMatch) {
+
+        Asset asset = assetService.load(filename);
+        String etag = "\"" + asset.contentHash() + "\"";
+
+        if (etag.equals(ifNoneMatch)) {
+            return ResponseEntity.status(304)
+                .eTag(etag)
+                .build();
+        }
+
+        CacheControl cc = asset.isImmutable()
+            ? CacheControl.maxAge(365, TimeUnit.DAYS).cachePublic().immutable()
+            : CacheControl.maxAge(1, TimeUnit.HOURS).cachePublic()
+                .staleWhileRevalidate(Duration.ofMinutes(5));
+
+        return ResponseEntity.ok()
+            .cacheControl(cc)
+            .eTag(etag)
+            .header("Surrogate-Key", "asset:" + filename + " type:" + asset.type())
+            .header("Vary", "Accept-Encoding")
+            .body(asset.bytes());
+    }
+
+    @PostMapping("/cdn/purge")
+    public ResponseEntity<Void> purge(@RequestBody PurgeRequest req) {
+        cdnPurgeService.purgeByTag(req.tags());
+        return ResponseEntity.accepted().build();
+    }
+
+    record PurgeRequest(List<String> tags) {}
+}
+```
+
+The `Surrogate-Key` header is invisible to the browser — Cloudflare and Fastly strip it before forwarding the response to the user. It is only consumed by the CDN's internal tag index. The `Vary: Accept-Encoding` header tells the CDN to store separate cache entries for compressed (gzip, brotli) and uncompressed variants of the same URL. Without `Vary`, a client requesting brotli-compressed content might receive an uncompressed response from cache that was stored for a client that did not send `Accept-Encoding`.
+
+The 304 short-circuit on ETag match eliminates unnecessary body transfers for conditional requests. An edge PoP revalidating a stale cache entry with `If-None-Match` receives a 304 with no body, updates its cache entry's TTL, and serves the cached body to the user — no full response body traverses the network between shield and origin.
+
+### Part B — Origin shield with Caffeine L2 cache
+
+The shield PoP runs a caching reverse proxy. In a Java service acting as a shield, Caffeine provides an in-process L2 cache that collapses concurrent origin fetches via its `get(key, mappingFunction)` method — Caffeine serializes concurrent requests for the same key so the mapping function runs exactly once.
+
+```java
+@Service
+public class OriginShieldService {
+    private final Cache<String, CachedResponse> l2Cache;
+    private final WebClient originClient;
+
+    public OriginShieldService(WebClient.Builder builder,
+                                @Value("${origin.url}") String originUrl) {
+        this.l2Cache = Caffeine.newBuilder()
+            .maximumSize(100_000)
+            .expireAfterWrite(Duration.ofMinutes(60))
+            .recordStats()
+            .build();
+        this.originClient = builder.baseUrl(originUrl).build();
+    }
+
+    public Mono<CachedResponse> fetch(String path, HttpHeaders requestHeaders) {
+        CachedResponse cached = l2Cache.getIfPresent(cacheKey(path, requestHeaders));
+        if (cached != null && !cached.isExpired()) return Mono.just(cached);
+
+        return originClient.get()
+            .uri(path)
+            .headers(h -> h.addAll(requestHeaders))
+            .retrieve()
+            .toEntityFlux(byte[].class)
+            .next()
+            .map(resp -> {
+                var cr = new CachedResponse(resp.getBody(), resp.getHeaders(), Instant.now());
+                l2Cache.put(cacheKey(path, requestHeaders), cr);
+                return cr;
+            });
+    }
+
+    private String cacheKey(String path, HttpHeaders headers) {
+        return path + "|" + headers.getFirst(HttpHeaders.ACCEPT_ENCODING);
+    }
+}
+```
+
+In production, the shield's L2 cache is not just an in-process Caffeine cache — it is backed by a large NVMe or HDD tier (100 TB) managed by software like Nginx's `proxy_cache` or a custom disk-backed cache. The Caffeine cache above illustrates the request collapse logic; for production disk-backed caching, Nginx handles the complexity:
+
+```nginx
+proxy_cache_path /data/cache levels=1:2 keys_zone=cdn:100m max_size=10g
+                 inactive=60m use_temp_path=off;
+
+server {
+    location / {
+        proxy_cache cdn;
+        proxy_cache_valid 200 1h;
+        proxy_cache_use_stale error timeout updating;
+        proxy_cache_lock on;
+        add_header X-Cache-Status $upstream_cache_status;
+        proxy_pass http://origin;
+    }
+}
+```
+
+`proxy_cache_lock on` is the nginx directive that implements request collapse during cache fill: when multiple requests arrive for the same uncached key simultaneously, nginx holds all but the first in a queue while the first request fetches from upstream. Once the first request populates the cache, all queued requests are served from the now-warm cache entry. Without this directive, 1,000 simultaneous requests for a cold key become 1,000 upstream fetches — exactly the cache-fill storm the shield is designed to prevent.
+
+<TradeoffTable title="Cache invalidation strategy comparison">
+
+| Strategy | Latency to fresh | Complexity | Scale | Best for |
+|---|---|---|---|---|
+| **TTL only** | Up to TTL duration (1 hour, 24 hours) | None — set it and forget it | Unlimited — no coordination required | Infrequently changing assets, third-party embeds |
+| **URL purge** | ~5 seconds globally | Low — single API call per URL | O(URLs) — breaks down at millions of URLs | Small sites, landing pages, few dozen URLs |
+| **Tag-based purge** | ~1–5 seconds globally | Medium — tag management at origin | O(tags) — excellent; one purge invalidates thousands of URLs | Large sites, product catalogs, news articles |
+| **Versioned URLs** (`app.v1234.js`) | Instant — new URL, cold miss | Medium — build pipeline must generate and reference hashed filenames | Unlimited — no purge infrastructure needed | JS/CSS/font assets with content-hash in filename |
+
+</TradeoffTable>
+
+<Pitfall title="Caching authenticated or personalized responses">
+
+If your cache key does not exclude the `Authorization` header, `userId` cookie, or session token, you risk storing a personalized response from User A and serving it to User B whose request happens to map to the same cache key (e.g., same URL, same `Accept-Encoding`, but different session). The consequence ranges from minor (User B sees User A's locale preference) to catastrophic (User B sees User A's account data, order history, or payment information).
+
+The correct configuration has two components. First, at the origin: return `Cache-Control: private, no-store` for any response that contains personalized data. The `private` directive tells the CDN not to cache the response at a shared cache (edge PoP). Second, at the CDN cache key: configure explicit allowlists of query parameters and `Vary` dimensions to include in the cache key, with an explicit denylist for `Cookie`, `Authorization`, and any user-identifying headers. The CDN must strip these headers from the forwarded request to origin (to avoid them influencing origin cache logic) and must never include them in the cache key for public content. Auditing your cache key configuration is a mandatory step before any CDN deployment — the attack surface for cache poisoning is entirely determined by what the CDN considers part of the cache key.
+
+</Pitfall>
+
+<Pitfall title="Not using surrogate keys for large-scale invalidation">
+
+Purging 1 million product page URLs one at a time after a catalog update is not a CDN purge strategy — it is a denial-of-service attack on your own CDN control plane. Each URL purge generates O(PoPs) internal messages; 1M URL purges × 200 PoPs = 200 million purge messages. The CDN's purge message bus may rate-limit you, the purge may take minutes to complete, and during that window users are seeing stale prices, stale inventory, or stale images for products that have already been updated in your database.
+
+The solution is to tag every cacheable response at response time — not at purge time. Attach a `Surrogate-Key` or `Cache-Tag` header to every response from the origin, listing all semantic dimensions the response depends on: `product:123 category:electronics brand:apple`. When product 123 changes, issue a single purge for tag `product:123`. Every listing page, search result widget, recommendation carousel, and product detail page that referenced product 123 is invalidated in one operation, propagated to all PoPs in under 5 seconds. The investment is in instrumentation at the origin — ensuring every response handler attaches the correct tag set — which pays dividends every time content changes. Teams that skip surrogate keys inevitably hit a situation where they must choose between serving stale data indefinitely or taking the CDN out of the critical path entirely, neither of which is acceptable.
+
+</Pitfall>
+
+<Curveball question="A PoP in Tokyo goes down due to a fiber cut. BGP convergence takes 90 seconds. During those 90 seconds, what happens to users in Japan routing to that PoP? How do you minimize impact?">
+
+During the BGP convergence window, new TCP connections from Japanese users destined for the Tokyo Anycast IP will be dropped — the fiber cut means packets cannot reach the PoP, and BGP has not yet propagated the route withdrawal to upstream ISPs and peering points. Users experience connection timeouts. The impact is proportional to TCP timeout durations: browsers will retry after 5–15 seconds, so users see a spinning page for that duration.
+
+The mitigations operate at multiple layers. First, the PoP's BGP daemon should be configured with aggressive BFD (Bidirectional Forwarding Detection) health checks — BFD can detect link failures in under 1 second and trigger BGP route withdrawal in 1–2 seconds, far faster than the 90-second default BGP hold timer. This reduces the convergence window from 90 seconds to under 10 seconds. Second, clients should use Happy Eyeballs (RFC 8305) — attempt both IPv4 and IPv6 connections in parallel; if the CDN announces different Anycast prefixes per address family, a failure in one can be masked by the other. Third, configure the PoP's health check daemon to proactively withdraw BGP announcements when local health checks fail (CPU > 95%, disk full, process crash) — not just on fiber cuts. The goal is to make route withdrawal an automatic response to any failure mode, not just physical link failures. Finally, after BGP convergence, traffic routes to the next closest PoP — typically Osaka or Seoul for Japanese users — adding 10–30 ms of latency but restoring service. This is the correct answer to "how does the CDN recover": automatically, via BGP, without operator intervention.
+
+</Curveball>
+
+<Curveball question="You need to serve A/B test variants at the CDN edge (30% see variant A, 70% see variant B). The variant assignment is sticky per user. How do you implement this without serving variant content to the wrong user from cache?">
+
+This is one of the most common edge computing use cases, and it requires careful cache key design to avoid serving the wrong variant. The naive approach — using an edge function to randomly assign variant A or B and then caching the variant-specific response — will fail because the first user's variant gets cached and served to all subsequent users who hit that cache key.
+
+The correct implementation has three parts. First, the variant assignment must be deterministic and user-sticky. Use a hash function: `variant = hash(userId or anonymousId cookie) % 100 < 30 ? "A" : "B"`. The anonymousId cookie is set on first visit and persists; hashing it ensures the same user always sees the same variant without any external state lookup. Second, the edge function (Cloudflare Worker or Fastly Compute) reads the cookie, computes the variant, and adds a synthetic request header before forwarding to the cache lookup: `X-AB-Variant: A` or `X-AB-Variant: B`. The cache key is configured to include this header. This means the CDN stores two cache entries per URL — one per variant — and serves the correct entry based on the header the edge function injects. Third, the `Vary: X-AB-Variant` response header tells intermediate caches to respect this dimension. The origin must return variant-specific responses with this `Vary` header, or the CDN must handle the variant selection entirely at the edge by rewriting the upstream request path (e.g., `/page.html` becomes `/page-variant-a.html`). The edge KV store is used only for cases where assignment must be overridable (e.g., forcing a specific user into a variant for QA) — it is not involved in the hot path of every request, avoiding the 1–5 ms KV read latency for the majority of traffic.
+
+</Curveball>
+
+<Curveball question="A video goes viral — 10M users simultaneously request the same 500MB file that just got uploaded and isn't cached anywhere yet. Describe exactly what happens at each tier and how origin shield prevents a thundering herd.">
+
+Walk through the full request lifecycle under this scenario. The 500 MB file was just uploaded; no PoP or shield has it cached. Within seconds, 10M users spread across all global PoPs issue GET requests for the file.
+
+**At L1 edge PoPs**: every request is a cache miss. Without an origin shield, all 10M requests would be forwarded to origin — a 500 MB file × 10M requests = 5 exabytes of outbound traffic from origin simultaneously, which is physically impossible. With a shield in place, edge PoPs forward L1 misses to their regional shield.
+
+**At regional shields**: the first request from any edge PoP in the region reaches the shield and is also a cache miss. The shield forwards a single GET request to origin. All subsequent requests from edge PoPs in the same region for the same key arrive at the shield while the origin fetch is in flight. Request collapse (`proxy_cache_lock on` in nginx, or equivalent) holds these requests in a queue. Origin serves the 500 MB file to the shield — at, say, 10 Gbps, this takes 400 ms. Once the shield has the full file, it simultaneously fans the response to all waiting edge PoPs. With 10 global shields, origin serves 10 parallel 500 MB streams — 5 GB total, not 5 exabytes.
+
+**At origin**: 10 concurrent requests instead of 10 million. Each request is a standard HTTP GET. The origin streams the file to each of the 10 shields at full link speed. Origin infrastructure is unaffected.
+
+**Edge PoP cache fill**: once each edge PoP receives the file from its shield, it caches it locally on SSD. All requests that arrived at the PoP during the shield fetch are also coalesced (if `proxy_cache_lock` is enabled at the edge tier as well) and served from the freshly populated L1 cache. Subsequent requests to the same PoP are pure L1 hits with sub-millisecond cache lookup latency. The total time from "file uploaded, no cache" to "fully warmed across all PoPs" is bounded by origin-to-shield transfer time (400 ms for 500 MB at 10 Gbps) plus shield-to-PoP transfer time (the same, in parallel) — roughly 1–2 seconds total, after which the global cache hit ratio for this file approaches 100%.
+
+</Curveball>
+
+<RelatedQuestions items={[
+  { slug: "api-gateway", title: "Design an API Gateway / Service Mesh", difficulty: "senior" },
+  { slug: "youtube-design", title: "Design YouTube", difficulty: "senior" },
+  { slug: "distributed-logging-system", title: "Design a Distributed Logging System", difficulty: "senior" },
+]} />
+
+## Further reading
+
+- [Cloudflare Architecture Blog](https://blog.cloudflare.com/tag/architecture/) — Cloudflare's engineering blog covers Anycast BGP at scale, their Argo routing system (ML-optimized routing above BGP), Workers isolation model (V8 isolates vs. containers), and the internals of their global cache purge system. Posts on "How Cloudflare's global load balancer works" and "Argo: measuring and optimizing web routing" are essential reading for understanding real-world CDN routing decisions.
+- [Fastly Edge Computing Documentation](https://developer.fastly.com/learning/compute/) — Fastly's Compute@Edge documentation explains the WebAssembly execution model at the edge, the Surrogate-Key / Surrogate-Control header contract, and the VCL (Varnish Configuration Language) cache control model that underpins Fastly's cache key design. The section on request collapsing and shielding maps directly to the concepts covered in this article.
+- [Akamai: Mapping the Internet](https://dl.acm.org/doi/10.1145/964723.964737) — Akamai's 2003 SIGCOMM paper "Akamai's Globally Distributed Content Delivery Architecture" describes how Akamai maps the internet topology using DNS-based traffic management (before Anycast became dominant), their server selection algorithm, and their approach to distributing content across 20,000+ servers. The fundamental problems — physics of latency, origin capacity protection, cache hierarchy design — are identical to what modern CDNs solve, making this paper a historically grounding read that clarifies why CDN architecture looks the way it does.
+- [AWS CloudFront Developer Guide — Cache Key and Origin Requests](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/controlling-the-cache-key.html) — AWS's documentation on CloudFront cache policies is the most practical reference for cache key normalization in production. It covers the exact semantics of including/excluding headers, cookies, and query strings from the cache key, and the distinction between the cache key (what CloudFront uses to look up a cache entry) and the origin request policy (what CloudFront forwards to origin on a cache miss). Reading this alongside the Vary header RFC (RFC 7231 §7.1.4) gives a complete picture of the cache key contract between CDN and origin.

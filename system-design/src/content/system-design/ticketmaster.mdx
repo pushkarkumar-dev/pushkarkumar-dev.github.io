@@ -1,0 +1,730 @@
+---
+title: "Design Ticketmaster"
+slug: "ticketmaster"
+category: "commerce"
+difficulty: "senior"
+estimatedReadMinutes: 22
+tags: ["ticket-booking", "seat-selection", "reservation", "flash-sale", "queue", "idempotency", "concurrency"]
+companyFlavors: ["Ticketmaster", "StubHub", "Eventbrite", "SeatGeek"]
+prerequisites: ["distributed-locking-service", "distributed-unique-id-generator", "stripe-payment-gateway"]
+relatedQuestions: ["stripe-payment-gateway", "amazon-product-catalog", "uber-ride-matching"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design Ticketmaster: seat reservation with atomic hold-and-pay, virtual waiting queues for Taylor Swift on-sale moments (1M users hitting simultaneously), seat map rendering, and the consistency requirements that make ticket booking harder than e-commerce."
+javaPackages:
+  - "org.springframework.boot:spring-boot-starter-data-jpa:3.3.0"
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "org.springframework.boot:spring-boot-starter-data-redis:3.3.0"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="ticketmaster" title="Design Ticketmaster" />
+
+<Tldr>
+- **Seats are a scarce, non-fungible resource**: unlike products with an inventory count, each seat is unique (Row 5, Seat 12 vs Row 5, Seat 13); reservation must target a specific `seat_id` or trigger a "best available" selection algorithm that assigns a concrete seat before the hold is placed.
+- **Reservation hold via atomic Redis SETNX**: seat selected → 10-minute hold in Redis (`SET seat:{event_id}:{seat_id} user_id NX EX 600`) → user pays → hold converted to a permanent confirmed booking; concurrent hold attempts on the same seat fail deterministically with no race conditions.
+- **Virtual waiting queue for on-sale events**: 1M users hit "on sale" simultaneously → redirect to queue service → assign position via Redis sorted set → drain N users into the booking flow per second based on server capacity; prevents thundering herd and delivers FIFO fairness.
+- **Seat map rendered from venue layout JSON**: event venue layout stored as a JSON blob (section → row → seat array) in the database; real-time availability overlaid from Redis on every request; rendered client-side as an interactive SVG or Canvas element.
+- **Payment idempotency through the hold ID**: after a hold is confirmed, the charge API is called with `idempotency_key = hold_id`; if payment fails the hold expires naturally; if the network errors mid-flight, retrying with the same `idempotency_key` guarantees no double charge.
+</Tldr>
+
+## The scale of the problem
+
+Ticketmaster processes roughly 500 million tickets per year across concerts, sports, theatre, and festivals — a throughput that, spread evenly, amounts to about 16 tickets per second. But the defining characteristic of the ticket-booking problem is that load is not evenly spread. It concentrates in violent, predictable spikes at the moment a major event goes on sale. The 2022 Taylor Swift Eras Tour on-sale broke every internal Ticketmaster record: the platform reported approximately 3.5 billion system requests in a single day, with sustained periods of 200,000 ticket-seat interactions per second. The event ultimately sold 2.4 million tickets in 24 hours, but the system saw roughly 1,500 requests for every confirmed sale — a 1,500:1 demand-to-supply ratio that no inventory system designed for average load can absorb without a deliberate queue strategy.
+
+Ticket booking is also architecturally harder than superficially similar domains like hotel or flight booking. Hotels manage inventory by room type (a "King Room with City View" at a specific property has, say, 12 units); flights manage inventory by fare class (12 seats in Economy Saver fare); in both cases, the unit of inventory is fungible within a class. Seat 12A and seat 12B on the same flight are interchangeable from the airline's inventory perspective. In ticket booking, they are not. Row 5, Seat 10 in the floor section of Madison Square Garden is a distinct object with a unique coordinate, a unique view, specific accessibility properties, and a potentially unique price. Two users simultaneously trying to book "the best available seat" are competing for a pool of unique objects, and any hold or confirmation must be resolved at the level of individual `seat_id` — not at the level of an inventory counter. This non-fungibility is the root cause of the "sold out in 2 minutes" experience: if 20,000 people are trying to acquire any one of 20,000 unique items, the first 20,000 winners each need a different item, and the collision rate is extreme.
+
+The "sold out in 2 minutes" phenomenon is not primarily a UX failure — it is a systems design problem with specific technical components. First, the seat hold must be atomic: two users who click the same seat at the same millisecond must deterministically result in exactly one hold being granted. Second, held seats must expire: if a user holds a seat and abandons the browser tab, those seats cannot be locked forever. Third, the payment step must be decoupled from the hold step: charging a card is a 1–2 second operation that cannot happen while holding a database row lock. Fourth, the front-of-line experience must be fair: a bot with 1,000 browser sessions should not be able to hold 1,000 seats while real fans wait. Each of these requirements drives a specific design decision, and understanding the coupling between them is what separates a junior answer (use a database transaction with SELECT FOR UPDATE) from a staff-level answer (Redis SETNX + virtual queue + idempotent payment with hold_id as idempotency key).
+
+## Clarifying questions
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| Does the user select a specific seat, or does the system assign the best available? | Both modes exist: venue-mapped events show an interactive seat map; GA (general admission) events use best-available assignment by section preference | Drives whether the hold targets a specific `seat_id` or requires a server-side best-available algorithm before the hold is issued |
+| Is ticket transfer supported (giving a ticket to another user)? | Yes in production, but out of scope for this design — involves identity verification and blockchain-ish ledger ownership; we focus on initial purchase | Prevents the design from ballooning into an NFT-style ownership transfer system |
+| Is dynamic (surge) pricing in scope? | Yes — Ticketmaster's "Official Platinum" pricing adjusts prices based on demand; relevant to the data model and audit requirements | Requires storing both `face_value_cents` and `charged_price_cents` in the booking; multiplier logic lives in a pricing service |
+| How are general admission / standing room events handled? | GA zones have a capacity count rather than individual seats; a "seat" in this context is a capacity slot with no fixed location | GA simplifies the seat map but still requires atomic decrement of available capacity — the same Redis SETNX pattern applies at zone level |
+| Are mobile tickets (QR codes) in scope? | QR code generation and validation at the venue gate are out of scope; we design up to the booking confirmation | Avoids designing a PKI/signing infrastructure for ticket authenticity |
+| Is the secondary resale marketplace in scope? | Out of scope; separate product (StubHub-like) with entirely different pricing and trust models | Resale introduces anti-scalping logic, price floors, and seller identity verification — a separate design |
+| What is the maximum group size per transaction? | Up to 10 tickets per transaction (Ticketmaster's standard limit) | Drives the "hold multiple seats atomically" requirement: either all 10 hold or none do |
+| What is the standard seat hold duration? | 10 minutes — industry standard; Ticketmaster has used 8–15 minutes depending on event type | Sets the Redis TTL value; also determines hold expiry cleanup strategy (TTL-based, no background job needed) |
+
+## Functional requirements
+
+- Users can browse events by artist, venue, date, and category; each event displays metadata (name, artist, venue, date, on-sale time, price ranges) before any seat selection begins.
+- For venue-mapped events, users can view an interactive seat map showing section layout and real-time seat availability (available, held, sold) overlaid on a venue SVG; the map refreshes availability approximately every 5 seconds.
+- Users can select one or more seats (up to 10 per transaction) and place a 10-minute hold; for best-available mode, the system assigns specific seats server-side based on section preference before returning the hold.
+- Within the hold window, users complete payment; on successful payment the hold converts to a confirmed booking; on payment failure the hold remains active for retry within the TTL window.
+- For high-demand on-sale events, users are placed in a virtual waiting queue before reaching seat selection; the queue returns a position and estimated wait time, then grants access when the user reaches the front.
+- Users can view confirmed bookings with ticket details and cancel subject to the event's refund policy (refund processing is acknowledged but the payment reversal details are out of scope).
+
+## Non-functional requirements
+
+- **Scale**: 500 million tickets sold per year; peak on-sale events sustain 200,000 seat interactions per second, with queue ingestion absorbing up to 1 million concurrent users at on-sale moment.
+- **Double-hold prevention**: zero tolerance — a seat must never be held by two users simultaneously; this is a hard correctness requirement, not a soft SLA.
+- **Seat selection latency**: p99 hold acquisition (SETNX path) under 200ms end-to-end including Redis write and DB hold record creation.
+- **Payment latency**: p99 payment confirmation under 2 seconds (dominated by payment processor round-trip, not internal systems).
+- **Availability**: 99.99% for the event browse and seat map read path; 99.9% for the hold and purchase path (it is acceptable to reject excess booking traffic during an on-sale storm rather than allow double-sells).
+- **Hold expiry accuracy**: expired holds must release their seats to available status within 1 second of TTL expiry; Redis keyspace notifications or TTL polling at 1s granularity satisfies this.
+
+<Capacity title="Ticketmaster Capacity Estimates">
+**Ticket sale throughput (average vs. peak)**
+
+Average: $\frac{500{,}000{,}000}{365 \times 86{,}400} \approx 15.9$ tickets/second.
+
+Taylor Swift on-sale peak: 2.4B requests in the first 24 hours $\Rightarrow \frac{2{,}400{,}000{,}000}{86{,}400} \approx 27{,}778$ requests/second sustained average; observed peak minute $\approx 200{,}000$ requests/second.
+
+**Seat hold state in Redis**
+
+Average event: 20,000 seats. Hold TTL: 600 seconds. Redis key: `seat:{event_id}:{seat_id}` → value is `{user_id}:{hold_id}`, approximately 50 bytes.
+
+$$\text{Redis per event} = 20{,}000 \times 50\ \text{bytes} = 1\ \text{MB}$$
+
+With 10,000 concurrent on-sale events: $10{,}000 \times 1\ \text{MB} = 10\ \text{GB}$ — trivial for a Redis cluster; even with 100,000 events it is 100 GB, well within a sharded setup.
+
+**Virtual waiting queue memory**
+
+1M queued users $\times$ 200 bytes/entry (user_id + join timestamp + metadata) = **200 MB** for one event queue in Redis — fits in a single Redis node with room to spare.
+
+Drain rate of 1,000 users/second: the queue clears in $\frac{1{,}000{,}000}{1{,}000} = 1{,}000$ seconds $\approx$ **17 minutes** for a full 1M queue — acceptable for a hot show.
+
+**Seat map read throughput**
+
+1M concurrent users, each polling availability every 5 seconds: $\frac{1{,}000{,}000}{5} = 200{,}000$ reads/second. Each read fetches a compressed availability bitmap (12.5 KB for a 100K-seat venue). At 200K reads/second with CDN caching and a 5-second TTL, the origin (Redis) sees at most $\frac{200{,}000}{\text{CDN hit rate}} \approx 2{,}000$ cache misses/second — well within Redis read throughput.
+
+**Database write throughput**
+
+Each ticket sale writes 1 booking row + N booking_seat rows (N ≤ 10). At average throughput of 16 tickets/second: ~32 DB writes/second (trivial). At peak: 200K requests/second, but with queue gating, actual confirmed purchases are bounded by drain rate — only 1,000 users/second pass through to payment, generating ~2,000 DB writes/second (comfortable for a sharded MySQL cluster).
+</Capacity>
+
+## API design
+
+The API follows REST conventions. All endpoints are versioned at `/api/v3/`. Authentication is via Bearer token (JWT issued at login). The `idempotency_key` header on mutation endpoints enables safe retries.
+
+**Event discovery and seat map**
+
+```
+GET /api/v3/events/{event_id}
+```
+Returns event metadata: name, venue, artist, start time, on-sale time, price range, status (`upcoming` / `on_sale` / `sold_out` / `past`), and whether the event is in queue mode. No authentication required — publicly cacheable.
+
+```
+GET /api/v3/events/{event_id}/seat-map
+```
+Returns the full venue layout JSON (section → row → seat coordinate array) merged with real-time availability. Availability is pulled from Redis on each request; layout JSON is cached in CDN for 24 hours. Response includes `availability_as_of` timestamp so clients can detect staleness. Cache TTL: 5 seconds at the Redis layer, shorter than the hold duration so a released hold appears available within one poll cycle.
+
+**Seat hold**
+
+```
+POST /api/v3/events/{event_id}/seats/hold
+Content-Type: application/json
+
+{
+  "seat_ids": ["seat_abc123", "seat_abc124"],
+  "mode": "specific",
+  "quantity": 2
+}
+```
+
+Or for best-available mode:
+```json
+{
+  "mode": "best_available",
+  "quantity": 4,
+  "section_preference": "floor"
+}
+```
+
+Response on success (`200 OK`):
+```json
+{
+  "hold_id": "hold_7f3a9c",
+  "seats": [
+    {"seat_id": "seat_abc123", "section": "Floor A", "row": "5", "number": "12", "price_cents": 18500},
+    {"seat_id": "seat_abc124", "section": "Floor A", "row": "5", "number": "13", "price_cents": 18500}
+  ],
+  "expires_at": "2025-01-15T20:42:00Z",
+  "total_cents": 37000
+}
+```
+
+Response on conflict (`409 Conflict`):
+```json
+{
+  "error": "SEAT_ALREADY_HELD",
+  "conflicting_seat_id": "seat_abc123",
+  "suggestion": "Try adjacent seats in the same section"
+}
+```
+
+**Purchase**
+
+```
+POST /api/v3/holds/{hold_id}/purchase
+Idempotency-Key: {hold_id}
+Content-Type: application/json
+
+{
+  "payment_method_id": "pm_stripe_xyz",
+  "billing_zip": "10001"
+}
+```
+
+Response (`200 OK`):
+```json
+{
+  "booking_id": "bk_88fa12",
+  "tickets": [...],
+  "total_cents": 37000,
+  "confirmation_number": "TM-2025-88FA12"
+}
+```
+
+**Hold management and bookings**
+
+```
+DELETE /api/v3/holds/{hold_id}
+```
+Explicitly releases the hold and marks seats available. Idempotent — safe to call multiple times.
+
+```
+GET /api/v3/bookings/{booking_id}
+```
+Returns confirmed booking details including ticket QR code URLs, seat assignments, and event information.
+
+**Queue management (on-sale events only)**
+
+```
+POST /api/v3/queue/join
+Content-Type: application/json
+
+{"event_id": "evt_taylor_swift_nyc"}
+```
+
+Response:
+```json
+{
+  "queue_id": "q_7f3c",
+  "position": 48291,
+  "estimated_wait_seconds": 48,
+  "queue_expires_at": "2025-01-15T21:00:00Z"
+}
+```
+
+When a user reaches the front of the queue, the drain worker issues a `booking_token` (signed JWT, 5-minute TTL) that is required as a header on the `POST /seats/hold` endpoint.
+
+## Data model
+
+**`events` table (MySQL)**
+
+```sql
+CREATE TABLE events (
+    event_id        CHAR(26) PRIMARY KEY,
+    venue_id        CHAR(26) NOT NULL,
+    artist_id       CHAR(26),
+    name            VARCHAR(255) NOT NULL,
+    start_time      DATETIME NOT NULL,
+    on_sale_time    DATETIME,
+    total_capacity  INT NOT NULL,
+    status          ENUM('upcoming','on_sale','sold_out','past') NOT NULL DEFAULT 'upcoming',
+    queue_mode      BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_on_sale_time (on_sale_time),
+    INDEX idx_status (status)
+);
+```
+
+**`seats` table (MySQL)**
+
+```sql
+CREATE TABLE seats (
+    seat_id         CHAR(26) PRIMARY KEY,
+    event_id        CHAR(26) NOT NULL,
+    section         VARCHAR(100) NOT NULL,
+    row_label       VARCHAR(10),
+    seat_number     VARCHAR(10),
+    tier            ENUM('floor','lower_bowl','upper_bowl','ga') NOT NULL,
+    base_price_cents INT NOT NULL,
+    is_accessible   BOOLEAN NOT NULL DEFAULT FALSE,
+    INDEX idx_event_section (event_id, section, tier)
+);
+```
+
+Seats are loaded once when an event is created and rarely modified — they are the static "venue layout" layer. There are no per-seat availability columns here: availability is entirely Redis-owned.
+
+**`seat_state` (Redis)**
+
+The live availability layer. Each seat in each event gets one Redis key:
+
+```
+Key:   seat:{event_id}:{seat_id}
+Value: {user_id}:{hold_id}   (during hold, TTL = 600s)
+Value: SOLD                  (after confirmed purchase, no TTL — permanent)
+```
+
+A missing key means the seat is available. An `NX EX 600` write is the atomic hold acquisition. Overwriting with `SOLD` (without EX) converts the hold to a permanent sold state.
+
+**`bookings` table (MySQL)**
+
+```sql
+CREATE TABLE bookings (
+    booking_id          CHAR(26) PRIMARY KEY,
+    user_id             CHAR(26) NOT NULL,
+    event_id            CHAR(26) NOT NULL,
+    status              ENUM('pending','confirmed','refunded','cancelled') NOT NULL,
+    total_cents         INT NOT NULL,
+    payment_charge_id   VARCHAR(255),
+    idempotency_key     VARCHAR(255) UNIQUE,
+    created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_user_event (user_id, event_id),
+    INDEX idx_event_status (event_id, status)
+);
+```
+
+**`booking_seats` table (MySQL)**
+
+```sql
+CREATE TABLE booking_seats (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    booking_id      CHAR(26) NOT NULL,
+    seat_id         CHAR(26) NOT NULL,
+    face_value_cents INT NOT NULL,
+    charged_price_cents INT NOT NULL,
+    UNIQUE KEY uq_seat (seat_id),
+    INDEX idx_booking (booking_id)
+);
+```
+
+The `UNIQUE KEY uq_seat (seat_id)` is a database-level backstop: even if Redis state is lost, the DB prevents a seat from appearing in two confirmed bookings. The `face_value_cents` vs. `charged_price_cents` split is the audit trail for dynamic pricing — regulators and chargebacks require visibility into what the base price was.
+
+**`wait_queue` (Redis sorted set)**
+
+```
+Key:   queue:{event_id}
+Member: {user_id}
+Score:  join_timestamp_ms (with ±5% jitter added server-side)
+```
+
+`ZADD queue:{event_id} NX {timestamp} {user_id}` — NX ensures a user cannot re-join and get a lower position. `ZPOPMIN queue:{event_id} {batch_size}` atomically dequeues the N earliest members for the drain worker.
+
+**`holds` table (MySQL)**
+
+```sql
+CREATE TABLE holds (
+    hold_id     CHAR(26) PRIMARY KEY,
+    user_id     CHAR(26) NOT NULL,
+    event_id    CHAR(26) NOT NULL,
+    seat_ids    JSON NOT NULL,
+    status      ENUM('active','purchased','expired','released') NOT NULL,
+    expires_at  DATETIME NOT NULL,
+    created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_user_event_status (user_id, event_id, status),
+    INDEX idx_expires (expires_at, status)
+);
+```
+
+This table is the durable record of an active hold. The system uses it to enforce the "one active hold per user per event" rule and to drive the cleanup process for expired holds that Redis TTL already freed.
+
+## System flows
+
+<Mermaid diagram={`flowchart TD
+  A([User selects seat]) --> B[POST /seats/hold]
+  B --> C{Event in\\nqueue mode?}
+  C -->|Yes| D[Validate booking_token JWT]
+  C -->|No| E[SeatHoldService]
+  D -->|Valid| E
+  D -->|Invalid/missing| Z1[403 Forbidden]
+  E --> F{Existing active\\nhold for user?}
+  F -->|Yes| Z2[409 - One hold per event]
+  F -->|No| G[Best-available\\nalgorithm if needed]
+  G --> H[Redis pipeline:\\nSET seat:ev:s1 userId NX EX 600\\nSET seat:ev:s2 userId NX EX 600]
+  H --> I{All SETNX\\nreturned OK?}
+  I -->|No - conflict| J[Rollback: DEL\\nsuccessful keys via Lua]
+  J --> Z3[409 Conflict - seat taken]
+  I -->|Yes - all held| K[Write hold record to MySQL]
+  K --> L[Return HoldResponse\\nwith hold_id + expires_at]
+  L --> M([User enters payment])
+  M --> N[POST /holds/holdId/purchase]
+  N --> O[Verify Redis key exists\\n- hold still active?]
+  O -->|Key gone - expired| Z4[410 Gone - hold expired]
+  O -->|Key exists| P[Call PaymentService.charge\\nidempotency_key = hold_id]
+  P --> Q{Charge\\nresult?}
+  Q -->|Success| R[Write booking to MySQL\\nbooking_seats rows]
+  R --> S[SET seat:ev:s1 SOLD no TTL\\nSET seat:ev:s2 SOLD no TTL]
+  S --> T[Update hold status = purchased]
+  T --> U([Return BookingResponse])
+  Q -->|Payment failed| V[Hold remains active\\nUser can retry within TTL]
+  Q -->|Network error| W[Retry with same\\nidempotency_key]
+  W --> P`} />
+
+<Mermaid diagram={`flowchart TD
+  A([1M users hit on-sale URL]) --> B[Queue Service\\nstateless, horizontally scaled]
+  B --> C[ZADD queue:event_id NX\\ntimestamp+jitter userId]
+  C --> D[Return queue_position\\n+ estimated_wait_seconds]
+  D --> E([User sees waiting room UI\\npolls GET /queue/status every 5s])
+  E --> F[Drain Worker\\nruns every 1 second]
+  F --> G[ZPOPMIN queue:event_id\\nbatch=500 users]
+  G --> H[For each dequeued user:\\nissue booking_token JWT\\nevent_id + user_id + exp=now+5min]
+  H --> I[Publish token to user\\nvia WebSocket or SSE push]
+  I --> J([User receives token\\nredirected to seat selection])
+  J --> K[POST /seats/hold\\nAuthorization + booking_token header]
+  K --> L[HoldService validates token\\nchecks event_id matches, not expired]
+  L --> M([Normal hold flow begins])
+  F --> N{Queue empty?}
+  N -->|Yes| O[Queue mode disabled\\nfor this event]
+  N -->|No| F`} />
+
+## Deep dives
+
+### Atomic seat hold with Redis SETNX
+
+The correctness of the entire booking system rests on one Redis command:
+
+```
+SET seat:{event_id}:{seat_id} {user_id}:{hold_id} NX EX 600
+```
+
+Breaking down the flags: `NX` means "set only if the key does not exist" — this is an atomic conditional write. Redis processes commands in a single-threaded event loop, so two clients racing to execute this command for the same key will serialize: the first receives `OK` (the value `1` in older protocol), the second receives `(nil)` (the value `0`). There are no locks, no transactions, no compare-and-swap loops — the atomicity is inherent to Redis's execution model. `EX 600` sets a 600-second expiry atomically in the same command, ensuring the hold cannot become permanent due to a crash between the SETNX and a subsequent EXPIRE call (a real bug in systems that do these as two separate commands).
+
+For multi-seat holds (group bookings), we need all-or-nothing semantics. A Redis pipeline is not atomic — it sends commands in bulk but processes them independently. The correct approach is a Lua script, which Redis executes atomically:
+
+```lua
+local event_id = ARGV[1]
+local user_hold = ARGV[2]
+local ttl = tonumber(ARGV[3])
+local results = {}
+for i = 1, #KEYS do
+  results[i] = redis.call('SET', KEYS[i], user_hold, 'NX', 'EX', ttl)
+end
+-- Check for any failures
+for i = 1, #results do
+  if results[i] == false then
+    -- Rollback: DEL all keys we successfully set
+    for j = 1, #KEYS do
+      if results[j] ~= false then
+        redis.call('DEL', KEYS[j])
+      end
+    end
+    return {err = 'CONFLICT:' .. tostring(i)}
+  end
+end
+return 'OK'
+```
+
+This Lua script runs atomically on the Redis server — no other client command can interleave between the individual SET operations. For a 10-seat group booking, all 10 SETNXs are evaluated together, and if any seat is taken, the entire operation rolls back cleanly. No partial holds leak into the system.
+
+**Hold expiry and the "SOLD" transition**: when a user successfully pays, we want the seat to remain in Redis permanently (no TTL) to serve as a fast-path availability check for the seat map. The transition is: `SET seat:{event_id}:{seat_id} SOLD` (without `EX`) — this overwrites the held key including its TTL, making the key permanent. If we called `PERSIST` instead of SET, there's a TOCTOU window where the hold could expire between our check and the PERSIST call. The overwrite approach is atomic.
+
+**Best-available mode**: when a user selects "4 best available in Floor A" rather than specific seats, the server must choose which 4 seats to attempt to hold. The strategy is: pre-compute a priority-ordered list of candidate seats for each section/tier combination (best view = highest priority, stored as a sorted list in Redis or preloaded in application memory). Iterate through candidates in order, attempting the Lua multi-seat hold. This usually succeeds on the first attempt for all but the last few seats in a section. The algorithm runs in the application tier — Redis SETNX is still the atomic gatekeeper.
+
+### Virtual waiting queue design
+
+The on-sale moment for a major event is a deliberate, announced flash sale. Unlike a flash sale for a product (where you add inventory), a concert has a fixed number of seats that cannot be increased. The demand-to-supply ratio is inherently extreme. The key insight is: **you cannot serve 1 million simultaneous users with 20,000 seats; you can only control how fairly and efficiently you reduce 1 million users to 20,000 winners.**
+
+Without a queue, the naive architecture sends all 1M users directly to seat selection. They all hit the hold endpoint simultaneously, generating 1M Redis SETNX attempts. The first 20,000 succeed; the remaining 980,000 get 409 Conflicts. This seems to work, but the load spike is enormous — 1M Redis writes in a tight window, plus 1M DB writes for hold records (most of which immediately fail). More importantly, it is unfair: faster networks, better hardware, and bots with persistent connections win. Users on mobile networks or older phones lose not because of demand but because of latency.
+
+The queue solves both problems:
+
+**Queue join** is cheap — it is a single Redis `ZADD` with a score of `now_ms + jitter`. The jitter (±5% of a configurable window, say ±500ms) prevents bot armies from winning by clock synchronization. Even 1,000 bots with perfectly synchronized clocks get randomly ordered among the legitimate users.
+
+**Drain rate** is set based on downstream capacity. If the booking servers can sustainably handle 500 hold attempts per second without degrading p99 latency, drain at 500 users/second. This gives a natural backpressure mechanism: as queues for multiple concurrent events drain simultaneously, the drain rate can be adjusted globally.
+
+**Booking token** is a signed JWT containing `event_id`, `user_id`, and `exp = now + 300s`. The hold endpoint validates the token before processing. This makes queue bypass impossible: you cannot skip the queue and hit the hold endpoint directly without a valid token. The token is single-use in the sense that once a hold is created, a second hold attempt (which the "one hold per event per user" check blocks) would fail even with a valid token.
+
+**Queue position polling** uses short-poll (GET /queue/status every 5 seconds) or Server-Sent Events. SSE is preferable for large queues because it avoids 1M × 12 polls/minute = 12M requests/minute from status polling. With SSE, the drain worker pushes a "your turn" event to users as they are dequeued — one-way server push with no polling overhead.
+
+**Queue fairness edge cases**: what if a user closes their browser tab while in the queue? Their queue entry remains (Redis sorted set membership persists until ZPOPMIN removes it). When their booking token is issued and pushed, if no active client receives it (SSE connection closed), the token is lost and that position is wasted. Mitigation: when dequeuing, simultaneously write `token:{user_id}:{event_id}` to Redis with TTL 300s. If the user reconnects within 5 minutes (e.g., refreshes the page), they can retrieve their token from Redis without re-joining the queue. After 5 minutes, the token expires and the position is forfeited — the next drain cycle fills that gap automatically.
+
+### Seat map rendering and availability overlay
+
+The seat map combines two conceptually distinct data layers that have very different update frequencies:
+
+**Venue layout** (static, hours-to-days TTL): A JSON document describing the physical venue — sections, rows, seat coordinates for SVG rendering, accessibility flags, section names. This is created when a venue is onboarded and changes only when the venue is renovated. It is stored in PostgreSQL, replicated to S3, and served via CDN with a `Cache-Control: max-age=86400` header. For a client loading the seat map, this is usually a cache hit from CDN — zero origin load.
+
+**Seat availability** (dynamic, 5-second TTL): The real-time state of every seat — available, held, or sold. This is served from Redis. The naive implementation fetches one key per seat (`HMGET` or pipeline of `GET` commands). For a 20,000-seat venue, that is 20,000 Redis GETs per availability request — wasteful. Better: store availability as a hash with field-per-seat, or (most efficiently) store it as a binary bitmap where bit position maps to seat index (1 = available, 0 = held/sold). A 100,000-seat venue fits in a 12.5 KB bitmap. The entire availability payload for a major venue is a single Redis GET returning 12.5 KB — one round trip, trivially cacheable.
+
+**Client-side rendering**: the client receives venue layout JSON (from CDN) and availability bitmap (from Redis via API). It renders the SVG using the layout coordinates, then colors each seat element based on the bitmap bit at that seat's index. The SVG can represent 20,000 seats interactively in a modern browser at 60fps using efficient DOM updates (update only changed seats between polls, not the full SVG). For very large venues (100K+ seats), Canvas rendering outperforms SVG due to lower DOM node count.
+
+**Availability staleness and UX**: a seat shown as "available" may become held in the 5 seconds before the user's next poll. When the user clicks it and the hold endpoint returns 409, the UI should immediately mark that seat as held and suggest adjacent seats — not show a generic error. The `conflicting_seat_id` in the 409 response enables this targeted UX update.
+
+### Dynamic pricing
+
+Ticketmaster's "Official Platinum" pricing is demand-based: prices increase as inventory decreases and the event approaches. The formula used internally is not public, but a reasonable approximation is:
+
+```
+current_price = face_value_cents × demand_multiplier
+demand_multiplier = 1.0 + (seats_sold / total_seats)^2 × (max_multiplier - 1.0)
+```
+
+At 0% sold: multiplier = 1.0 (face value). At 50% sold: multiplier ≈ 1.25× (with max_multiplier = 2.0). At 90% sold: multiplier ≈ 1.81×. At 100% sold: multiplier = 2.0× (but there are no seats to sell).
+
+The pricing service recomputes the multiplier every 5 minutes per event, publishes it to a Redis key (`price:multiplier:{event_id}:{section_tier}`), and the seat hold endpoint reads this multiplier to compute `charged_price_cents` at hold time. The price is locked at hold creation — it does not change during the 10-minute hold window even if the multiplier updates.
+
+Dynamic pricing is controversial and worth acknowledging at a staff interview: it transfers economic surplus from fans to Ticketmaster and the artist, is widely criticized as predatory on super-fans, and has drawn regulatory scrutiny in several jurisdictions. The system design implications are: (1) it requires storing the `face_value_cents` separately from `charged_price_cents` for refund and audit purposes; (2) the multiplier must be applied server-side (never trusted from the client); (3) the price displayed on the seat map must match the price charged, updated within one multiplier cycle.
+
+## Java integration
+
+### Part A — SeatHoldService.java
+
+```java
+package com.ticketmaster.booking.service;
+
+import io.lettuce.core.api.StatefulRedisConnection;
+import io.lettuce.core.ScriptOutputType;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+@Service
+public class SeatHoldService {
+
+    private static final int HOLD_TTL_SECONDS = 600;
+
+    private static final String HOLD_LUA = """
+        for i = 1, #KEYS do
+          local res = redis.call('SET', KEYS[i], ARGV[1], 'NX', 'EX', ARGV[2])
+          if res == false then
+            for j = 1, i - 1 do
+              redis.call('DEL', KEYS[j])
+            end
+            return {err = 'CONFLICT:' .. tostring(i)}
+          end
+        end
+        return 'OK'
+        """;
+
+    private final StatefulRedisConnection<String, String> redis;
+    private final HoldRepository holdRepository;
+
+    public SeatHoldService(StatefulRedisConnection<String, String> redis,
+                           HoldRepository holdRepository) {
+        this.redis = redis;
+        this.holdRepository = holdRepository;
+    }
+
+    public sealed interface HoldResult permits HoldResult.Success, HoldResult.Conflict {
+        record Success(String holdId, Instant expiresAt, List<String> seatIds) implements HoldResult {}
+        record Conflict(String conflictingSeatId) implements HoldResult {}
+    }
+
+    @Transactional
+    public HoldResult holdSeats(String eventId, String userId, List<String> seatIds) {
+        if (holdRepository.countActiveHolds(userId, eventId) > 0) {
+            return new HoldResult.Conflict("existing_hold");
+        }
+        String holdId = UUID.randomUUID().toString().replace("-", "");
+        String holdValue = userId + ":" + holdId;
+        List<String> keys = seatIds.stream()
+            .map(sid -> "seat:" + eventId + ":" + sid)
+            .collect(Collectors.toList());
+        String[] keysArr = keys.toArray(new String[0]);
+        String result = redis.sync().eval(
+            HOLD_LUA, ScriptOutputType.VALUE, keysArr,
+            holdValue, String.valueOf(HOLD_TTL_SECONDS));
+        if (result != null && result.startsWith("CONFLICT:")) {
+            int idx = Integer.parseInt(result.split(":")[1]) - 1;
+            return new HoldResult.Conflict(seatIds.get(idx));
+        }
+        Instant expiresAt = Instant.now().plusSeconds(HOLD_TTL_SECONDS);
+        holdRepository.save(new Hold(holdId, userId, eventId, seatIds, expiresAt));
+        return new HoldResult.Success(holdId, expiresAt, seatIds);
+    }
+
+    public void releaseHold(String holdId) {
+        Hold hold = holdRepository.findById(holdId).orElseThrow();
+        String luaDel = """
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+              return redis.call('DEL', KEYS[1])
+            else return 0 end
+            """;
+        for (String seatId : hold.getSeatIds()) {
+            String key = "seat:" + hold.getEventId() + ":" + seatId;
+            String expected = hold.getUserId() + ":" + holdId;
+            redis.sync().eval(luaDel, ScriptOutputType.INTEGER, new String[]{key}, expected);
+        }
+        holdRepository.updateStatus(holdId, HoldStatus.RELEASED);
+    }
+}
+```
+
+### Part B — BookingController.java
+
+```java
+package com.ticketmaster.booking.controller;
+
+import com.ticketmaster.booking.service.SeatHoldService;
+import com.ticketmaster.booking.service.SeatHoldService.HoldResult;
+import com.ticketmaster.booking.service.PaymentService;
+import com.ticketmaster.booking.service.BookingService;
+import io.lettuce.core.api.StatefulRedisConnection;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/v3")
+public class BookingController {
+
+    private final SeatHoldService seatHoldService;
+    private final PaymentService paymentService;
+    private final BookingService bookingService;
+    private final StatefulRedisConnection<String, String> redis;
+    private final QueueTokenValidator tokenValidator;
+
+    public BookingController(SeatHoldService seatHoldService, PaymentService paymentService,
+                             BookingService bookingService,
+                             StatefulRedisConnection<String, String> redis,
+                             QueueTokenValidator tokenValidator) {
+        this.seatHoldService = seatHoldService;
+        this.paymentService = paymentService;
+        this.bookingService = bookingService;
+        this.redis = redis;
+        this.tokenValidator = tokenValidator;
+    }
+
+    @PostMapping("/events/{eventId}/seats/hold")
+    public ResponseEntity<?> holdSeats(@PathVariable String eventId,
+                                       @RequestBody HoldRequest req,
+                                       @RequestHeader(value = "X-Booking-Token", required = false) String token,
+                                       @RequestAttribute("userId") String userId) {
+        if (eventIsInQueueMode(eventId) && !tokenValidator.isValid(token, eventId, userId)) {
+            return ResponseEntity.status(403).body(new ErrorResponse("QUEUE_TOKEN_REQUIRED",
+                "Obtain a booking token from the waiting queue"));
+        }
+        HoldResult result = seatHoldService.holdSeats(eventId, userId, req.seatIds());
+        return switch (result) {
+            case HoldResult.Success s -> ResponseEntity.ok(
+                new HoldResponse(s.holdId(), s.seatIds(), s.expiresAt(), req.seatIds().size()));
+            case HoldResult.Conflict c -> ResponseEntity.status(409).body(
+                new ConflictResponse(c.conflictingSeatId(), "Try adjacent seats in the same section"));
+        };
+    }
+
+    @PostMapping("/holds/{holdId}/purchase")
+    public ResponseEntity<?> purchase(@PathVariable String holdId,
+                                      @RequestBody PurchaseRequest req,
+                                      @RequestAttribute("userId") String userId) {
+        Hold hold = holdRepository.findById(holdId).orElseThrow();
+        String redisKey = "seat:" + hold.getEventId() + ":" + hold.getSeatIds().get(0);
+        if (redis.sync().exists(redisKey) == 0) {
+            return ResponseEntity.status(410).body(new ErrorResponse("HOLD_EXPIRED",
+                "Your 10-minute hold has expired. Please select seats again."));
+        }
+        PaymentResult payment = paymentService.charge(
+            hold.getTotalCents(), req.paymentMethodId(), holdId);
+        if (!payment.success()) {
+            return ResponseEntity.status(402).body(
+                new ErrorResponse("PAYMENT_FAILED", payment.declineReason()));
+        }
+        Booking booking = bookingService.confirmBooking(hold, payment.chargeId());
+        return ResponseEntity.ok(new BookingResponse(booking.bookingId(),
+            booking.tickets(), hold.getTotalCents()));
+    }
+
+    @DeleteMapping("/holds/{holdId}")
+    public ResponseEntity<Void> releaseHold(@PathVariable String holdId) {
+        seatHoldService.releaseHold(holdId);
+        return ResponseEntity.noContent().build();
+    }
+
+    private boolean eventIsInQueueMode(String eventId) {
+        return "1".equals(redis.sync().get("queue_mode:" + eventId));
+    }
+}
+```
+
+<TradeoffTable
+  columns={["Approach", "Double-Hold Risk", "On-Sale Load", "Seat Selection UX", "Scalability"]}
+  rows={[
+    ["DB row lock (SELECT FOR UPDATE)", "None — serialized at DB level", "Catastrophic: 200K TPS → connection pool exhaustion, cascading timeouts; DB becomes the bottleneck", "High failure rate during peaks; long waits for lock release", "Bottleneck at DB layer; cannot scale horizontally past single primary"],
+    ["Optimistic locking (version counter)", "Low — version mismatch triggers retry", "Better than row locks; but high retry rate at peak means many wasted round-trips and thundering herd retries", "Good under low contention; poor under high contention — users see frequent 'seat already taken' errors requiring re-selection", "DB write throughput still bounded; concurrent retries can worsen write amplification"],
+    ["Redis SETNX hold (no queue)", "None — SETNX is atomically correct", "1M simultaneous SETNX operations: Redis handles ~1M ops/s per node, but the load spike stresses the application tier and DB for hold record creation", "980,000 of 1M users see instant 409; frustrating but correct; no latency degradation on the success path", "Redis scales well; application tier needs horizontal scaling; but no fairness — fastest client wins"],
+    ["Redis SETNX + virtual queue (Ticketmaster approach)", "None — SETNX correctness preserved", "Queue absorbs 1M users upfront; booking system sees only drain rate (500–1,000 users/s); load profile is smooth and predictable", "Users see fair FIFO ordering with wait time estimate; seat selection experience is calm and deliberate within the 10-minute window granted by the booking token", "Each component scales independently: queue service (stateless), Redis (sharded), booking servers (horizontal); drain rate is tunable knob"]
+  ]}
+/>
+
+<Pitfall>
+**Using SELECT FOR UPDATE for seat holds at on-sale scale**
+
+The intuitive solution for preventing double-holds is a database row lock: `SELECT * FROM seats WHERE seat_id = ? FOR UPDATE`, then update `status = 'held'` inside a transaction. This is correct for a venue doing 100 bookings per hour. At 200,000 requests per second during a Taylor Swift on-sale, it is catastrophic.
+
+Every thread that cannot acquire the lock must wait, holding a database connection. With a standard connection pool of 200 connections and lock wait times of even 10ms, the pool exhausts immediately. Waiting threads pile up at the application tier. The DB's lock manager is flooded. A cascade begins: connection pool wait times increase → requests time out → clients retry → more connections requested → pool exhaustion deepens. Within seconds, the entire booking service is unresponsive.
+
+Redis SETNX sidesteps this entirely. The Redis event loop processes commands in microseconds; a failed SETNX (key already held) returns immediately with no waiting, no lock held, no connection consumed. The 999,999th user attempting to hold an already-held seat gets a sub-millisecond response at the Redis level — the only latency overhead is network round-trip. This is O(1) and non-blocking for both the success and failure paths.
+</Pitfall>
+
+<Pitfall>
+**Allowing unlimited hold attempts per user opens the door to scalping bots**
+
+Without a "one active hold per user per event" constraint, a bot can open 1,000 browser sessions (or call the API directly with 1,000 JWT tokens from 1,000 accounts), hold 10 seats per session, and control 10,000 seats of a 20,000-seat venue. The holds expire after 10 minutes — but the bot repeats the attack indefinitely during the on-sale window, ensuring that real fans see a perpetually "sold out" event even though the bot has no intention of purchasing.
+
+The mitigation requires enforcement at multiple layers. First, the hold service checks `holdRepository.countActiveHolds(userId, eventId) > 0` before issuing a new hold — a single active hold per user per event. Second, the queue token is single-use: once redeemed for a hold, a second hold attempt fails the "one hold per event" check even if the user obtains a new token. Third, rate limiting on the join-queue endpoint (e.g., 1 request per minute per IP, with device fingerprinting) makes it expensive to operate thousands of bot accounts simultaneously. Fourth, account-level purchase history analysis can flag accounts that repeatedly hold and never purchase for bot-pattern detection and suspension.
+
+This is an arms race — motivated scalpers will always probe for gaps. The system's job is to raise the cost of scalping high enough that the economic return from the margin on resold tickets falls below the operational cost of running the bot fleet.
+</Pitfall>
+
+<Curveball>
+**Taylor Swift announces a surprise Eras Tour show with 10 minutes notice — 5M users hit on-sale simultaneously. Your normal queue supports 1M users. How do you scale the queue dynamically in 10 minutes?**
+
+The queue service is stateless: each queue-join request does a `ZADD` to Redis and returns. The queue itself lives entirely in Redis, not in application memory. Scaling the queue service means adding more stateless queue service pods — Kubernetes horizontal pod autoscaling can provision new pods in under 2 minutes if the HPA is pre-configured with aggressive scale-up thresholds and a warm node pool is available.
+
+The Redis sorted set can hold 5M members in a single shard — Redis supports hundreds of millions of members per sorted set with O(log N) ZADD performance; 5M users at ~200 bytes each is 1 GB, which a single Redis node handles comfortably. No sharding change is needed.
+
+The drain rate is the real constraint. If servers can handle 1,000 users/second and you have 5M in queue, it takes 5,000 seconds (83 minutes). Communicating this honestly to users (estimated wait: 80 minutes) is better than false promises. To reduce actual wait time: spin up more booking server capacity (again, Kubernetes autoscaling from a warm pool), which allows a higher drain rate; and reduce per-booking server overhead by making hold validation asynchronous where possible.
+
+What cannot be scaled in 10 minutes is database write throughput if MySQL is the bottleneck — which is why Redis SETNX is the hold mechanism, not a DB transaction. The only MySQL writes are for confirmed bookings, which are bounded by the drain rate, not by raw queue size.
+</Curveball>
+
+<Curveball>
+**A user's payment fails after their seat hold expires — connection timeout on the payment processor at T+599s. They retry with the same idempotency_key 2 minutes later, but someone else has already purchased that seat. Walk through the correct system behavior.**
+
+At T+599s, the payment call times out. The client has not received a response. At T+600s, the Redis TTL expires — the seat key is deleted, making the seat available. Another user (User B) successfully holds and purchases the seat at T+605s, writing `SOLD` (no TTL) to Redis and a `booking_seats` row to MySQL.
+
+The original user (User A) retries at T+720s with the same `idempotency_key = hold_id`. The purchase endpoint first checks `redis.sync().exists("seat:event:seat_id")` — it finds the key exists with value `SOLD` (set by User B's purchase). But the key value is not `SOLD` for User A's holdId — User B's booking wrote over it.
+
+The hold check: the hold record in MySQL shows `status = 'active'` (we haven't expired it yet since expiry is TTL-based in Redis) but `expires_at` is in the past. The endpoint should check `hold.getExpiresAt().isBefore(Instant.now())` — yes, expired. Return `410 Gone: Your hold expired. Another user has purchased this seat.`
+
+The payment retry with the same `idempotency_key` on the payment processor: because the original call timed out (not confirmed), the payment processor either (a) never received it — no charge exists, retry creates a new authorization attempt which is then declined because we return 410 before calling `paymentService.charge()`, or (b) processed it silently — in which case the processor's idempotency check returns the original charge result. If the processor returns success for the idempotent retry but we decline to confirm the booking (seat is sold), we must issue a refund immediately. The booking service should check the payment result, detect that the seat is no longer available, and call `paymentService.refund(chargeId)` before returning the 410. This is why the payment idempotency key and the refund path must be implemented together — an idempotent charge without a corresponding refund path creates the risk of charging without delivering.
+</Curveball>
+
+<Curveball>
+**The venue discovers that 500 seats sold via Ticketmaster have structural issues and must be removed from the event. Design the notification, refund, and reseating process for the 500 affected bookings, executed within 2 hours.**
+
+This is a bulk remediation workflow with three phases running in parallel where possible.
+
+**Phase 1 — Identification (T+0 to T+5 min)**: The venue provides a list of affected `seat_id` values. An operations script queries `booking_seats WHERE seat_id IN (...)` to find the 500 affected `booking_id` values and their corresponding `user_id`, `charged_price_cents`, and `payment_charge_id`. This is a read query — no locks, runs in seconds. Output: a remediation batch job record with all 500 bookings.
+
+**Phase 2 — Seat freezing (T+5 to T+10 min)**: Mark affected seats as unavailable before notifying users, to prevent resale of the (now-hazardous) seats. Redis: `SET seat:{event_id}:{seat_id} FROZEN` for each affected seat. MySQL: update `booking_seats` with a `seat_status = 'invalidated'` flag. This prevents these seats from appearing as available on the seat map or being held by new users.
+
+**Phase 3 — Reseating and notification (T+10 to T+120 min)**: For each of the 500 affected users, the process is: (1) Find equivalent-or-better available seats using the best-available algorithm for that user's section and tier. (2) If equivalent seats are available: proactively hold them for the user (`SET seat:event:newSeat user_id NX EX 3600` — 1-hour hold for reseating), update `booking_seats` to the new seat, send a notification email/push: "We've moved your seats to [new location] at no charge." If the new seats are more expensive, charge the difference; if cheaper, issue a partial refund for the difference. (3) If no equivalent seats exist: issue a full refund via `paymentService.refund(payment_charge_id)` and send a cancellation notification with refund confirmation and instructions to rebook if desired.
+
+The 2-hour SLA is the binding constraint. With 500 bookings and an automated remediation pipeline (not manual), this is achievable: bulk Redis update (seconds), bulk DB query (seconds), bulk refund API calls (payment processors support batch refunds), bulk email via a transactional email service at thousands per minute. Human judgment is needed only for escalations (user disputes the reseating, accessibility requirements were on the original seat, etc.).
+</Curveball>
+
+## Further reading
+
+- **Redis SET command documentation**: the `NX` and `EX` flags make a single-command atomic conditional write possible — understanding why this is safer than a two-command SETNX + EXPIRE sequence is foundational to the design. The Redis docs at redis.io/commands/set/ explain the atomicity guarantee and the exact return value semantics.
+- **Ticketmaster Engineering on the 2022 Taylor Swift on-sale**: Ticketmaster published a post-mortem acknowledging that third-party bot traffic (estimated at 3.5 billion of the day's system requests) overwhelmed their queue infrastructure. The incident was cited in a U.S. Senate Judiciary Committee hearing on ticketing industry practices. The technical lesson — that queue infrastructure must be independently scalable from booking infrastructure, and that bot mitigation must happen before the queue layer, not inside it — directly informs this design.
+- **"The Seat Map Problem"**: modeling a venue layout for SVG rendering requires coordinate normalization (different venues use different coordinate systems), section boundary polygons, and accessibility compliance metadata. The JSON schema design for venue layouts — separating static geometry from dynamic availability — is worth exploring independently as a spatial data modeling exercise.
+- **Idempotency in payment APIs**: the Stripe documentation on idempotency keys (stripe.com/docs/api/idempotent_requests) is the canonical reference. The key insight is that idempotency keys must be stable across retries but scoped to a specific user + operation — using `hold_id` as the idempotency key satisfies both requirements, since `hold_id` is unique per hold attempt and stable across the payment retry window.
+
+<RelatedQuestions items={[
+  { slug: "stripe-payment-gateway", title: "Design Stripe's Payment Gateway", difficulty: "staff" },
+  { slug: "amazon-product-catalog", title: "Design Amazon's Product Catalog", difficulty: "senior" },
+  { slug: "uber-ride-matching", title: "Design Uber Ride Matching", difficulty: "senior" },
+]} />

@@ -1,0 +1,713 @@
+---
+title: "Design Amazon's Product Catalog"
+slug: "amazon-product-catalog"
+category: "commerce"
+difficulty: "senior"
+estimatedReadMinutes: 23
+tags: ["catalog", "search", "inventory", "elasticsearch", "product-graph", "availability", "pricing"]
+companyFlavors: ["Amazon", "eBay", "Alibaba", "Shopify"]
+prerequisites: ["google-search", "design-a-cache", "distributed-unique-id-generator"]
+relatedQuestions: ["stripe-payment-gateway", "ticketmaster", "airbnb"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design Amazon's product catalog: a 350M-item database with real-time inventory, per-seller pricing, product search with faceted filtering, and the availability guarantee that drives 'Buy Now' at Black Friday scale."
+javaPackages:
+  - "org.springframework.boot:spring-boot-starter-data-elasticsearch:3.3.0"
+  - "org.springframework.boot:spring-boot-starter-data-redis:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "org.springframework.data:spring-data-jpa:3.3.0"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="amazon-product-catalog" title="Design Amazon's Product Catalog" />
+
+<Tldr>
+- **Catalog storage**: product master data in DynamoDB (product_id → attributes JSONB); inventory in a separate Inventory Service with optimistic locking via DynamoDB conditional expressions; pricing in a Pricing Service with per-seller, per-customer, and time-based rules — three separate services because their read/write patterns differ by orders of magnitude.
+- **Search**: Elasticsearch cluster with product documents, real-time indexing via Kafka (product-updated events), faceted search (brand, price range, star rating, Prime eligibility), query-time personalization via BM25 + seller performance score boosts, and category-routed index sharding to keep fan-out manageable across 350M documents.
+- **Availability guarantee**: the "In Stock" label requires an inventory reserve before order creation; reserve uses a conditional write (DynamoDB condition expression: `quantity_available >= :qty`) to prevent overselling without pessimistic locking — no SELECT FOR UPDATE, no distributed locks, just atomic compare-and-swap at the database layer.
+- **Product variations**: parent ASIN (product family) → child ASINs (specific variants: color, size); search returns parent ASIN with denormalized child data; detail page shows variant selector; inventory is tracked at child ASIN level so "Red Size 10 in stock" is independent of "Red Size 11 in stock."
+- **Third-party seller catalog**: sellers submit product feeds (bulk CSV or API) → catalog ingest pipeline normalizes, deduplicates (same product → same ASIN), and indexes within 15 minutes; Kafka event stream decouples ingest from Elasticsearch indexing and downstream services like recommendations and pricing.
+</Tldr>
+
+## The scale of the problem
+
+Amazon's product catalog is one of the most demanding read-heavy systems ever built at commercial scale. As of 2024, the marketplace hosts over 350 million distinct products across more than 36 product categories, contributed by approximately 2.5 million active third-party sellers alongside Amazon's own first-party inventory. The catalog serves roughly 400 million page views per day under normal conditions — a number that doubles or triples during Prime Day and major holidays. Every single one of those page views needs to display accurate pricing, a current in-stock indicator, and the correct variant selection UI, all within 100 milliseconds at the 99th percentile. That combination of scale, freshness, and latency is what makes this one of the most instructive system design problems available.
+
+The naive approach — a single relational database with a products table — breaks down immediately. The first problem is schema rigidity: a power tool and a paperback novel share almost no attributes. A schema-per-category approach requires managing hundreds of tables; joins across categories become impossible. Amazon's actual solution is a sparse-attribute model where each product stores its attributes as a structured blob (JSONB in PostgreSQL, or a DynamoDB item with arbitrary attributes), and the category-specific attribute set is validated by an attribute taxonomy service rather than enforced by the database schema. This design decision alone has enormous downstream consequences for how you build the search index, the detail page renderer, and the seller catalog API.
+
+The second problem is that "product catalog" is actually three completely different workloads masquerading as one. Product description reads (title, images, bullet points, description) are dominated by traffic — every page view reads this data, but it almost never changes. Inventory reads and writes are high-frequency and require strict consistency — an inventory count must be accurate enough to prevent overselling, yet it updates with every purchase, return, and warehouse receiving event. Pricing updates are somewhere in the middle — they can be stale by a few seconds without catastrophic consequence, but the dynamic pricing engine makes thousands of adjustments per second across the catalog. Designing a single service that serves all three workloads uniformly is the architectural mistake most candidates make in the first ten minutes. The staff-level answer separates them into distinct services with separate data stores tuned to their individual access patterns.
+
+## Clarifying questions
+
+Before drawing a single box on the whiteboard, establish which subset of Amazon's catalog problem you are actually designing. The answers below represent what a senior interviewer expects you to probe for.
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| Physical goods only, or digital products too (Kindle, Prime Video)? | Focus on physical goods; digital products have no inventory concept | Digital products require entitlement management, DRM, and delivery infrastructure that is orthogonal to physical catalog design |
+| Are third-party sellers a core scenario or an edge case? | Third-party sellers account for over 60% of units sold — they are central | Third-party sellers require a catalog ingest pipeline, ASIN deduplication, seller-specific pricing and inventory, and per-seller performance scoring in search |
+| What is the granularity of inventory tracking — per SKU, per seller, per warehouse? | Per-seller per-warehouse (fulfillment center) | Determines the inventory table's partition key design; a single ASIN may have inventory across 50+ warehouses and 10+ sellers |
+| How are prices set — Amazon-only, seller-set, or dynamic? | Seller-set list price + Amazon dynamic competitive pricing engine + time-limited promotions | Pricing becomes a separate high-write service; the Elasticsearch document must store a denormalized `price_min` that refreshes on every price change |
+| Is search personalized, or does every user get the same results? | Personalized — Prime membership, purchase history, and location all affect ranking | Personalization is applied as a re-ranking pass on top of Elasticsearch results, not inside Elasticsearch itself |
+| Single marketplace (US) or global with separate catalogs? | Global — each country/marketplace has its own catalog, pricing, and regulatory data | Cross-marketplace product matching is a separate problem; assume single marketplace for this interview unless probed |
+| Is the product review system in scope? | Out of scope — treat it as a dependency via API | Reviews are a separate service with their own read models; the catalog stores only `avg_rating` and `review_count` as denormalized aggregates |
+| Flash sales and Lightning Deals — do they affect the inventory design? | Yes — Lightning Deals require time-windowed inventory caps at extremely high concurrency | Lightning Deals are the hardest inventory problem in the system; they require a separate pre-allocation mechanism, not the standard DynamoDB conditional write path |
+
+## Functional requirements
+
+- **Product browse and search**: users can search by keyword, filter by category, price range, star rating, and Prime eligibility; the system returns a ranked list of products with title, price, availability indicator, and thumbnail image.
+- **Product detail page**: given an ASIN, the system returns the full product record including all attribute fields, image gallery, variation selector (size, color, style), current pricing across sellers, and in-stock status.
+- **Availability check**: the system can answer "is this specific child ASIN (color + size combination) currently in stock?" in real time; the answer must be fresh enough that an "In Stock" label leading to a failed purchase is an exception rather than a routine event.
+- **Inventory reservation**: when a user adds an item to cart, the system atomically reserves one unit, decrementing available inventory, so that two simultaneous buyers cannot both successfully purchase the last unit.
+- **Seller product management**: third-party sellers can create new product listings, update attributes, adjust pricing, and upload inventory counts; bulk operations (CSV feeds of millions of listings) must be supported with SLA on indexing latency.
+- **Category navigation**: users can browse the category tree (Electronics → Computers → Laptops) and see faceted aggregations (how many results in each price band, brand, etc.) without full-text search.
+
+## Non-functional requirements
+
+- **Scale**: 350M product listings; 400M page views per day baseline; peak (Prime Day) 10× baseline.
+- **Read latency**: p99 product detail page load under 100ms (excluding client rendering); p99 search query under 500ms including facet aggregations.
+- **Inventory accuracy**: zero oversells is a hard requirement — it is preferable to show "Out of Stock" incorrectly for a brief window than to sell units that do not exist.
+- **Write latency**: inventory updates must propagate to the availability indicator within 30 seconds of the transaction; price changes within 60 seconds; product attribute changes within 15 minutes.
+- **Availability**: 99.99% uptime for product browse (read path); 99.9% for inventory writes — brief inventory write unavailability is preferable to serving stale inventory that causes overselling.
+- **Consistency model**: inventory uses strong consistency (conditional writes with linearizable reads); product attributes and pricing use eventual consistency with bounded staleness (seconds to minutes).
+
+<Capacity title="Amazon Product Catalog Capacity Estimates">
+**Product page reads:**
+
+$$\frac{400\text{M views/day}}{86{,}400\text{ s/day}} \approx 4{,}630 \text{ page views/s baseline}$$
+
+Prime Day peak at 10× gives approximately $46{,}300$ reads/s. Each product detail page triggers one catalog read, one pricing read, and one availability check — so the effective RPS at the data layer is $\approx 139{,}000$ reads/s at peak.
+
+**Search queries:**
+
+Approximately 30% of page views originate from a search result click, giving:
+
+$$4{,}630 \times 0.30 \approx 1{,}389 \text{ search queries/s baseline}$$
+
+Each search query fans out across multiple Elasticsearch shards. With 50 shards per index, each query triggers $\approx 50$ sub-queries internally.
+
+**Inventory write throughput:**
+
+$$350\text{M products} \times 5 \text{ updates/day} = 1.75\text{B updates/day}$$
+
+$$\frac{1.75\text{B}}{86{,}400} \approx 20{,}255 \text{ inventory writes/s}$$
+
+This includes purchases, returns, warehouse receiving events, and inventory corrections. At Prime Day peak: $\approx 200{,}000$ writes/s.
+
+**Storage estimates:**
+
+- Catalog (DynamoDB): $350\text{M} \times 10\text{ KB/product} = 3.5\text{ TB}$ — well within DynamoDB's horizontal scaling capacity.
+- Elasticsearch index (search documents): $350\text{M} \times 500\text{ B/doc} = 175\text{ GB}$ compressed, distributed across a cluster.
+- Redis product cache: top 1M products account for $\approx 90\%$ of page views (power-law distribution). Caching top 1M products: $1\text{M} \times 10\text{ KB} = 10\text{ GB}$ — fits comfortably in a Redis cluster.
+
+**Cache impact:** a 90% cache hit rate at the Redis layer means only $\approx 4{,}630 \text{ reads/s}$ reach DynamoDB at baseline — roughly $463\text{ reads/s}$ — a manageable load.
+</Capacity>
+
+## API design
+
+The public-facing and internal APIs form the contract that all downstream services depend on. Version them from day one.
+
+**Product catalog APIs:**
+
+```
+GET /v2/products/{asin}
+  Response: { asin, title, brand, description, bullet_points[], image_urls[],
+              parent_asin, variation_attributes, category_path[],
+              seller_list[{seller_id, price, is_prime, ships_days}],
+              avg_rating, review_count }
+
+GET /v2/products/{asin}/pricing
+  Response: { asin, offers[{seller_id, list_price, current_price, is_prime,
+              shipping_estimate_days, seller_rating, fulfillment_type}] }
+
+GET /v2/products/{asin}/availability
+  Response: { asin, in_stock, quantity_estimate_bucket,
+              fulfillment_options[{type, estimated_delivery_date}] }
+```
+
+**Search API:**
+
+```
+GET /v2/search?q={query}&category={cat}&price_min={}&price_max={}&prime={bool}
+              &rating_min={}&sort={relevance|price|reviews}&cursor={cursor}
+  Response: { products[{asin, title, price_min, is_prime, avg_rating,
+              review_count, thumbnail_url, in_stock}],
+              facets{brands[], price_ranges[], ratings[], prime_count},
+              total_count, next_cursor }
+```
+
+**Inventory reservation API (internal, called by Cart Service):**
+
+```
+POST /v2/inventory/{asin}/reserve
+  Body:     { seller_id, warehouse_id, quantity, order_id }
+  Response: { status: "reserved"|"out_of_stock"|"seller_unavailable",
+              reservation_id, expires_at }
+
+DELETE /v2/inventory/reservations/{reservation_id}
+  Response: { released_quantity }
+```
+
+**Seller catalog management APIs:**
+
+```
+PUT /v2/catalog/products/{asin}
+  Body:     { title, description, bullet_points[], attributes{}, image_keys[] }
+  Response: { asin, status: "accepted", estimated_indexed_at }
+
+POST /v2/catalog/feeds
+  Body:     { feed_type: "product"|"inventory"|"pricing", s3_uri }
+  Response: { feed_id, status: "processing", estimated_complete_at }
+
+GET /v2/categories/{category_id}/browse
+  Response: { category{id, name, parent_id}, subcategories[], products[],
+              facets{}, total_count }
+```
+
+## Data model
+
+The data model is deliberately split across multiple storage systems, each chosen for its specific access pattern.
+
+**products table (DynamoDB):**
+
+```
+PK: asin (String)
+SK: "PRODUCT" (fixed — allows future SK patterns on same partition)
+
+Attributes:
+  title               String
+  brand               String
+  category_path       List<String>    ["Electronics", "Computers", "Laptops"]
+  description         String          (full HTML, up to 50KB)
+  bullet_points       List<String>    (max 5 bullets)
+  image_keys          List<String>    (S3 keys, not full URLs)
+  parent_asin         String?         (null for standalone products)
+  variation_attributes Map            {color: ["Red","Blue"], size: ["S","M","L"]}
+  attribute_map       Map             (category-specific sparse attributes)
+  created_at          Number          (epoch ms)
+  updated_at          Number          (epoch ms)
+  status              String          "active"|"suppressed"|"deleted"
+```
+
+**inventory table (DynamoDB):**
+
+```
+PK: asin (String)
+SK: seller_id#warehouse_id (composite String, e.g. "A1B2C3#BDL1")
+
+Attributes:
+  quantity_available  Number          (current sellable units)
+  quantity_reserved   Number          (held in active carts)
+  quantity_inbound    Number          (in transit to warehouse)
+  last_updated        Number          (epoch ms)
+  version             Number          (optimistic lock counter)
+
+GSI: seller_id-index (PK: seller_id, SK: asin) — for seller inventory dashboard
+```
+
+The inventory table uses conditional writes for all decrement operations. There are no pessimistic locks. The `quantity_reserved` counter is incremented atomically with the `quantity_available` decrement in a single UpdateItem call — meaning the total `quantity_available + quantity_reserved` is always conserved, preventing both overselling and phantom double-counting.
+
+**pricing table (DynamoDB):**
+
+```
+PK: asin (String)
+SK: seller_id (String)
+
+Attributes:
+  list_price          Number          (MSRP in cents)
+  current_price       Number          (active selling price in cents)
+  is_prime            Boolean
+  shipping_days       Number
+  seller_rating       Number          (0-100 composite score)
+  deal_price          Number?         (null if no active deal)
+  deal_valid_from     Number?         (epoch ms)
+  deal_valid_to       Number?         (epoch ms)
+  updated_at          Number          (epoch ms)
+```
+
+**search_index (Elasticsearch):**
+
+```json
+{
+  "asin": "B08N5WRWNW",
+  "title": "Apple AirPods Pro (2nd Generation)",
+  "brand": "Apple",
+  "category_ids": ["electronics", "electronics_audio", "electronics_audio_headphones"],
+  "category_path_text": "Electronics > Headphones & Earbuds > Earbuds",
+  "price_min": 18999,
+  "price_max": 24999,
+  "is_prime_available": true,
+  "avg_rating": 4.4,
+  "review_count": 82341,
+  "seller_performance_score": 94,
+  "in_stock": true,
+  "bullet_points_text": "Active noise cancellation. Transparency mode...",
+  "variation_summary": "Available in: White",
+  "indexed_at": "2025-01-15T10:30:00Z"
+}
+```
+
+The Elasticsearch document is intentionally lean — it contains only fields needed to render a search result card and compute relevance. The full description, image gallery, and seller list are fetched from DynamoDB and the Pricing Service only when the user clicks through to the product detail page. Storing the 50KB description in ES for 350M products would inflate the index to 17TB, destroying search performance.
+
+**product_events (Kafka):**
+
+```json
+{
+  "asin": "B08N5WRWNW",
+  "event_type": "product_updated",
+  "changed_fields": ["current_price", "in_stock"],
+  "seller_id": "A1B2C3",
+  "timestamp": 1705312200000,
+  "source": "pricing_engine"
+}
+```
+
+Topic partitioning: by `asin` — ensures all events for the same product are processed in order by the Elasticsearch indexer. Retention: 7 days (allows the indexer to replay if it falls behind).
+
+## System architecture
+
+<Mermaid diagram={`flowchart TD
+  subgraph Client
+    U[User Browser]
+  end
+
+  subgraph Edge
+    CDN[CloudFront CDN]
+  end
+
+  subgraph ProductAPI["Product API Layer"]
+    PA[Product API Service]
+    RC[Redis Cache\\nTTL 5 min]
+  end
+
+  subgraph DataStores["Core Data Stores"]
+    DDB[(DynamoDB\\nCatalog)]
+    INV[(DynamoDB\\nInventory)]
+    ES[(Elasticsearch\\nSearch Index)]
+  end
+
+  subgraph Downstream["Domain Services"]
+    PS[Pricing Service]
+    IS[Inventory Service]
+    CART[Cart Service]
+  end
+
+  subgraph Async["Async Pipeline"]
+    KAFKA[Kafka\\nproduct-events]
+    IDX[ES Indexer\\nConsumer]
+  end
+
+  U -->|GET /v2/products/ASIN| CDN
+  CDN -->|Cache miss| PA
+  PA -->|Check cache| RC
+  RC -->|Hit| PA
+  PA -->|Miss: GetItem| DDB
+  PA -->|Parallel call| PS
+  PA -->|Parallel call| IS
+  PS -->|price data| PA
+  IS -->|availability| PA
+  PA -->|Assemble + cache| RC
+  PA -->|ProductDetailResponse| CDN
+  CDN -->|Cached response| U
+
+  U -->|GET /v2/search| PA
+  PA -->|BoolQuery + facets| ES
+  ES -->|SearchResponse| PA
+
+  U -->|POST /v2/inventory/ASIN/reserve| CART
+  CART -->|reserveInventory| IS
+  IS -->|ConditionalWrite\\nqty >= requested| INV
+  INV -->|Success or CCC Exception| IS
+  IS -->|ReserveResult| CART
+
+  DDB -->|Change stream| KAFKA
+  PS -->|price-updated event| KAFKA
+  KAFKA -->|Consume| IDX
+  IDX -->|Bulk index partial update| ES`} />
+
+**Product browse flow (cache hit path):** the Client sends `GET /v2/products/{asin}`; CloudFront checks its own HTML cache (for non-personalized page shells) and forwards the JSON API call to the Product API Service; Redis cache lookup by key `product:{asin}` returns the assembled ProductDetail JSON within 1ms; total latency is under 10ms end-to-end.
+
+**Product browse flow (cache miss path):** Redis miss triggers three parallel calls: DynamoDB GetItem for product attributes, Pricing Service for current offers, Inventory Service for in-stock status. All three use CompletableFuture.allOf() — the slowest of the three determines the response time. DynamoDB single-item reads are typically under 5ms; the assembled response is written to Redis with a 5-minute TTL and returned to the client. Total latency: 20–60ms.
+
+**Inventory reserve flow:** Cart Service receives "Add to Cart"; delegates to Inventory Service; Inventory Service issues a DynamoDB UpdateItem with a ConditionExpression checking `quantity_available >= :requested_qty`. If the condition holds, DynamoDB atomically decrements `quantity_available` and increments `quantity_reserved`. If not — because another buyer just took the last unit — DynamoDB throws a ConditionalCheckFailedException, which the Inventory Service maps to ReserveResult.OUT_OF_STOCK and returns to the Cart Service within 5ms.
+
+## Deep dives
+
+### Catalog data model: parent/child ASIN structure
+
+The ASIN (Amazon Standard Identification Number) hierarchy is the most important modeling decision in the entire catalog. Without it, every color-size combination of a T-shirt would appear as a separate search result, flooding the results page with near-duplicate listings.
+
+The parent ASIN represents a product family: "Levi's 501 Original Fit Jeans." It stores the variation dimensions (color options, size options) as a JSON map and a list of child ASINs. The parent ASIN has no inventory — you cannot buy a parent ASIN directly.
+
+Child ASINs represent specific purchasable units: "Levi's 501 Jeans, Dark Stonewash, 32×30." Each child ASIN has its own inventory record (per seller per warehouse), its own images (showing the specific color), and may have its own price. The child ASIN inherits most descriptive attributes from the parent but can override them.
+
+Search indexing strategy for variations: index the parent ASIN with denormalized child data — the minimum price across all in-stock child ASINs, a "sizes available" list, a "colors available" list, and an `in_stock` flag that is true if any child is in stock. When the user arrives at the product detail page via a search result, they see the parent ASIN page with a variant selector. Selecting a variant (e.g., clicking "Blue, Size L") triggers a lightweight API call to load the child ASIN's price and availability — a partial page update, not a full page reload.
+
+Variation attribute schema on the parent ASIN:
+
+```json
+{
+  "variation_attributes": {
+    "dimensions": ["color", "size"],
+    "color": {
+      "Red": ["B001AAAAA1", "B001AAAAA2"],
+      "Blue": ["B001AAAAA3", "B001AAAAA4"]
+    },
+    "size": {
+      "S": ["B001AAAAA1", "B001AAAAA3"],
+      "M": ["B001AAAAA2", "B001AAAAA4"]
+    }
+  }
+}
+```
+
+This matrix lets the detail page render the variant picker without making additional API calls — it knows which child ASINs exist for each combination. Availability for each child is fetched lazily as the user hovers or selects.
+
+### Inventory reservation without pessimistic locking
+
+This is the crux of the entire interview. Most candidates reach for one of two wrong answers: (1) a relational database with SELECT FOR UPDATE, or (2) a distributed lock (Redis SETNX or ZooKeeper). Both fail at Amazon's concurrency level.
+
+SELECT FOR UPDATE serializes concurrent readers into a queue behind the lock holder. At 200,000 inventory writes per second during Prime Day, lock wait times cascade into seconds-long timeouts. The database connection pool exhausts; writes begin to fail; the entire checkout flow degrades. A row-level lock on a hot product like a new iPhone drop — where 100,000 concurrent users are hitting "Add to Cart" — means 99,999 of those users are waiting for the one lock holder to finish before they even learn the item is out of stock.
+
+DynamoDB conditional expressions solve this without any locking:
+
+```
+UpdateExpression:    SET quantity_available = quantity_available - :qty,
+                         quantity_reserved = quantity_reserved + :qty,
+                         last_updated = :now
+ConditionExpression: quantity_available >= :qty
+                     AND attribute_not_exists(reservation_#orderId)
+```
+
+The second condition — `attribute_not_exists(reservation_#orderId)` — provides idempotency. If the same order ID attempts to reserve again (network retry, duplicate request), the condition fails on the attribute_exists check and DynamoDB returns ConditionalCheckFailedException, which the Inventory Service maps to a "already reserved" response rather than "out of stock."
+
+DynamoDB evaluates the condition and performs the update atomically at the partition level. There is no lock — DynamoDB uses optimistic concurrency at the storage layer (last-writer-wins with version vectors). If two concurrent UpdateItem calls race, one wins and one receives a ConditionalCheckFailedException. The loser retries once; if the item is now out of stock, it returns OUT_OF_STOCK immediately. This optimistic approach is dramatically faster under contention than pessimistic locking because failed operations return within milliseconds rather than waiting in a lock queue.
+
+Reserve expiry: if the buyer does not complete checkout within 30 minutes, a Kafka event `reserve-expires` triggers a compensating UpdateItem that increments `quantity_available` and removes the reservation attribute. This is implemented as a scheduled event published at reservation time with a 1,800-second delay (using Kafka's timestamp-based scheduling or a separate delay queue service).
+
+### Product search: Elasticsearch design
+
+350 million documents across a single Elasticsearch index would require either absurdly large shards or absurdly many shards, neither of which performs well. Shard count is fixed at index creation time — get it wrong and you're doing a reindex at production scale, which takes days.
+
+The solution is category-routed multi-index architecture. Each top-level product category gets its own Elasticsearch index: `products-electronics`, `products-clothing`, `products-books`, etc. When a user searches "noise cancelling headphones," the API layer routes the query to `products-electronics` only, based on either the user's selected category filter or a lightweight ML intent classifier that predicts the most likely category from the query text. This reduces per-query fan-out from 100+ shards to 10–20 shards, cutting query latency proportionally.
+
+For cross-category searches ("gifts for dad"), the query fans out to all category indexes — acceptable because cross-category searches are less common and latency expectations are slightly relaxed.
+
+Index sizing per category: Electronics has roughly 50M products × 500B/doc = 25GB compressed; divided across 20 primary shards, each shard is 1.25GB — well within Elasticsearch's recommended 10–50GB shard range. Replicas (2 per shard) provide fault tolerance and read scaling.
+
+Relevance function: BM25 text score on title, brand, and bullet_points_text fields. The title field receives a 3× boost (most important signal for relevance). On top of BM25, function score applies two multiplicative boosts:
+
+```
+final_score = bm25_score
+              × seller_performance_boost (0.8 for low-rated sellers, 1.2 for top sellers)
+              × prime_boost (1.1 for Prime-eligible items when user is a Prime member)
+              × in_stock_filter (0 for out-of-stock items — effectively excluded)
+```
+
+The top 50 Elasticsearch results by this score are passed to a personalization re-ranking service (a lightweight ML model that considers the user's category affinity, brand preferences, and price sensitivity) to produce the final ranked list. This two-phase approach keeps Elasticsearch fast — ES doesn't need to know anything about users — while still delivering personalized results.
+
+Facet computation: Elasticsearch aggregations compute facet counts (how many products match "brand: Apple", how many fall in the "$0–$25 price range") in a single query alongside the top-K results. The `price_min` field in the ES document uses a numeric range aggregation; `brand` uses a terms aggregation with a max cardinality of 50 buckets.
+
+### Real-time catalog indexing
+
+Product updates flow through the system via an event-driven pipeline. When a seller submits a product attribute update, the Catalog API service writes to DynamoDB and publishes a `product-updated` event to the `product-events` Kafka topic, partitioned by ASIN. The Elasticsearch Indexer consumer reads this event, fetches the current DynamoDB record (to get the full up-to-date document), transforms it to the lightweight ES document format, and calls the Elasticsearch bulk index API.
+
+The Elasticsearch indexer uses a micro-batch pattern: it accumulates events for 2 seconds, then issues a single bulk request to Elasticsearch with all accumulated document updates. This dramatically improves indexing throughput (Elasticsearch bulk requests are 10–50× more efficient than individual index requests) while keeping indexing latency under 10 seconds end-to-end.
+
+Price changes require special handling because the dynamic pricing engine emits thousands of price-change events per second — far more than product attribute changes. Reindexing the full ES document for every price change would overwhelm the indexer. Instead, price-change events flow through a separate `price-updated` Kafka topic and trigger Elasticsearch partial updates:
+
+```json
+{
+  "_update": {
+    "doc": {
+      "price_min": 18999,
+      "is_prime_available": true,
+      "indexed_at": "2025-01-15T10:30:00Z"
+    }
+  }
+}
+```
+
+This partial update touches only the `price_min` and `is_prime_available` fields in the ES document without re-scoring or re-analyzing the text fields, completing in under 1ms per document at the Elasticsearch layer.
+
+Reindex from scratch: when the ES schema changes (new field, new analyzer, new index settings), a full reindex of 350M documents is required. The strategy: create a new index with the updated mapping, kick off a backfill job that streams all DynamoDB records through the new document transformer and bulk-indexes into the new index (this takes 4–6 hours), then atomically switch the alias `products-electronics` from the old index to the new index. Zero downtime, zero search interruption.
+
+### Prime Day flash sale: inventory at 10× peak
+
+Prime Day is the canonical stress test for every design decision made above. At 46,000 page views per second, two failure modes dominate: read hot spots on popular product pages, and write contention on Lightning Deal inventory.
+
+**Read hot spots:** A Lightning Deal for a Nintendo Switch going live at 9 AM Pacific means every Amazon customer who has it wishlisted — potentially millions — loads the same product detail page simultaneously. The Redis cache for that ASIN absorbs most reads, but cache invalidation at deal start is itself a spike. Solution: pre-warm the cache. The Lightning Deals scheduling system knows which ASINs go live and when; 60 seconds before a deal starts, the cache warming job pre-computes and caches the deal-price version of the product JSON. The CDN also pre-warms its edge caches for the product page HTML shell. When the deal goes live, the cache is already warm and the cache invalidation spike never happens.
+
+**Lightning Deal inventory:** a Lightning Deal for a 65-inch TV at 50% off for 5 minutes with 1,000 units available means 500,000 users clicking "Add to Cart" simultaneously for a 1,000-unit cap. The DynamoDB conditional write path can handle high concurrency, but the hot partition problem emerges: DynamoDB partitions a table by PK. If all 500,000 writes target the same ASIN, they hit the same DynamoDB partition and can exhaust its throughput capacity (3,000 write units per second per partition).
+
+The Lightning Deal solution uses a ticket pre-allocation approach via Redis. At deal start, the Deal Service runs `SET lightning_deal:{asin} 1000 EX 300` and `SET lightning_deal:{asin}:counter 1000 EX 300`. Each "Add to Cart" click atomically decrements the Redis counter: `DECR lightning_deal:{asin}:counter`. If the result is >= 0, the user gets a ticket. If < 0, the deal is sold out. Redis single-threaded DECR operations are atomic by design — no two users get the same ticket number.
+
+The ticket converts to an actual DynamoDB inventory reservation asynchronously: the Cart Service holds the ticket and calls the Inventory Service's reserve endpoint in the background. The user sees "item reserved" immediately (within 10ms from Redis), and the DynamoDB write completes within 1–2 seconds. This decouples the user-facing latency from the DynamoDB write throughput, handling 500,000 concurrent clicks without a single hot-partition timeout.
+
+### Third-party seller catalog ingest
+
+2.5 million active sellers, each potentially updating thousands of products daily. Bulk feed ingest (CSV files with millions of rows) is the dominant ingestion pattern; individual API calls handle single-product updates.
+
+The ingest pipeline:
+
+1. **Upload**: seller uploads CSV to S3 via pre-signed URL; Catalog Feed Service records the `feed_id` and S3 URI.
+2. **Parse and validate**: a distributed Spark job (or AWS Glue) reads the CSV in parallel; each row is validated against the category-specific attribute taxonomy. Invalid rows are logged and returned to the seller in an error report.
+3. **ASIN deduplication**: for each valid row, the pipeline checks whether the product already exists in the catalog. Deduplication uses a product matching model (lightweight ML model trained on product title + brand + category + UPC/EAN/ISBN) plus exact UPC matching. If a match is found, the new row updates the existing ASIN's attributes. If no match, a new ASIN is minted via the Distributed ID Generator service.
+4. **DynamoDB write**: batch write the new/updated product records to DynamoDB.
+5. **Kafka events**: publish one `product-updated` Kafka event per ASIN to trigger Elasticsearch indexing.
+6. **SLA**: 5 million product feed with 4-hour SLA requires processing 1,250 products per second; a 10-node Spark cluster handles this comfortably.
+
+## Java integration
+
+### Part A — InventoryService.java
+
+```java
+package com.amazon.catalog.inventory;
+
+import org.springframework.stereotype.Service;
+import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import software.amazon.awssdk.services.dynamodb.model.*;
+import org.springframework.kafka.core.KafkaTemplate;
+import java.time.Instant;
+import java.util.Map;
+
+@Service
+public class InventoryService {
+
+    private final DynamoDbClient dynamoDb;
+    private final KafkaTemplate<String, InventoryEvent> kafka;
+    private static final String TABLE = "inventory";
+    private static final int RESERVE_TTL_SECONDS = 1800;
+
+    public InventoryService(DynamoDbClient dynamoDb,
+                            KafkaTemplate<String, InventoryEvent> kafka) {
+        this.dynamoDb = dynamoDb;
+        this.kafka = kafka;
+    }
+
+    public ReserveResult reserveInventory(String asin, String sellerId,
+                                          String warehouseId, int quantity,
+                                          String orderId) {
+        String sk = sellerId + "#" + warehouseId;
+        String reservationAttr = "reservation_" + orderId;
+
+        UpdateItemRequest request = UpdateItemRequest.builder()
+            .tableName(TABLE)
+            .key(Map.of(
+                "asin",    AttributeValue.fromS(asin),
+                "sk",      AttributeValue.fromS(sk)
+            ))
+            .updateExpression(
+                "SET quantity_available = quantity_available - :qty, " +
+                "quantity_reserved = quantity_reserved + :qty, " +
+                "#ts = :now, #resv = :orderId"
+            )
+            .conditionExpression(
+                "quantity_available >= :qty AND attribute_not_exists(#resv)"
+            )
+            .expressionAttributeNames(Map.of(
+                "#ts",   "last_updated",
+                "#resv", reservationAttr
+            ))
+            .expressionAttributeValues(Map.of(
+                ":qty",    AttributeValue.fromN(String.valueOf(quantity)),
+                ":now",    AttributeValue.fromN(String.valueOf(Instant.now().toEpochMilli())),
+                ":orderId", AttributeValue.fromS(orderId)
+            ))
+            .build();
+
+        try {
+            dynamoDb.updateItem(request);
+            publishReservationEvent(asin, sellerId, orderId, quantity);
+            scheduleReservationExpiry(asin, sellerId, warehouseId, orderId, quantity);
+            return ReserveResult.SUCCESS;
+        } catch (ConditionalCheckFailedException e) {
+            return ReserveResult.OUT_OF_STOCK;
+        } catch (ResourceNotFoundException e) {
+            return ReserveResult.SELLER_UNAVAILABLE;
+        }
+    }
+
+    private void publishReservationEvent(String asin, String sellerId,
+                                         String orderId, int quantity) {
+        kafka.send("inventory-reserved", asin,
+            new InventoryEvent(asin, sellerId, orderId, quantity,
+                               "reserved", Instant.now().toEpochMilli()));
+    }
+
+    private void scheduleReservationExpiry(String asin, String sellerId,
+                                           String warehouseId, String orderId,
+                                           int quantity) {
+        long expiresAt = Instant.now().toEpochMilli() + (RESERVE_TTL_SECONDS * 1000L);
+        kafka.send("reserve-expires", asin,
+            new InventoryEvent(asin, sellerId, orderId, quantity,
+                               "expires", expiresAt));
+    }
+
+    public enum ReserveResult {
+        SUCCESS, OUT_OF_STOCK, SELLER_UNAVAILABLE
+    }
+}
+```
+
+### Part B — ProductController.java
+
+```java
+package com.amazon.catalog.api;
+
+import org.springframework.web.bind.annotation.*;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.http.ResponseEntity;
+import java.util.concurrent.CompletableFuture;
+import java.time.Duration;
+
+@RestController
+@RequestMapping("/v2")
+public class ProductController {
+
+    private final RedisTemplate<String, ProductDetailResponse> redis;
+    private final DynamoDbCatalogRepository catalog;
+    private final PricingServiceClient pricing;
+    private final InventoryService inventory;
+    private final ElasticsearchClient esClient;
+
+    public ProductController(RedisTemplate<String, ProductDetailResponse> redis,
+                             DynamoDbCatalogRepository catalog,
+                             PricingServiceClient pricing,
+                             InventoryService inventory,
+                             ElasticsearchClient esClient) {
+        this.redis = redis; this.catalog = catalog;
+        this.pricing = pricing; this.inventory = inventory;
+        this.esClient = esClient;
+    }
+
+    @GetMapping("/products/{asin}")
+    public ResponseEntity<ProductDetailResponse> getProduct(@PathVariable String asin) {
+        String cacheKey = "product:" + asin;
+        ProductDetailResponse cached = redis.opsForValue().get(cacheKey);
+        if (cached != null) return ResponseEntity.ok(cached);
+
+        CompletableFuture<ProductAttributes> attrFuture  = CompletableFuture.supplyAsync(() -> catalog.getItem(asin));
+        CompletableFuture<PricingInfo>       priceFuture = CompletableFuture.supplyAsync(() -> pricing.getOffers(asin));
+        CompletableFuture<AvailabilityInfo>  availFuture = CompletableFuture.supplyAsync(() -> inventory.getAvailability(asin));
+
+        CompletableFuture.allOf(attrFuture, priceFuture, availFuture).join();
+        ProductDetailResponse response = ProductDetailResponse.assemble(
+            attrFuture.join(), priceFuture.join(), availFuture.join());
+
+        redis.opsForValue().set(cacheKey, response, Duration.ofSeconds(300));
+        return ResponseEntity.ok(response);
+    }
+
+    @GetMapping("/search")
+    public ResponseEntity<SearchResponse> search(
+            @RequestParam String q,
+            @RequestParam(required = false) String category,
+            @RequestParam(required = false) Double priceMin,
+            @RequestParam(required = false) Double priceMax,
+            @RequestParam(required = false) Boolean prime,
+            @RequestParam(defaultValue = "relevance") String sort,
+            @RequestParam(required = false) String cursor) {
+        SearchResponse result = esClient.search(
+            SearchRequest.builder().query(q).category(category)
+                .priceRange(priceMin, priceMax).primeOnly(prime)
+                .sort(sort).cursor(cursor).build());
+        return ResponseEntity.ok(result);
+    }
+
+    @PostMapping("/inventory/{asin}/reserve")
+    public ResponseEntity<ReserveResponse> reserve(
+            @PathVariable String asin, @RequestBody ReserveRequest req) {
+        InventoryService.ReserveResult result = inventory.reserveInventory(
+            asin, req.sellerId(), req.warehouseId(), req.quantity(), req.orderId());
+        return ResponseEntity.ok(ReserveResponse.from(result, req.orderId()));
+    }
+}
+```
+
+## Trade-off analysis
+
+<TradeoffTable
+  columns={["Approach", "Read Latency", "Inventory Accuracy", "Write Throughput", "Search Quality"]}
+  rows={[
+    ["Single relational DB (MySQL)", "High — full-table scans on 350M rows; B-tree indexes help for point lookups but degrade under catalog read fan-out. p99 exceeds 500ms under load.", "Good — ACID transactions with SELECT FOR UPDATE prevent overselling, but lock contention at scale causes timeouts that effectively cause failures.", "Low — single write path, no horizontal scaling for writes; connection pool exhausts at Prime Day throughput levels.", "Poor — LIKE queries do not support relevance ranking, faceted aggregations, or typo tolerance; full-text search extensions (MySQL FTS) do not scale to 350M documents."],
+    ["DynamoDB for catalog + RDS for inventory", "Good — DynamoDB single-item reads at 5ms p99; RDS read replicas absorb product detail reads. Acceptable for most traffic.", "Good — RDS transactions with row-level locking prevent overselling; acceptable at moderate scale, but lock contention degrades at Prime Day peak.", "Medium — DynamoDB scales horizontally for catalog writes; RDS inventory writes limited by single primary node; multi-primary RDS (Aurora Global) partially addresses this.", "Poor — no search capability; requires a separate search layer (Elasticsearch or SOLR); not integrated into the above architecture."],
+    ["DynamoDB + Elasticsearch + Redis (Amazon's approach)", "Excellent — Redis cache serves 90% of product reads at under 2ms; DynamoDB handles cache misses at 5ms p99; Elasticsearch serves search at 50–200ms p99.", "Excellent — DynamoDB conditional expressions provide optimistic concurrency without locking; ConditionalCheckFailedException at contention returns immediately rather than waiting in a lock queue.", "Excellent — all three stores scale horizontally; DynamoDB auto-sharding handles write spikes; Elasticsearch bulk indexing handles catalog update throughput.", "Excellent — BM25 relevance, faceted aggregations, multi-field search, typo tolerance, category-routed sharding, and pluggable personalization re-ranking are all first-class Elasticsearch features."],
+    ["Event-sourced catalog (Kafka log as source of truth)", "Medium — product state must be reconstructed from event log on cache miss; warm projections can match DynamoDB latency but cold start is slow. Adds architectural complexity.", "Excellent — event ordering guarantees strong consistency for inventory events; exactly-once semantics with Kafka transactions prevent duplicate inventory decrements.", "Excellent — Kafka handles millions of events per second; the log is the write path; all reads are from materialized projections (DynamoDB, Redis, Elasticsearch).", "Good — search index is a projection of the Kafka log; same Elasticsearch quality as the previous approach, but with cleaner audit trail and simpler reindex (replay the log)."]
+  ]}
+/>
+
+## Common pitfalls
+
+<Pitfall>
+**Storing inventory count in the same DynamoDB table as product attributes.**
+
+Product reads and inventory writes have a 99:1 ratio under normal conditions and a 500:1 ratio during a Prime Day flash sale. Collocating them on the same DynamoDB item means every "Add to Cart" operation — a write — competes for throughput capacity with the product detail reads. More critically, DynamoDB's per-item throughput limits (40KB item size, partition-level throughput) mean a hot product with high inventory churn (think iPhone launch day) can throttle its own product reads, causing the product detail page to slow down precisely when you most need it to be fast. Separate the Inventory Service into its own DynamoDB table with its own provisioned capacity, its own auto-scaling policy, and its own caching tier (where inventory is intentionally not aggressively cached, unlike product attributes).
+</Pitfall>
+
+<Pitfall>
+**Indexing the full product description text in Elasticsearch for 350M products.**
+
+A product description in Amazon's catalog can run 10–50KB — HTML formatted text, technical specifications, safety warnings, and seller notes. Storing the full description in Elasticsearch for 350M products produces an index of 3.5TB to 17.5TB, far exceeding what a practical Elasticsearch cluster can serve with sub-500ms query latency. Elasticsearch was not designed as a document store for large blobs. The correct design: the Elasticsearch document contains only fields needed for search relevance and result card rendering (title, brand, bullet_points summary, category_ids, price_min, avg_rating, in_stock). The full description lives in DynamoDB and is fetched only when the user navigates to the product detail page. This reduces the Elasticsearch index to 175GB compressed — two orders of magnitude smaller — and keeps search fast.
+</Pitfall>
+
+## Curveball questions
+
+<Curveball>
+**"Prime Day starts and the Lightning Deal for a 65-inch TV goes live — 50,000 users click 'Add to Cart' simultaneously for 1,000 units. Walk through the race condition handling and how you prevent 50,000 successful reservations."**
+
+The DynamoDB conditional write path alone is insufficient here because the hot-partition problem emerges before the condition check even runs. With 50,000 concurrent UpdateItem requests targeting the same ASIN, DynamoDB's per-partition write throughput (3,000 WCU/s) is saturated; requests begin receiving ProvisionedThroughputExceededException — which the SDK retries with exponential backoff, turning a 5ms operation into a 2-second timeout cascade.
+
+The Lightning Deal ticket system solves this in two stages. Stage 1: atomic Redis DECR. The Deal Service pre-loads `SETEX lightning_deal:B001TV:counter 300 1000`. Each "Add to Cart" click calls `DECR lightning_deal:B001TV:counter`. Redis single-threaded command execution makes DECR atomic without any locking — exactly one caller gets counter value 1000, one gets 999, and so on. Callers who receive a value >= 0 have a ticket; those who receive a negative value get "Sold Out" immediately. Redis handles 100,000+ operations per second on a single node — 50,000 concurrent DECRs resolve within milliseconds.
+
+Stage 2: asynchronous DynamoDB reservation. Ticket holders are shown "Item Reserved — complete checkout within 10 minutes." The Cart Service queues a DynamoDB reservation in the background; if it fails (inventory discrepancy from a different fulfillment path), the Cart Service revokes the ticket and notifies the user. This happens in under 2 seconds in the background while the user proceeds to checkout.
+
+The race condition is fully prevented: only 1,000 Redis DECR operations return non-negative values; no DynamoDB writes are needed to enforce the cap.
+</Curveball>
+
+<Curveball>
+**"A third-party seller submits a bulk catalog update of 5 million product listings. How do you ingest, normalize, deduplicate against existing ASINs, and index them in Elasticsearch within 4 hours without impacting live search?"**
+
+Five million products in 4 hours requires processing 347 products per second sustained. Three parallelization axes make this tractable.
+
+The CSV file (assume 5GB) is uploaded to S3. The Catalog Feed Service splits it into 500 chunks of 10,000 rows each. AWS Step Functions (or a simple Kafka topic of work items) distributes the 500 chunks across a 20-node worker fleet. Each worker processes 25 chunks sequentially: parse, validate against the category attribute taxonomy, and perform ASIN deduplication.
+
+ASIN deduplication is the expensive step. The deduplication index is a separate DynamoDB table keyed on normalized product fingerprint (SHA-256 of normalized title + brand + category + UPC/EAN/ISBN). Each row maps to an existing ASIN. A worker checks 10,000 rows in a single BatchGetItem call (DynamoDB BatchGetItem supports 100 items; 100 calls per chunk). Fingerprints not found in the dedup index are new products — mint a new ASIN via the ID Generator Service. Fingerprints found map to existing ASINs that need attribute updates.
+
+DynamoDB writes: new products via BatchWriteItem (25 items per call); updates via TransactWriteItems in groups where all-or-nothing semantics matter (e.g., updating parent + child ASINs atomically). Kafka events published per ASIN update drive Elasticsearch bulk indexing. The Elasticsearch indexer's micro-batch strategy (5-second windows, 1,000 documents per bulk request) can absorb 347 documents/s comfortably — that is only 0.35 bulk requests per second at 1,000 docs/batch.
+
+Isolation from live search: the bulk indexing writes to the write-optimized Elasticsearch index; live search queries hit a replica that is refreshed every 5 seconds. The `index.refresh_interval` is temporarily set to 30 seconds for the bulk import index to maximize indexing throughput, then restored to 1 second when the feed completes. Live search queries are unaffected because they read from replicas and the refresh is an internal Elasticsearch operation.
+</Curveball>
+
+<Curveball>
+**"Amazon wants to add 'Buy Again' suggestions to the home page — a personalized list of products you've purchased before with current pricing and availability. Design the data pipeline without adding latency to the home page load."**
+
+The constraint is additive latency to home page load: zero. This rules out synchronous calls to the purchase history service, pricing service, and inventory service at page load time.
+
+The solution is a pre-computed personalization cache. A nightly (or near-real-time) batch job reads each user's purchase history from the Order Service (join on user_id), deduplicates by ASIN (keep most recently purchased instance), and writes a ranked list of ASINs to Redis: `SETEX buy_again:{user_id} 86400 [asin1, asin2, ..., asin20]`. The list is ranked by recency × purchase frequency.
+
+At home page load, the frontend makes a single Redis call `GET buy_again:{user_id}` — returned in under 2ms. The ASIN list arrives; the page renders skeleton cards immediately. Then an async GraphQL query fetches current pricing and availability for those 20 ASINs in parallel (20 concurrent Product API calls, each hitting Redis cache). The product cards populate within 50–100ms of the initial page render without blocking the above-the-fold content.
+
+Price and availability freshness: the Product API's Redis cache has a 5-minute TTL. For "Buy Again," pricing freshness of 5 minutes is acceptable — this is a suggestion card, not a checkout flow. If the item is actually out of stock, the card shows "Currently Unavailable" and the call-to-action changes from "Add to Cart" to "See Options."
+
+Pipeline update frequency: the `buy_again:{user_id}` list is updated within 1 hour of a new purchase (a Kafka consumer on the `order-completed` topic triggers a targeted refresh for that user_id). This ensures a user who just bought something sees their updated "Buy Again" list the next time they visit, without waiting for the nightly batch.
+</Curveball>
+
+## Further reading
+
+- **Amazon DynamoDB Developer Guide: Conditional Writes** — the primary reference for `ConditionExpression` syntax, `ConditionalCheckFailedException` handling, and the optimistic concurrency patterns used throughout the Inventory Service.
+- **Sharma et al., "Amazon Aurora: Design Considerations for High Throughput Cloud-Native Relational Databases"** (SIGMOD 2017) — while the catalog uses DynamoDB, the Aurora paper provides essential background on how Amazon approached cloud-native storage decoupling; the log-structured storage model is directly applicable to understanding why DynamoDB's conditional writes are faster than relational row locks.
+- **Elasticsearch documentation: Index Templates and ILM (Index Lifecycle Management) for large-scale search** — covers the index template patterns used to manage per-category product indexes, the alias swap technique for zero-downtime reindex, and ILM policies for retiring stale index segments in a 350M-document catalog.
+
+<RelatedQuestions items={[
+  { slug: "stripe-payment-gateway", title: "Design Stripe's Payment Gateway", difficulty: "staff" },
+  { slug: "ticketmaster", title: "Design Ticketmaster", difficulty: "senior" },
+  { slug: "airbnb", title: "Design Airbnb", difficulty: "senior" },
+]} />

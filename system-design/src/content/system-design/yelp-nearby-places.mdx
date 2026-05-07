@@ -1,0 +1,529 @@
+---
+title: "Design Yelp / Nearby Places"
+slug: "yelp-nearby-places"
+category: "search-maps"
+difficulty: "mid"
+estimatedReadMinutes: 17
+tags: ["geospatial", "geohash", "r-tree", "quadtree", "proximity-search", "review-aggregation", "elasticsearch"]
+companyFlavors: ["Yelp", "Google Places", "Foursquare", "TripAdvisor", "OpenTable"]
+prerequisites: []
+relatedQuestions: ["google-maps", "typeahead-autocomplete", "google-search"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Design a proximity search service that finds businesses near a given location — covering geohash indexing, ranking by distance and rating, review aggregation at scale, and the write path for new businesses and reviews."
+javaPackages: ["org.elasticsearch.client:elasticsearch-rest-high-level-client:7.17.0", "org.springframework.boot:spring-boot-starter:3.3.0", "redis.clients:jedis:5.1.3"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="yelp-nearby-places" title="Design Yelp / Nearby Places" />
+
+<Tldr>
+- Geohash encodes lat/lng into a string prefix: nearby locations share a common prefix. "Restaurants within 1km" = query the current cell plus 8 neighboring cells to prevent boundary edge cases where a business 50 meters away sits in an adjacent cell.
+- Geohash precision is tunable: level 6 (6 characters) gives roughly a 1.2km × 0.6km cell, level 7 gives roughly 153m × 153m. Choose the precision level based on your required search radius — smaller radius, finer precision, fewer false-positive candidates to filter.
+- Keep the location index separate from business metadata: a geospatial index (Elasticsearch `geo_point` or a custom geohash tree) handles fast proximity lookup; Postgres holds the authoritative business metadata — name, hours, address, photos — fetched by ID after the location index returns candidate IDs.
+- Review aggregation: do not recalculate the average rating on every read. Maintain a running `rating_sum` and `review_count` in Postgres; `avg_rating = rating_sum / review_count`. Update both columns atomically in a single `UPDATE` on every new review submission.
+- Elasticsearch `geo_distance` query is the pragmatic production choice: it handles geohash indexing, neighboring-cell search, and radius filtering internally via a BKD tree, and composes cleanly with full-text search for queries like "vegan restaurant near me."
+</Tldr>
+
+## Why proximity search needs special indexing
+
+The naive approach to a nearby-business query is a SQL predicate: `WHERE distance(lat, lng, user_lat, user_lng) < 1000`. On a Postgres table with 100 million businesses, this is a full table scan. Postgres evaluates the distance function for every row in the table before it can apply the filter — there is no index on a derived expression unless you explicitly build one. Even with a composite B-tree index on `(lat, lng)`, the index cannot satisfy a radius query because radius queries define a circular region, and B-trees only support rectangular range predicates. A bounding-box pre-filter (`WHERE lat BETWEEN x1 AND x2 AND lng BETWEEN y1 AND y2`) reduces the candidate set but still hands a potentially large rectangle of rows to the distance function for final filtering. At 100M rows, even a tight bounding box over a dense city center can produce hundreds of thousands of candidates for a simple "restaurants within 500m" query.
+
+Spatial indexes — R-trees, geohash prefix trees, quadtrees, and BKD trees — solve this by organizing locations in a structure that encodes proximity. An R-tree groups spatially nearby geometries into minimum bounding rectangles (MBRs) at each node of the tree; a radius query traverses only the branches whose MBR intersects the search circle, pruning the vast majority of the dataset at each level. A geohash prefix tree hashes the two-dimensional coordinate into a one-dimensional string where shared prefixes mean shared geography — the index can then apply a simple string-prefix filter on a sorted structure to retrieve all records within a geographic cell in O(log n). Both approaches reduce proximity lookup from O(n) to O(log n) in the number of businesses, which at 100M businesses is the difference between scanning 100M rows and scanning roughly 27 levels of a balanced tree.
+
+## Clarifying questions
+
+Anchor these questions before sketching any architecture. Each one gates a significant design decision.
+
+| Question | Ideal answer | Why it matters |
+|---|---|---|
+| What is the default search radius, and is there a hard maximum? | Default 1km, max 50km | Determines geohash precision level — larger maximum radius means coarser cells to avoid querying hundreds of neighboring cells |
+| How many businesses are in the system globally? | ~100M businesses | Drives Elasticsearch cluster sizing and Postgres storage; at 100M, the geo index fits comfortably in RAM on a 3-node cluster |
+| What ranking signals matter beyond distance? | Distance, rating, category, price tier, currently-open status | Each additional signal adds a scoring component; open-now filtering requires hours parsing at query time |
+| How quickly must business updates (hours, closures, category changes) propagate? | Near-real-time, within a few minutes | Determines whether you need async Elasticsearch index updates or synchronous dual-writes |
+| Do we need a review system, or is search + display enough? | Full review system with submission and display | Review writes are a separate write path; review reads drive the rating aggregation strategy |
+| Are photo uploads in scope for the MVP? | Yes, but out of scope for the system design deep dive | Confirms S3 for blob storage; photo storage at scale is a separate discussion |
+| Should we support personalization — user favorites, visit history, recommendation ranking? | Out of scope for this design | Avoids scope creep into recommendation systems; keeps the design focused on proximity search and review aggregation |
+| What is the expected read-to-write ratio? | Very read-heavy — roughly 100:1 searches to new-business submissions | Confirms caching is critical; the write path (new businesses, reviews) can tolerate slightly higher latency than search |
+
+## Functional requirements
+
+- Search nearby businesses by category and radius, anchored to a user-supplied latitude/longitude — return a paginated list sorted by distance, rating, or relevance
+- View a full business profile: name, address, phone, hours of operation, photo gallery, and aggregated rating with review count
+- Submit a text review with a 1–5 star rating for a business; view paginated reviews sorted by recency or helpfulness
+- Add a new business to the platform via an owner-facing form (name, address, coordinates, category, hours)
+- Filter search results by category, price tier, and currently-open status
+
+## Non-functional requirements
+
+- **Scale**: 100M businesses globally; 1B searches per month (~385 searches/sec sustained, ~2,000/sec peak)
+- **Search latency**: p99 < 100ms end-to-end; Elasticsearch geo query target < 30ms
+- **Availability**: 99.9% (< 8.7 hours downtime per year); search must degrade gracefully when Elasticsearch is degraded by falling back to Postgres PostGIS
+- **Review write throughput**: 1M reviews per day = ~12 writes/sec; peak ~60 writes/sec
+- **Consistency**: search results may lag business updates by up to 5 minutes (Elasticsearch async indexing); review ratings must be immediately consistent via Postgres
+- **Durability**: no business or review data loss; Postgres is the source of truth for all metadata
+
+## Capacity estimation
+
+<Capacity title="Storage and throughput sizing for 100M businesses, 1B reviews, and 1B monthly searches">
+
+**Business metadata in Postgres**
+
+With 100M businesses and roughly 200 bytes of metadata per business (name, address, geohash, hours as JSON, rating fields):
+
+$$
+\text{business storage} = 100 \times 10^6 \times 200\ \text{bytes} = 20\ \text{GB}
+$$
+
+This fits on a single Postgres primary with generous headroom. Replica reads handle search-path fallback.
+
+**Elasticsearch geo index**
+
+The Elasticsearch index stores only the fields needed for proximity lookup and ranking — `businessId`, `name`, `lat/lng` as a `geo_point`, `category`, `avgRating`. At roughly 500 bytes per document:
+
+$$
+\text{ES index size} = 100 \times 10^6 \times 500\ \text{bytes} = 50\ \text{GB}
+$$
+
+A 3-node Elasticsearch cluster with 64 GB RAM per node fits the entire index in the OS page cache, giving sub-millisecond index traversal on warm nodes.
+
+**Reviews in Postgres**
+
+With 1B reviews at roughly 1 KB each (text, rating, userId, businessId, timestamps):
+
+$$
+\text{review storage} = 1 \times 10^9 \times 1\ \text{KB} = 1\ \text{TB}
+$$
+
+Partition the `reviews` table by `business_id` (hash partitioning) to keep per-business review fetches local to a single shard.
+
+**Photo storage in S3**
+
+At an average of 20 photos per business, each 500 KB:
+
+$$
+\text{photo storage} = 100 \times 10^6 \times 20 \times 500\ \text{KB} = 1\ \text{PB}
+$$
+
+S3 with lifecycle policies to move infrequently-accessed photos to Glacier.
+
+**Geohash index memory footprint**
+
+The geohash index stores a geohash string (12 bytes at level 6) plus a `businessId` (8 bytes) per business:
+
+$$
+\text{geohash index} = 100 \times 10^6 \times 20\ \text{bytes} = 2\ \text{GB}
+$$
+
+Tiny — fits entirely in a Redis sorted set or as a secondary index in Postgres without impacting memory pressure.
+
+**Search throughput**
+
+At 385 searches/sec and each search fanning out to 9 geohash cells in Elasticsearch:
+
+$$
+\text{ES queries/sec} = 385 \times 1 = 385\ \text{/sec}
+$$
+
+Each query is a single compound `geo_distance + term` query; Elasticsearch internally fans out to shards. At 385 queries/sec across 3 nodes, each node handles roughly 128 queries/sec — well within the 1,000–2,000 queries/sec capacity of a single Elasticsearch node for geo queries on a warm index.
+
+</Capacity>
+
+## API design
+
+```
+GET /search?lat=37.7749&lng=-122.4194&radius=1000&category=restaurant&sort=rating&page=1&limit=20
+  Returns: 200 OK
+  Body: {
+    "businesses": [{ "businessId": "...", "name": "...", "distanceMeters": 320, "avgRating": 4.7, "reviewCount": 1200, "category": "restaurant", "address": "..." }],
+    "total": 847,
+    "page": 1,
+    "nextPage": "/search?...&page=2"
+  }
+
+GET /businesses/{businessId}
+  Returns: 200 OK
+  Body: { "businessId": "...", "name": "...", "lat": 37.77, "lng": -122.41, "address": "...", "phone": "...", "hours": {...}, "photos": ["s3://..."], "avgRating": 4.7, "reviewCount": 1200, "category": "restaurant" }
+
+POST /businesses/{businessId}/reviews
+  Body: { "rating": 5, "text": "Outstanding ramen, generous portions." }
+  Returns: 201 Created
+  Body: { "reviewId": "...", "businessId": "...", "userId": "...", "rating": 5, "text": "...", "createdAt": "2026-05-07T12:00:00Z" }
+
+GET /businesses/{businessId}/reviews?sort=recent&page=1&limit=20
+  Returns: 200 OK
+  Body: { "reviews": [{ "reviewId": "...", "userId": "...", "rating": 5, "text": "...", "createdAt": "..." }], "total": 1200 }
+
+POST /businesses
+  Body: { "name": "...", "lat": 37.77, "lng": -122.41, "address": "...", "phone": "...", "category": "restaurant", "hours": {...} }
+  Returns: 201 Created
+  Body: { "businessId": "...", "name": "...", ... }
+```
+
+## Data model
+
+**`businesses` table (Postgres — source of truth)**
+
+```sql
+CREATE TABLE businesses (
+  business_id   BIGSERIAL PRIMARY KEY,
+  name          TEXT        NOT NULL,
+  lat           DOUBLE PRECISION NOT NULL,
+  lng           DOUBLE PRECISION NOT NULL,
+  geohash       VARCHAR(12) NOT NULL,         -- level-6 geohash for prefix queries
+  category      TEXT        NOT NULL,
+  address       TEXT        NOT NULL,
+  phone         TEXT,
+  hours_json    JSONB,                         -- { "mon": "09:00-22:00", ... }
+  avg_rating    NUMERIC(3,2) DEFAULT 0,
+  review_count  INT          DEFAULT 0,
+  rating_sum    INT          DEFAULT 0,        -- sum of all ratings for atomic avg update
+  created_at    TIMESTAMPTZ  DEFAULT now()
+);
+
+CREATE INDEX idx_businesses_geohash ON businesses (geohash);
+CREATE INDEX idx_businesses_category ON businesses (category);
+```
+
+**`reviews` table (Postgres — partitioned by business_id)**
+
+```sql
+CREATE TABLE reviews (
+  review_id    BIGSERIAL,
+  business_id  BIGINT      NOT NULL REFERENCES businesses(business_id),
+  user_id      BIGINT      NOT NULL,
+  rating       SMALLINT    NOT NULL CHECK (rating BETWEEN 1 AND 5),
+  text         TEXT        NOT NULL,
+  created_at   TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (business_id, review_id)
+) PARTITION BY HASH (business_id);
+```
+
+**`photos` table (Postgres — references S3)**
+
+```sql
+CREATE TABLE photos (
+  photo_id     BIGSERIAL PRIMARY KEY,
+  business_id  BIGINT NOT NULL REFERENCES businesses(business_id),
+  user_id      BIGINT NOT NULL,
+  s3_key       TEXT   NOT NULL,
+  uploaded_at  TIMESTAMPTZ DEFAULT now()
+);
+```
+
+**Elasticsearch document schema**
+
+```json
+{
+  "businessId": "12345",
+  "name": "Tartine Bakery",
+  "location": { "lat": 37.7611, "lon": -122.4243 },
+  "category": "bakery",
+  "avgRating": 4.8,
+  "reviewCount": 3100
+}
+```
+
+The Elasticsearch document is intentionally minimal — it contains only the fields needed to answer "which businesses match this geo + category query, and in what rank order?" All other fields (address, phone, hours, photos) are fetched from Postgres by `businessId` after the proximity query returns the candidate list. This separation means Elasticsearch can be rebuilt from Postgres at any time; Postgres is the authoritative source and Elasticsearch is a derived read replica optimized for geospatial queries.
+
+## High-level architecture
+
+<Mermaid caption="Search reads hit Elasticsearch for proximity lookup, then Postgres for full business metadata. Review writes go directly to Postgres; an async consumer keeps the Elasticsearch index up to date." diagram={`graph LR
+  Client --> API[API Servers]
+  API --> ES[Elasticsearch\ngeo_point index]
+  API --> Postgres[(Postgres\nbusiness metadata)]
+  API --> Redis[(Redis\npopular areas cache)]
+  ES --> API
+  Postgres --> API
+  Redis --> API
+
+  ReviewWrite[Review Submit] --> Postgres
+  Postgres --> Outbox[Outbox / CDC]
+  Outbox --> ESUpdate[ES Index Updater\nasync consumer]
+  ESUpdate --> ES`} />
+
+<Mermaid caption="Search request flow: Redis cache check → Elasticsearch geo_distance query → Postgres multi-get for full business profiles → response assembly." diagram={`sequenceDiagram
+  autonumber
+  participant C as Client
+  participant API as API Server
+  participant R as Redis Cache
+  participant ES as Elasticsearch
+  participant PG as Postgres
+
+  C->>API: GET /search?lat=37.77&lng=-122.41&radius=1000&category=restaurant
+  API->>R: GET places:9q8yy:restaurant:1000
+  R-->>API: MISS
+  API->>ES: geo_distance query (center + 9 cells, category=restaurant)
+  ES-->>API: [businessId: 101, 205, 88, ...]  (top 20 by distance+rating)
+  API->>PG: SELECT * FROM businesses WHERE business_id IN (101, 205, 88, ...)
+  PG-->>API: full business records
+  API->>R: SETEX places:9q8yy:restaurant:1000 300 [...]
+  API-->>C: 200 OK paginated business list`} />
+
+## Deep dives
+
+### Geohash indexing
+
+Geohash works by interleaving the bits of latitude and longitude into a single bit string, then encoding it in base32. The Earth's surface is recursively bisected: the first bit splits the world into two east/west halves, the second into north/south, the third into east/west again, and so on, alternating axes. After 30 bits (15 lat + 15 lng), you have divided the globe into cells roughly 1m × 1m. Base32 encoding packs 5 bits per character, so a 6-character geohash represents 30 bits — a cell approximately 1.2km wide × 0.6km tall at mid-latitudes.
+
+The critical property is prefix sharing: two locations in the same geohash cell share the same 6-character string, and two locations in neighboring cells share the first 5 characters. "Restaurants within 1km" can therefore be expressed as a query against the current geohash cell plus the 8 adjacent cells. This 9-cell search guarantees that no business within the search radius is missed: even a business sitting 1 meter across the cell boundary in an adjacent cell is captured. Without the 9-cell search, a business 50 meters from the user but in an adjacent cell would be invisible.
+
+Geohash precision must be tuned to the search radius. A level-6 cell (1.2km) is appropriate for a 1km search radius — the 9-cell envelope covers a 3.6km × 1.8km area, which is a reasonable candidate set to then filter by exact haversine distance. For a 50km search, you would drop to level-4 cells (~39km wide) so that the 9-cell search does not need to enumerate hundreds of level-6 cells. The candidate set grows with the cell size, but the haversine post-filter eliminates false positives before the results reach the client.
+
+### Elasticsearch geo_distance query
+
+In production, Elasticsearch's `geo_distance` query is the standard implementation choice. It accepts a center point and a radius, internally queries its BKD tree (a space-partitioning tree similar in spirit to an R-tree), and returns matching documents sorted by `_geo_distance` ascending. The query composes naturally with additional filters:
+
+```json
+{
+  "query": {
+    "bool": {
+      "must": { "term": { "category": "restaurant" } },
+      "filter": {
+        "geo_distance": {
+          "distance": "1km",
+          "location": { "lat": 37.7749, "lon": -122.4194 }
+        }
+      }
+    }
+  },
+  "sort": [
+    { "_geo_distance": { "location": { "lat": 37.7749, "lon": -122.4194 }, "order": "asc" } },
+    { "avgRating": { "order": "desc" } }
+  ]
+}
+```
+
+The BKD tree (block k-d tree) that Elasticsearch uses for `geo_point` fields is a two-dimensional spatial index stored as a sorted, immutable file structure. Lookup is O(log n) in the number of indexed points. Unlike a traditional R-tree, the BKD tree is optimized for write-once, immutable segments — which aligns with Elasticsearch's Lucene segment model. Updates to a business's location or rating trigger a re-index of that document, which lands in a new segment and is merged into the tree during background segment merges. The near-real-time indexing lag (default 1 second per Elasticsearch's `index.refresh_interval`) means a new business or rating update is visible in search within seconds of the Postgres write completing.
+
+For queries that combine location with free text — "vegan restaurant near me" — the `bool` query adds a `must` clause with a `match` query on `name` and a `multi_match` on `category`. Elasticsearch scores documents by the product of the BM25 text relevance score and a distance-decay function (`gauss` or `exp` on the geo distance), producing a combined ranking that surfaces both relevant and nearby results.
+
+### Review aggregation
+
+The naive implementation of average rating is `SELECT AVG(rating) FROM reviews WHERE business_id = X`. At 1B reviews distributed across 100M businesses, even with partitioning, a popular business with 50,000 reviews triggers a 50,000-row aggregate scan on every profile view. At 1B daily profile views, this approach cannot scale.
+
+The correct pattern is a running aggregate. The `businesses` table carries three denormalized columns: `rating_sum`, `review_count`, and `avg_rating`. When a review is submitted, a single atomic `UPDATE` increments all three:
+
+```sql
+UPDATE businesses
+SET
+  rating_sum   = rating_sum + :newRating,
+  review_count = review_count + 1,
+  avg_rating   = CAST(rating_sum + :newRating AS NUMERIC) / (review_count + 1)
+WHERE business_id = :businessId;
+```
+
+This is a single row write with no aggregate scan. The `avg_rating` column is always current to the last committed review. Profile reads return this pre-computed value directly — no join to the reviews table required.
+
+The risk of floating-point drift over millions of reviews is real but manageable. Schedule a daily reconciliation job that recomputes `rating_sum`, `review_count`, and `avg_rating` from the `reviews` table for all businesses and patches any rows that have drifted. This catches any inconsistencies introduced by application bugs or failed transactions without requiring the hot path to be slower.
+
+### Caching popular areas
+
+"Restaurants near Times Square NYC" is issued by millions of users per hour. The Elasticsearch result set for this query is identical for any user searching within the same geohash cell with the same category and radius. Caching at the geohash + category + radius level covers a disproportionate share of total query volume because popular areas (city centers, tourist destinations, transit hubs) dominate the query distribution.
+
+Cache key structure: `places:{geohash6}:{category}:{radiusMeters}`. Value: serialized list of the top-50 business IDs and their pre-computed distance from the cell center. TTL: 5 minutes — short enough that a new five-star restaurant appearing in a popular area becomes visible within 5 minutes; long enough to absorb millions of identical queries without hitting Elasticsearch.
+
+Cache invalidation on business updates: when a business is created, updated, or its rating changes, the application computes the business's geohash and deletes all cache keys matching `places:{geohash6}:*`. Redis's `SCAN` + `DEL` pattern handles this without a `KEYS` command. For a rating update (the most frequent write), only the rating-ranked cache entries are stale — category-filtered caches for the same geohash may still be valid if the business's rank within its category has not changed enough to shift the top-20 result set. A pragmatic simplification is to always invalidate all cache entries for the affected geohash on any write — the false-positive invalidation rate is acceptable given that writes are rare relative to reads.
+
+## Java integration
+
+**Part A — Geohash proximity search with Redis caching**
+
+```java
+package dev.pushkar.places;
+
+import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.Jedis;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Comparator;
+
+@Service
+public class ProximitySearchService {
+    private final JedisPool jedis;
+    private final BusinessRepository repo;
+
+    public ProximitySearchService(JedisPool jedis, BusinessRepository repo) {
+        this.jedis = jedis;
+        this.repo = repo;
+    }
+
+    public List<Business> searchNearby(double lat, double lng,
+                                        int radiusMeters, String category) {
+        String geohash = Geohash.encode(lat, lng, 6); // 1.2km precision
+        String cacheKey = "places:" + geohash + ":" + category + ":" + radiusMeters;
+
+        try (Jedis j = jedis.getResource()) {
+            String cached = j.get(cacheKey);
+            if (cached != null) return deserialize(cached);
+        }
+
+        // Search center cell + 8 neighbors to avoid boundary misses
+        List<String> geohashCells = new ArrayList<>(Geohash.neighbors(geohash));
+        geohashCells.add(geohash);
+
+        List<Business> results = repo.findByGeohashInAndCategory(geohashCells, category)
+            .stream()
+            .filter(b -> haversineDistance(lat, lng, b.lat(), b.lng()) <= radiusMeters)
+            .sorted(Comparator.comparingDouble(b -> haversineDistance(lat, lng, b.lat(), b.lng())))
+            .limit(50)
+            .toList();
+
+        try (Jedis j = jedis.getResource()) {
+            j.setex(cacheKey, 300, serialize(results)); // 5-minute TTL
+        }
+        return results;
+    }
+
+    private double haversineDistance(double lat1, double lng1, double lat2, double lng2) {
+        double R = 6_371_000; // Earth radius in meters
+        double dLat = Math.toRadians(lat2 - lat1);
+        double dLng = Math.toRadians(lng2 - lng1);
+        double a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+            + Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2))
+            * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+
+    private String serialize(List<Business> businesses) {
+        // JSON serialization omitted for brevity — use Jackson ObjectMapper
+        throw new UnsupportedOperationException("implement with Jackson");
+    }
+
+    private List<Business> deserialize(String json) {
+        throw new UnsupportedOperationException("implement with Jackson");
+    }
+}
+```
+
+The haversine formula computes the great-circle distance between two points on a sphere. It is more accurate than the flat-earth approximation (`sqrt((Δlat)^2 + (Δlng)^2)`) for distances above a few kilometers, where the curvature of the Earth matters. For a 1km radius at mid-latitudes, the flat-earth error is roughly 0.01% — negligible — but the haversine is the correct formula to use in production to avoid subtle bugs at high latitudes (near the poles) or across the prime meridian.
+
+**Part B — Review submission with atomic rating update**
+
+```java
+@Service
+@Transactional
+public class ReviewService {
+    private final ReviewRepository reviewRepo;
+    private final BusinessRepository businessRepo;
+    private final JedisPool jedis;
+
+    public ReviewService(ReviewRepository reviewRepo,
+                         BusinessRepository businessRepo,
+                         JedisPool jedis) {
+        this.reviewRepo = reviewRepo;
+        this.businessRepo = businessRepo;
+        this.jedis = jedis;
+    }
+
+    public Review submitReview(long businessId, long userId, int rating, String text) {
+        if (rating < 1 || rating > 5) {
+            throw new IllegalArgumentException("Rating must be between 1 and 5");
+        }
+
+        Review review = reviewRepo.save(new Review(businessId, userId, rating, text));
+
+        // Atomic rating update — no SELECT AVG, no aggregate recalculation
+        businessRepo.updateRating(businessId, rating);
+
+        // Invalidate the geohash cache for this business's area
+        invalidateGeohashCache(businessId);
+
+        return review;
+    }
+
+    private void invalidateGeohashCache(long businessId) {
+        businessRepo.findById(businessId).ifPresent(business -> {
+            String pattern = "places:" + business.getGeohash() + ":*";
+            try (Jedis j = jedis.getResource()) {
+                // Scan-based deletion — never use KEYS in production
+                String cursor = "0";
+                do {
+                    var scanResult = j.scan(cursor, new redis.clients.jedis.ScanParams().match(pattern).count(100));
+                    cursor = scanResult.getCursor();
+                    if (!scanResult.getResult().isEmpty()) {
+                        j.del(scanResult.getResult().toArray(new String[0]));
+                    }
+                } while (!cursor.equals("0"));
+            }
+        });
+    }
+}
+```
+
+```java
+// BusinessRepository (Spring Data JPA):
+@Modifying
+@Query("""
+    UPDATE Business b
+    SET b.ratingSum   = b.ratingSum + :rating,
+        b.reviewCount = b.reviewCount + 1,
+        b.avgRating   = CAST(b.ratingSum + :rating AS java.lang.Double) / (b.reviewCount + 1)
+    WHERE b.businessId = :businessId
+    """)
+void updateRating(@Param("businessId") long businessId, @Param("rating") int rating);
+```
+
+The `@Modifying` annotation signals to Spring Data JPA that this query mutates state and should bypass the first-level cache — without it, the cached `Business` entity in the persistence context would hold the stale `avgRating` value even after the `UPDATE` executes, causing subsequent reads within the same transaction to return stale data.
+
+<TradeoffTable title="Geospatial indexing approaches compared">
+
+| Approach | Query complexity | Boundary handling | Dynamic updates | Best for |
+|---|---|---|---|---|
+| Raw lat/lng full scan | O(n) | Perfect — exact distance for every row | Trivial — no index to maintain | Fewer than 10K businesses |
+| Geohash prefix (string index) | O(log n) | Requires explicit 9-cell search | Easy — update geohash column on coordinate change | Simple proximity search without full-text |
+| R-tree via Postgres PostGIS | O(log n) | Built-in — `ST_DWithin` handles boundaries natively | Easy — PostGIS updates index on row update | Complex spatial queries: polygons, intersections, routing |
+| Elasticsearch `geo_point` BKD tree | O(log n) | Built-in — `geo_distance` filter handles boundaries | Near-real-time — new documents visible in ~1 second | Combined full-text + geo: "vegan restaurant near me" |
+| S2 cells (Google S2 library) | O(log n) | Built-in — S2 covering handles boundaries at multiple levels | Easy — update cell ID on coordinate change | Google-scale geospatial; hierarchical covering at variable precision |
+
+</TradeoffTable>
+
+<Pitfall title="Searching only the geohash cell the user is in">
+
+A business 50 meters from the user — clearly within any reasonable search radius — may sit in an adjacent geohash cell. If you query only the cell that contains the user's coordinates, that business is invisible in the result set. This is not a rare edge case: geohash cell boundaries are lines on a map, and a dense city block will have businesses on both sides of a boundary constantly. The fix is mandatory: always query the center cell plus all 8 neighboring cells. This 9-cell search eliminates all false negatives at cell boundaries. The tradeoff is a slightly larger candidate set (up to 9× the single-cell size) that must be filtered by exact haversine distance before returning results — but at geohash level 6 (1.2km cells), 9 cells cover a ~3.6km × 3.6km area, which produces a manageable candidate set even in dense cities.
+
+</Pitfall>
+
+<Pitfall title="Recalculating average rating with SELECT AVG on every read">
+
+`SELECT AVG(rating) FROM reviews WHERE business_id = X` sounds reasonable until you calculate the load. At 1B daily profile views and a popular business with 50,000 reviews, each profile read triggers a 50,000-row aggregate scan. Postgres can execute that scan in a few milliseconds with a good index, but at 10,000 profile reads per second for popular businesses, you are running 10,000 concurrent aggregate scans against the reviews table. The reviews table is also the hottest write target — 12 new reviews per second globally. Read-write contention on the reviews partition for a popular restaurant becomes severe. The correct pattern is a pre-computed running aggregate: `rating_sum`, `review_count`, and `avg_rating` columns on the `businesses` row, updated atomically with each new review. Profile reads return `avg_rating` directly from the businesses row — a single primary-key lookup with no join, no aggregate, and no contention with the review write path.
+
+</Pitfall>
+
+<Curveball question="A user searches for 'coffee' in Tokyo. Your index has millions of coffee shops in Japan. How do you rank results so that the most popular, currently-open coffee shops within 500m appear first?">
+
+This requires a composite ranking function combining three signals: distance, rating, and open-now status. In Elasticsearch, express this as a `function_score` query wrapping the `geo_distance` filter. Define a `gauss` decay function on the geo distance (score decreases as distance increases from the center), a `field_value_factor` on `avgRating` with a log dampening factor (so a 4.9 is not 4.9x better than a 1.0 — ratings are compressed), and a filter function that applies a boost multiplier of 1.5 for businesses whose hours JSON includes the current time window. The open-now filter is computed at query time by the API server: parse the user's local time, convert to the business's timezone (stored in the hours JSON), and pass a `filter` clause that matches businesses open during that hour. The combined Elasticsearch score is `distance_score × rating_score × open_now_multiplier`, sorted descending. Distance still dominates for very short searches (0–200m) because the Gaussian decay function drops sharply near the center, while rating and open-now matter more at the margin when many businesses are equidistant.
+
+</Curveball>
+
+<Curveball question="A business moves to a new location. How do you update the geohash index atomically so that the business appears in searches for the new location and stops appearing in searches for the old location?">
+
+Postgres is the source of truth, so the coordinate and geohash update is a standard row update wrapped in a transaction — atomicity is guaranteed by Postgres. The Elasticsearch index update is the challenge: Elasticsearch is updated asynchronously via a CDC (change data capture) consumer reading the Postgres outbox. During the lag between the Postgres commit and the Elasticsearch index refresh (typically 1–5 seconds), the business appears in searches for the old location and does not appear in searches for the new location. This is the acceptable eventual-consistency window for a business move — users will not notice a 5-second delay. The Elasticsearch update is an upsert by `businessId` with the new `location` field; once indexed, the BKD tree rebuild happens during the next segment merge and the `geo_distance` query will return the updated location. Simultaneously, the Redis cache for the old geohash cell must be invalidated (delete `places:{old_geohash}:*`) and the cache for the new geohash cell must also be invalidated (`places:{new_geohash}:*`) to prevent both stale appearances and missing appearances in the cached result sets. The invalidation is idempotent — a cache miss on the next query simply re-queries Elasticsearch, which by then reflects the updated coordinates.
+
+</Curveball>
+
+<Curveball question="Yelp's review system is being gamed: a competitor leaves 1-star reviews via bot accounts. How do you detect and filter fake reviews at scale?">
+
+Fake review detection is a multi-signal problem that no single heuristic solves. At write time, apply lightweight velocity checks: if a single IP address or device fingerprint submits more than 5 reviews per hour, rate-limit and flag those reviews for manual moderation before publishing. At the account level, flag reviews from accounts created within the last 24 hours that review a business in a geographic area they have no prior activity in — a new account with no prior reviews, no check-ins, and no photos suddenly leaving a 1-star review in a zip code they have never visited before is a strong signal. At the pattern level, run a periodic batch job (Spark or Flink) that identifies bursts: if a business receives 50 1-star reviews within a 2-hour window when its 30-day trailing average was 2 reviews per day, that burst is an anomaly. Flag the entire burst for review. For the ML layer at scale, train a binary classifier on features including: reviewer account age, reviewer geographic diversity, reviewer review velocity, text similarity among reviews in the same burst (bot farms often use templated text with minor paraphrasing), and sentiment-to-rating consistency (a 1-star review with positive sentiment text is suspicious). Flagged reviews are soft-hidden — excluded from the `avg_rating` calculation and from the default review display — pending human moderator review. The key system design point is that `avg_rating` must be computed from `verified_reviews` only, not all reviews; maintain separate `verified_rating_sum` and `verified_review_count` columns updated only when a review passes moderation.
+
+</Curveball>
+
+<RelatedQuestions items={[
+  { slug: "google-maps", title: "Design Google Maps + Routing", difficulty: "senior" },
+  { slug: "typeahead-autocomplete", title: "Design Typeahead / Autocomplete", difficulty: "mid" },
+  { slug: "google-search", title: "Design Google Search", difficulty: "staff" },
+]} />
+
+## Further reading
+
+- [Yelp Engineering Blog — How We Built the Yelp Index](https://engineeringblog.yelp.com/2017/06/moving-yelps-core-business-search-to-elasticsearch.html) — Yelp's migration from their custom search infrastructure to Elasticsearch, including their geo query strategy, index sharding decisions, and the lessons learned from running geo queries at production scale across 100M+ business documents.
+- [PostGIS Documentation — Spatial Indexes](https://postgis.net/docs/using_postgis_dbmanagement.html#idm2246) — The authoritative reference on R-tree indexing for geospatial data in Postgres. Covers `ST_DWithin`, `ST_Distance`, GIST index internals, and the difference between geometry (flat-earth) and geography (spherical) types — a distinction that matters for accuracy at search radii above 10km.
+- [Elasticsearch Reference — Geo Queries](https://www.elastic.co/guide/en/elasticsearch/reference/current/geo-queries.html) — Complete documentation of `geo_distance`, `geo_bounding_box`, and `geo_shape` queries, including the BKD tree implementation notes, `distance_type` options (`arc` vs `plane`), and the `_geo_distance` sort parameter. The `geo_distance` query section is required reading for understanding how Elasticsearch's spatial index differs from a traditional R-tree.

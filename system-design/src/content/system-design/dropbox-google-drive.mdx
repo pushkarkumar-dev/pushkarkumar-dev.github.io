@@ -1,0 +1,530 @@
+---
+title: "Design Dropbox / Google Drive"
+slug: "dropbox-google-drive"
+category: "storage"
+difficulty: "senior"
+estimatedReadMinutes: 23
+tags: ["block-dedup", "delta-sync", "conflict-resolution", "chunking", "rsync", "s3", "metadata-db"]
+companyFlavors: ["Dropbox", "Google Drive", "Box", "OneDrive", "iCloud Drive"]
+prerequisites: []
+relatedQuestions: ["s3-object-storage", "distributed-unique-id-generator", "design-a-cache"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Design a cloud file storage service that syncs files across devices in near-real-time using block-level deduplication, delta sync (only transfer changed blocks), and conflict resolution — handling 100M users and petabytes of storage."
+javaPackages: ["software.amazon.awssdk:s3:2.25.0", "org.springframework.boot:spring-boot-starter:3.3.0", "redis.clients:jedis:5.1.3"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="dropbox-google-drive" title="Design Dropbox / Google Drive" />
+
+<Tldr>
+- **Block chunking**: split every file into 4 MB blocks and hash each block with SHA-256. A 1 GB file with a 1 KB edit uploads only one 4 MB block, not 1 GB — the remaining 255 blocks are already on the server.
+- **Cross-user deduplication**: the block store is content-addressable (keyed by SHA-256 hash). If two users upload the same file independently, the bytes live once in S3 and both `file_versions` rows point to the same blocks. Dropbox's published estimates place the global dedup ratio at roughly 30%.
+- **Sync protocol**: on reconnect, the client sends its list of `(blockHash, offset)` pairs for each modified file. The server computes the set difference and returns only the hashes it does not yet have. The client uploads those blocks and commits a new version manifest — zero redundant bytes transit the wire.
+- **Conflict resolution**: last-write-wins is acceptable for plain text files where a 3-way merge is feasible server-side. For binary files (PDFs, Photoshop documents, Office docs), create a "conflicted copy" for the losing client — never silently drop either write. Explicit conflict surfacing is the model Dropbox uses and the right answer in an interview.
+- **Metadata and content are separate tiers**: the metadata database (Postgres) is the authoritative source of truth for the file tree, permissions, version history, and sync cursors. S3 holds the raw bytes. This split enables independent scaling, efficient range queries on metadata, and consistent version history without touching object storage.
+</Tldr>
+
+## Why file sync is hard
+
+The naive implementation of cloud file storage is straightforward: on save, upload the file; on open, download it. This works until you have two devices, intermittent connectivity, and files larger than a few megabytes. The moment a laptop goes offline, edits a document for an hour, reconnects, and discovers that another device made a different edit to the same file during that window, you have the full complexity of distributed state reconciliation on the client side — a problem that has ended more than a few careers at consumer software companies.
+
+Bandwidth efficiency is the first hard constraint. A senior engineer on the Dropbox sync team wrote publicly that early versions of the client did full-file re-uploads on every save event. At 1 GB average file size across their creative-professional user base, this quickly became untenable. The solution — block-level delta sync — means the client tracks which 4 MB chunks have changed since the last acknowledged sync and uploads only those. A 1 KB change in a Word document still uploads 4 MB (one block), not 1 GB. The protocol is closer to rsync than to FTP, and reasoning about it at that level of detail is what separates a strong system design answer from a hand-wavy one.
+
+Scale introduces the second set of hard problems. One hundred million users each storing ten gigabytes produces a raw storage requirement of one petabyte before any replication factor. Cross-user deduplication means that if five million users each store a copy of the same Linux ISO, the actual bytes hit S3 exactly once — the other 4,999,999 `file_versions` rows point at the same block hashes. The engineering challenge is making the reference-counting scheme correct under concurrent deletes while GC runs asynchronously. And consistency — what does the user see when two devices are both syncing changes simultaneously? — requires a well-specified cursor model and a clear answer to the question of what "sync complete" means.
+
+## Clarifying questions
+
+Before drawing any boxes on the whiteboard, gather the answers to these questions. Each one can flip a design decision.
+
+| Question | Ideal answer to probe for | Why it changes the design |
+|---|---|---|
+| Maximum file size? | 100 GB (e.g., 4K video, database dump) | Determines whether multipart upload, resumable sessions, and chunk-level retry are required — they are at 100 GB |
+| Real-time collaborative editing (like Google Docs)? | No — file-level sync, not character-level CRDT | If yes, block-level dedup is insufficient; you need OT or CRDT at the document model layer |
+| Version history depth and retention? | Last 30 versions, retained for 180 days | Drives block GC policy — blocks referenced by any live version cannot be garbage-collected |
+| Offline support required? | Yes — devices should sync after reconnecting from hours-long offline sessions | Requires durable client-side state (local DB of block hashes), conflict detection on reconnect, and delta sync protocol |
+| Sharing and permission model? | Shared folders with per-user view/edit ACLs | Complicates the metadata schema; permissions must be evaluated at every API call, not just at share time |
+| Mobile client support? | iOS and Android, with background sync | Battery and bandwidth constraints favour aggressive delta sync and adaptive chunk sizing; background sync APIs on iOS have strict scheduling limits |
+| Scale targets: users, storage per user? | 100 M users, 10 GB average, 1% daily active uploaders | Sets the storage, bandwidth, and metadata DB sizing targets |
+| Sync latency SLA? | Changes should appear on all devices within 30 seconds of a save | Determines whether push notifications (WebSocket / APNs / FCM) are required or whether polling is sufficient |
+
+## Functional requirements
+
+- **Upload**: clients can upload files of any type up to 100 GB using a block-upload protocol; resumable sessions survive network interruptions
+- **Download**: clients can download any version of a file they have access to; downloads stream block-by-block to support seeking in large files without full download
+- **Automatic sync**: changes made on one device propagate to all other linked devices within 30 seconds; sync occurs in the background without user interaction
+- **Version history**: the system retains the last 30 file versions; users can browse, preview, and restore any prior version from the client or web UI
+- **File sharing and permissions**: users can share files and folders with other users, granting view-only or edit access; permissions are enforced server-side on every request
+- **Conflict detection and resolution**: when two devices diverge from a common ancestor version, the system detects the conflict and surfaces it to the user with both copies preserved — data is never silently discarded
+- **Folder structure**: files are organized in a hierarchical folder tree with arbitrary nesting depth; move and rename operations are atomic from the user's perspective
+
+## Non-functional requirements
+
+- **Scale**: 100 M registered users; 10 GB average storage per user; 1 PB raw storage, 3 PB with 3x replication
+- **Sync latency**: changes appear on all connected devices within 30 seconds of a successful upload commit
+- **Durability**: 99.999% annual file durability — equivalent to losing one file per 100,000 stored per year (S3 Standard is 99.999999999%)
+- **Availability**: 99.9% uptime for sync and metadata APIs (< 8.7 hours/year downtime); 99.99% read availability for file download
+- **Throughput**: sustain 100 TB of uploads per day (peak 3x = 300 TB/day) without queuing backup
+- **File size**: individual files up to 100 GB
+- **Security**: all data encrypted in transit (TLS 1.3) and at rest (AES-256, customer-managed keys for enterprise tier)
+
+## Capacity estimation
+
+<Capacity title="Storage, bandwidth, and metadata sizing for 100 M users">
+
+**Total raw storage**
+
+$\text{Total} = 100\text{M users} \times 10\ \text{GB/user} = 1\ \text{PB}$
+
+With 3× replication across availability zones:
+
+$\text{Replicated storage} = 1\ \text{PB} \times 3 = 3\ \text{PB}$
+
+**Cross-user block deduplication**
+
+Dropbox's published dedup ratio is approximately 30% globally (files like OS images, common PDFs, stock photos appear across millions of accounts). Effective storage after dedup:
+
+$\text{Effective storage} = 3\ \text{PB} \times (1 - 0.30) = 2.1\ \text{PB}$
+
+**Daily upload bandwidth**
+
+Assume 1% of users upload each day, with an average upload size of 100 MB:
+
+$\text{Daily uploads} = 100\text{M} \times 0.01 \times 100\ \text{MB} = 100\ \text{TB/day}$
+
+Sustained bandwidth (upload only):
+
+$\text{Sustained upload} = \frac{100\ \text{TB}}{86{,}400\ \text{s}} \approx 1.16\ \text{GB/s}$
+
+With peak headroom of 3×:
+
+$\text{Peak bandwidth} \approx 3.5\ \text{GB/s}$
+
+**Metadata database size**
+
+Assume each user has an average of 1,000 files, with 500 bytes of metadata per file (name, path, timestamps, permissions, latest version pointer):
+
+$\text{Metadata} = 100\text{M} \times 1{,}000 \times 500\ \text{B} = 50\ \text{TB}$
+
+This is large for a single relational database — sharding the metadata DB by `userId` (range or hash) is required.
+
+**Block index (Redis)**
+
+Each block record in the block index is roughly: 32-byte hash + 8-byte size + 64-byte S3 key + 4-byte refCount = ~108 bytes. At 1 PB of data split into 4 MB blocks:
+
+$\text{Block count} = \frac{1 \times 10^{15}}{4 \times 10^6} = 250\text{M blocks}$
+
+$\text{Block index memory} = 250\text{M} \times 108\ \text{B} \approx 27\ \text{GB}$
+
+A Redis cluster with a few r7g.2xlarge nodes (64 GB RAM each) comfortably holds this hot index with room for growth.
+
+</Capacity>
+
+## API design
+
+The upload protocol is the most interview-critical part of the API. A single `POST /upload` with a multipart body is wrong — it does not support resumability, deduplication, or block-level delta sync. The correct protocol is a three-phase handshake.
+
+```
+POST /upload/init
+  Body: { fileId, blockHashes: string[] }
+  Response: { sessionId, neededHashes: string[] }
+
+  The client sends the full ordered list of block hashes for the new version of the file.
+  The server returns only the hashes it does not already have in the CAS.
+  If neededHashes is empty, the client skips directly to /upload/commit (zero-byte upload).
+
+PUT /upload/block/{hash}
+  Body: raw block bytes (up to 4 MB)
+  Response: 204 No Content
+
+  Client uploads each needed block. The server validates that SHA-256(body) == hash
+  before writing to S3. Returns 400 if the hash does not match (integrity check).
+
+POST /upload/commit
+  Body: { sessionId, fileId, blockHashes: string[], deviceId }
+  Response: { versionId, fileId, createdAt }
+
+  Atomically creates a new file_version row with the block manifest.
+  Triggers sync events to all other devices linked to this user.
+
+GET /files/{fileId}?version={versionId}
+  Response: file bytes (streamed block-by-block)
+  Default version is the latest; specify versionId for historical restore.
+
+GET /files/{fileId}/versions
+  Response: [ { versionId, size, createdAt, deviceId }, ... ]
+  Returns the last 30 versions in reverse chronological order.
+
+GET /sync/delta?cursor={opaqueCursor}
+  Response: { events: SyncEvent[], nextCursor: string }
+  Long-poll endpoint (up to 30 s) that returns file tree changes since the cursor.
+  cursor is an opaque base64-encoded event ID. First sync uses cursor=0.
+```
+
+The `cursor`-based delta sync endpoint is the key to efficient reconnection. A device that was offline for eight hours does not need to re-enumerate the full file tree — it fetches the event log tail from its last known cursor and replays only the changes that occurred during the outage.
+
+## Data model
+
+The schema deliberately keeps metadata and content separate. Postgres owns the file tree and version history; S3 owns the bytes.
+
+**`files` table** — one row per logical file (or folder), persisted across version history:
+
+```sql
+CREATE TABLE files (
+  file_id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id          UUID        NOT NULL,
+  parent_folder_id UUID        REFERENCES files(file_id),
+  name             TEXT        NOT NULL,
+  latest_version_id UUID,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at       TIMESTAMPTZ,
+  CONSTRAINT uq_name_in_folder UNIQUE (user_id, parent_folder_id, name, deleted_at)
+);
+CREATE INDEX idx_files_user ON files (user_id, deleted_at);
+```
+
+**`file_versions` table** — immutable record of each committed version:
+
+```sql
+CREATE TABLE file_versions (
+  version_id     UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  file_id        UUID        NOT NULL REFERENCES files(file_id),
+  block_manifest JSONB       NOT NULL,  -- ordered array of blockHash strings
+  size_bytes     BIGINT      NOT NULL,
+  device_id      TEXT        NOT NULL,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  is_conflict    BOOLEAN     NOT NULL DEFAULT false
+);
+CREATE INDEX idx_versions_file ON file_versions (file_id, created_at DESC);
+```
+
+The `block_manifest` column is a JSON array of SHA-256 hex strings in block order. Reconstructing the file means fetching each block from S3 in sequence. Storing it as JSONB allows GIN-indexed containment queries: `SELECT * FROM file_versions WHERE block_manifest @> '["abc123..."]'` — useful for the GC job to find all versions referencing a given block before decrementing its refCount.
+
+**`blocks` table** — the content-addressable store index (S3 holds the actual bytes):
+
+```sql
+CREATE TABLE blocks (
+  block_hash  CHAR(64)    PRIMARY KEY,  -- SHA-256 hex
+  size_bytes  INT         NOT NULL,
+  s3_key      TEXT        NOT NULL,
+  ref_count   INT         NOT NULL DEFAULT 0,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+The `ref_count` is incremented atomically when a new `file_version` references the block, and decremented when a version is deleted. GC (a background job) deletes from S3 any block where `ref_count = 0` and `created_at < now() - interval '1 hour'` (the delay prevents a race between a concurrent upload that hasn't committed yet and a concurrent delete).
+
+**`sync_cursors` table** — tracks the last event each device has acknowledged:
+
+```sql
+CREATE TABLE sync_cursors (
+  device_id   TEXT        NOT NULL,
+  user_id     UUID        NOT NULL,
+  last_event_id BIGINT    NOT NULL DEFAULT 0,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (device_id, user_id)
+);
+```
+
+**`sync_events` table** — the ordered event log that drives delta sync:
+
+```sql
+CREATE TABLE sync_events (
+  event_id    BIGSERIAL   PRIMARY KEY,
+  user_id     UUID        NOT NULL,
+  event_type  TEXT        NOT NULL,  -- 'created' | 'modified' | 'deleted' | 'moved'
+  file_id     UUID        NOT NULL,
+  version_id  UUID,
+  payload     JSONB,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_events_user ON sync_events (user_id, event_id);
+```
+
+## High-level architecture
+
+<Mermaid caption="Upload path (solid lines) and sync notification path (dashed lines). Blocks bypass the API tier and go directly to S3 via pre-signed URLs; only the manifest commit touches the API servers." diagram={`graph LR
+  Client["Desktop / Mobile\nClient"] -- "1 init + commit" --> API["API Servers\n(stateless)"]
+  Client -- "2 PUT block (pre-signed URL)" --> S3["Block Store\nS3 CAS"]
+  API -- "read/write versions\nand manifests" --> MetaDB[("Metadata DB\nPostgres (sharded)")]
+  API -- "block index\nref-count cache" --> Cache[("Redis\nBlock Index")]
+  API -- "append sync event" --> Events[("Sync Events\nPostgres / Kafka")]
+  Events -- "fan-out" --> Sync["Sync Service\n(per-user long-poll)"]
+  Sync -- "push delta" --> Notify["Notification\nWebSocket / SSE\n/ APNs / FCM"]
+  Notify -. "new version available" .-> Client`} />
+
+The upload path keeps the API servers out of the data plane after the init handshake. Once the server knows which blocks are needed (from `POST /upload/init`), it returns pre-signed S3 URLs for each block. The client uploads those blocks directly to S3, then calls `POST /upload/commit` to record the new version manifest. This eliminates the bandwidth cost of routing gigabytes of block data through the API tier — the API servers only handle metadata operations, which are small and fast.
+
+The sync notification path is separate from the upload path. When a commit lands, the API server appends an event to the `sync_events` table (or a Kafka topic for higher throughput). The Sync Service maintains one long-poll connection per active device. On receiving a new event for a user, the Sync Service wakes all connections for that user's devices and delivers the delta, triggering the affected devices to run `GET /sync/delta?cursor=lastKnown`.
+
+## Deep dives
+
+### Block chunking and delta sync
+
+Fixed-size 4 MB blocks are the practical default. Variable-size chunking via rolling hash (the rsync algorithm: Adler-32 rolling checksum for boundary detection, then MD4 or SHA-256 of each chunk) produces smaller average chunk sizes on text-heavy workloads and better deduplication across versions with content insertions, but adds client-side CPU cost and implementation complexity. Fixed 4 MB is the right starting point; mention rolling-hash as a follow-up optimization.
+
+The upload protocol in detail:
+
+1. The client reads the current file from disk, splits it into fixed 4 MB chunks, and computes SHA-256 of each chunk. The result is an ordered list of `(blockHash, offset)` pairs — the block manifest.
+2. The client calls `POST /upload/init` with the full list of block hashes. The server looks up each hash in the `blocks` table (Redis hot path, Postgres fallback). It returns the subset of hashes it does not have — the "needed set."
+3. The client uploads only the needed blocks (via pre-signed S3 PUTs). Each block is validated by the server before S3 write: `SHA-256(body)` must equal the hash in the URL. This prevents corruption and hash-collision attacks.
+4. The client calls `POST /upload/commit` with the full ordered manifest (including already-present hashes). The server atomically inserts the `file_versions` row and increments `ref_count` on all referenced blocks.
+
+For a 1 GB file where only the first 5 KB changed, the block manifest has 256 entries (256 × 4 MB = 1 GB). Only the first block differs; the client uploads 4 MB, not 1 GB. The remaining 255 blocks are already in the CAS, referenced by previous versions, and the commit is instant.
+
+### Content-addressable block store
+
+Blocks are stored in S3 with a key derived from the hash to avoid hot-partition problems in S3's internal key-space partitioning:
+
+```
+s3://drive-blocks-cas/blocks/{hash[0:2]}/{hash[2:4]}/{hash}
+```
+
+The two-level prefix splits the key space into 65,536 buckets, which is enough to avoid S3 request-rate limits even at hundreds of thousands of block uploads per second. S3's built-in prefix-level scaling handles the rest.
+
+Cross-user deduplication falls out naturally from the content-addressable scheme. If two users independently upload the same 10 GB database dump, the first upload populates 2,560 blocks in S3 and creates a `file_versions` row. The second user's client sends all 2,560 block hashes in the init call; the server returns an empty needed set; the client calls commit immediately. Only the metadata rows differ. The bytes live once.
+
+The reference-counting scheme is the correctness crux. Every `upload/commit` call runs inside a Postgres transaction that both inserts the `file_versions` row and issues `UPDATE blocks SET ref_count = ref_count + 1 WHERE block_hash = ANY($1)` for all blocks in the manifest. Every version deletion runs the inverse in a transaction. The GC job runs on a 10-minute cron, deleting from S3 any block with `ref_count = 0` and `created_at` older than one hour (the delay avoids the TOCTOU race between a commit in progress and the GC scan).
+
+### Conflict resolution
+
+Conflict detection requires knowing the common ancestor. Each device persists its last acknowledged `version_id` per file in local state. When the device reconnects and calls `POST /upload/commit`, it includes a `baseVersionId` in the request. The server checks whether `files.latest_version_id == baseVersionId`. If it does, no conflict — the new version becomes latest. If it does not, the server has received a divergent version while the client was offline.
+
+For plain text and code files, the server can attempt a 3-way merge using the common ancestor's block content as the base. If the merge succeeds without conflicts, the result becomes the new version. If the merge has conflicts (overlapping edits), fall through to the binary-file path.
+
+For binary files (Word documents, PDFs, images, Excel spreadsheets), a content-aware merge is not feasible. The server keeps both versions: the already-committed version retains its `version_id` as latest, and the incoming version is stored as a new `file_versions` row with `is_conflict = true` and a display name of `filename (conflicted copy, device@timestamp)`. Both copies are surfaced to the user in the UI. This is identical to the conflict model Dropbox has used since 2008 — and it is the right answer because it guarantees zero data loss.
+
+Conflict resolution design has one hard invariant that must be stated clearly: **never silently pick a winner**. Silent last-write-wins causes data loss that users may not discover until hours or days later. The engineering team at Dropbox documented that the hardest customer support tickets were always cases where data had been silently overwritten. Always surface conflicts explicitly.
+
+### Sync protocol with cursors
+
+The `sync_events` table is an append-only log ordered by `event_id` (a BIGSERIAL). Each event records what happened to which file. Devices maintain a `last_event_id` cursor that represents the frontier of what they have processed.
+
+On reconnect, the client calls:
+
+```
+GET /sync/delta?cursor=12847329
+```
+
+The server returns all events where `user_id = ? AND event_id > 12847329`, ordered by `event_id`. For each event:
+
+- `created` or `modified`: client calls `POST /upload/init` with the new version's block manifest to determine which blocks it needs, fetches them, and updates local state.
+- `deleted`: client removes the local file (moves to local trash).
+- `moved`: client updates the local file tree path.
+
+The response includes a `nextCursor` — the highest `event_id` in the returned batch. The client saves this as its new cursor before applying any of the events, so that if the application crashes mid-apply, it replays from the same cursor on next start (idempotent application of events is required; each event has a stable `event_id` that the client can use to skip already-applied events).
+
+For real-time sync on connected devices, the Sync Service holds a WebSocket or SSE connection per active device. When a commit lands and a new sync event is appended, the service wakes up waiting connections for that `user_id` and delivers the event immediately — no polling required on the happy path.
+
+## Java integration
+
+### Part A — Block store service
+
+```java
+package dev.pushkar.drive;
+
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.core.sync.RequestBody;
+import java.security.MessageDigest;
+import java.util.HexFormat;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+@Service
+public class BlockStoreService {
+    private static final String BUCKET = "drive-blocks-cas";
+    private final S3Client s3;
+    private final BlockRepository blockRepo;
+
+    public BlockStoreService(S3Client s3, BlockRepository blockRepo) {
+        this.s3 = s3;
+        this.blockRepo = blockRepo;
+    }
+
+    public String store(byte[] blockData) {
+        String hash = sha256(blockData);
+        if (blockRepo.existsByHash(hash)) {
+            blockRepo.incrementRefCount(hash);
+            return hash; // dedup: block already stored
+        }
+        String s3Key = toS3Key(hash);
+        s3.putObject(PutObjectRequest.builder()
+            .bucket(BUCKET)
+            .key(s3Key)
+            .contentLength((long) blockData.length)
+            .build(), RequestBody.fromBytes(blockData));
+        blockRepo.save(new Block(hash, blockData.length, s3Key, 1));
+        return hash;
+    }
+
+    public byte[] fetch(String blockHash) {
+        return s3.getObjectAsBytes(r -> r.bucket(BUCKET).key(toS3Key(blockHash))).asByteArray();
+    }
+
+    public Set<String> findMissingBlocks(List<String> hashes) {
+        Set<String> existing = blockRepo.findExistingHashes(hashes);
+        return hashes.stream()
+            .filter(h -> !existing.contains(h))
+            .collect(Collectors.toSet());
+    }
+
+    private String toS3Key(String hash) {
+        return "blocks/" + hash.substring(0, 2) + "/" + hash.substring(2, 4) + "/" + hash;
+    }
+
+    public static String sha256(byte[] data) {
+        try {
+            return HexFormat.of().formatHex(
+                MessageDigest.getInstance("SHA-256").digest(data));
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+}
+```
+
+Three implementation notes worth calling out. First, `blockRepo.incrementRefCount` must be atomic — use a `UPDATE blocks SET ref_count = ref_count + 1 WHERE block_hash = ?` rather than a read-modify-write in application code, otherwise concurrent uploads of the same block will race. Second, the `existsByHash` call is the hot path: at scale, this is a Redis `SISMEMBER` call against the block hash set, with Postgres as the fallback on a miss. Third, the `toS3Key` method uses the first two bytes of the hash as a prefix to distribute keys across S3's internal shards — without this, a lexicographically sequential write pattern (e.g., hashes that share a common prefix) can cause request-rate throttling on the S3 side.
+
+### Part B — Spring Boot upload controller
+
+```java
+@RestController
+@RequestMapping("/upload")
+public class UploadController {
+    private final BlockStoreService blockStore;
+    private final FileVersionRepository versionRepo;
+    private final UploadSessionCache uploadSessionCache;
+
+    public UploadController(BlockStoreService blockStore,
+                            FileVersionRepository versionRepo,
+                            UploadSessionCache uploadSessionCache) {
+        this.blockStore = blockStore;
+        this.versionRepo = versionRepo;
+        this.uploadSessionCache = uploadSessionCache;
+    }
+
+    @PostMapping("/init")
+    public UploadSession init(@RequestBody InitUploadRequest req) {
+        Set<String> needed = blockStore.findMissingBlocks(req.blockHashes());
+        String sessionId = UUID.randomUUID().toString();
+        uploadSessionCache.put(sessionId, new UploadSession(sessionId, req, needed));
+        return new UploadSession(sessionId, needed);
+    }
+
+    @PutMapping("/block/{hash}")
+    public ResponseEntity<Void> uploadBlock(@PathVariable String hash,
+                                             @RequestBody byte[] data) {
+        String actualHash = BlockStoreService.sha256(data);
+        if (!actualHash.equals(hash)) {
+            return ResponseEntity.badRequest().build();
+        }
+        blockStore.store(data);
+        return ResponseEntity.ok().build();
+    }
+
+    @PostMapping("/commit")
+    public FileVersion commit(@RequestBody CommitRequest req) {
+        return versionRepo.save(new FileVersion(
+            req.fileId(),
+            req.blockHashes(),
+            req.deviceId(),
+            Instant.now()
+        ));
+    }
+
+    record InitUploadRequest(String fileId, List<String> blockHashes) {}
+    record CommitRequest(String fileId, List<String> blockHashes, String deviceId) {}
+}
+```
+
+The hash validation in `uploadBlock` is a mandatory integrity check — it prevents a client from uploading corrupt data and attributing it to the wrong hash, which would cause silent file corruption for every other user whose version manifest references that hash. In production, you would also check that the `hash` in the URL is a member of the session's `needed` set (stored in Redis) to prevent clients from uploading unrequested blocks and inflating storage.
+
+<TradeoffTable title="Sync approach comparison">
+
+| Approach | Bandwidth cost | Conflict handling | Implementation complexity | Best for |
+|---|---|---|---|---|
+| Full file upload on every change | Very high — entire file retransmitted for any change | Simple — latest write wins by timestamp | Low — standard multipart upload | Files under 1 MB, simple single-device use cases |
+| Delta sync (rsync / xdelta) | Low — only the changed byte ranges | Medium — detect conflicts via base version ID | Medium — requires rolling hash on client, diff computation on server | Text files, code repositories, documents with frequent small edits |
+| Block-level dedup (this design) | Very low — only new 4 MB blocks transit the wire | Medium — conflict detection on commit, "conflicted copy" for binary files | High — CAS store, ref-counting GC, cursor-based event log | Large files, media-heavy workloads, multi-user environments with high dedup ratios |
+| CRDT-based sync (e.g., Figma, Notion) | Low — only operation deltas | Automatic — convergent merge with no conflicts | Very high — CRDT data types, causal ordering, tombstone management | Real-time collaborative editing of structured documents |
+
+</TradeoffTable>
+
+<Pitfall title="Deleting blocks without reference counting">
+
+A common mistake is to delete blocks whenever a file version is deleted, on the assumption that the deleted version "owned" those blocks. This is wrong in two ways. First, multiple `file_versions` rows for the same file share blocks between adjacent versions — version 5 and version 6 of a document will share all but one or two blocks. Second, cross-user deduplication means two completely unrelated users' files may reference the same block hash. Deleting the block when one user deletes their file corrupts the other user's data.
+
+The correct model: every block has a `ref_count`. Increment it on every `file_version` insert that references the block; decrement it on every version deletion. GC deletes from S3 only blocks where `ref_count = 0`. The decrement and the GC deletion must not happen in the same transaction — the GC should add a delay (e.g., blocks deleted from S3 only if `ref_count = 0 AND created_at < now() - interval '1 hour'`) to protect against a race where a concurrent upload is in progress but has not yet committed its version row.
+
+</Pitfall>
+
+<Pitfall title="Last-write-wins for all file types">
+
+Implementing last-write-wins (LWW) uniformly across all file types is the most common conflict resolution mistake in system design interviews. For plain text files, LWW silently discards one set of edits. For binary files (Word documents, Photoshop files, Excel spreadsheets), it is even worse: the binary format of these files is not line-addressable, so there is no concept of a "merge" — one version simply overwrites the other, and the user whose change was overwritten may not notice for hours.
+
+The correct approach: detect divergence by comparing the incoming `baseVersionId` against `files.latest_version_id`. On divergence, attempt a 3-way merge for text files (if it succeeds cleanly, commit the merged result; if it has conflicts, fall through). For binary files or failed text merges, commit both versions and surface the conflict explicitly as a "conflicted copy." The rule is absolute: **never silently discard data**. A conflicted copy that the user must resolve manually is always better than silent data loss.
+
+</Pitfall>
+
+<Curveball question="A user uploads a 100 GB video file. With 4 MB blocks that's 25,000 blocks. The upload takes 2 hours. At the 90-minute mark the connection drops. How does the client resume without re-uploading the first 90 minutes of data?">
+
+The answer is that the three-phase protocol already handles this correctly — if you implement it right. The session state in Redis records which block hashes were in the `needed` set from the `init` call. Crucially, each `PUT /upload/block/{hash}` call is idempotent: if the block is already in S3 (because it was uploaded before the drop), the `store()` method detects that `blockRepo.existsByHash(hash)` is true and increments the ref count without re-uploading. So the client can simply replay every block upload from the beginning and the already-uploaded blocks will no-op in microseconds (a Redis `SISMEMBER` hit and a ref-count increment).
+
+In practice, you want to be smarter: the client tracks which blocks it has already confirmed uploaded (a local SQLite table of confirmed block hashes for this session). On resume, it skips those blocks entirely. The `sessionId` from the `init` call is persisted locally so the client can resume the same session across restarts. The session in Redis should have a TTL of at least 24 hours to accommodate overnight interruptions.
+
+The `commit` call is never made until all needed blocks are confirmed uploaded — so a partial upload that drops at 90 minutes leaves no garbage version in the metadata DB. If the session TTL expires before the client reconnects, the client calls `init` again with the same block manifest. Any blocks uploaded before the drop are already in the CAS with a ref count; they will appear in the existing-blocks set and the new `neededHashes` will only contain the blocks from the second 30 minutes of the original upload.
+
+</Curveball>
+
+<Curveball question="Two enterprise customers independently upload the same 10 GB proprietary database dump. Cross-user dedup means they share blocks in S3. Customer A deletes their file — how do you ensure Customer B's data is not deleted?">
+
+This is precisely the ref-counting problem. The sequence of events in a naive implementation without ref-counting:
+
+1. Customer A uploads — 2,560 blocks written to S3, `ref_count = 1` for each.
+2. Customer B uploads the same file — `init` returns an empty `neededHashes` set; `commit` runs and sets `ref_count = 2` for all shared blocks.
+3. Customer A deletes their file — the version deletion job decrements `ref_count` to 1 for all blocks. GC sees `ref_count > 0` and leaves the blocks in S3.
+4. Customer B's file is intact and reads correctly.
+
+The failure mode only occurs if ref-counting is omitted or if the decrement and the S3 delete happen in the same transaction. The GC job must be separate, asynchronous, and conservative: only delete from S3 if `ref_count = 0` AND the block is old enough (e.g., one hour) to have cleared any in-flight commit transactions that have not yet incremented the ref count.
+
+A secondary concern: data isolation. Even though two customers share blocks in S3, neither customer should be able to discover that the other has the same file. The block store is opaque — customers interact with the metadata API (which is scoped to their `user_id`) and never with raw block hashes or S3 keys. The deduplication is an internal storage optimization, completely invisible at the API layer. For regulated industries (HIPAA, FedRAMP), cross-customer block sharing may be prohibited by compliance requirements regardless of the technical isolation — in that case, disable cross-user dedup and scope deduplication to per-user or per-organization boundaries only.
+
+</Curveball>
+
+<Curveball question="You need version history — users can restore any of the last 30 versions. But block-level dedup means version 1 and version 30 share most of their blocks. How does your data model support rollback without storing duplicate data?">
+
+This is exactly what the `file_versions` + `blocks` + `ref_count` schema is designed for. Rollback to version N does not copy any bytes — it is a metadata operation only.
+
+The rollback sequence:
+
+1. User requests restore of `versionId = v15`.
+2. Server reads `file_versions.block_manifest` for `v15` — this is the ordered array of block hashes that makes up the file at that version.
+3. Server creates a **new** `file_versions` row with the same `block_manifest` array as `v15` but a new `version_id` and `created_at = now()`. This new row becomes the latest version.
+4. Server increments `ref_count` on all blocks in the `v15` manifest (they now have one more reference: the newly created version row).
+5. The old latest version row is not deleted — it remains in version history.
+
+The actual bytes in S3 are never touched. The 4 MB blocks that make up `v15` have been in S3 since they were first uploaded (possibly by version 1, since most of the file hasn't changed). Every version from v1 to v30 references many of the same blocks. The only storage overhead for 30 versions of a mostly-unchanged 1 GB file is 30 rows in `file_versions` (each ~500 bytes of JSON manifest) plus the incremental new blocks from each revision — not 30 full copies of 1 GB.
+
+Version pruning (enforcing the 30-version limit) is also a metadata-only operation: delete `file_versions` rows beyond the 30-version window, decrement `ref_count` on all blocks in those manifests, and let the GC clean up any blocks whose count reaches zero. Blocks shared with surviving versions are unaffected.
+
+</Curveball>
+
+<RelatedQuestions items={[{slug: "s3-object-storage", title: "Design S3-like Object Storage", difficulty: "staff"}, {slug: "distributed-unique-id-generator", title: "Design a Distributed Unique ID Generator", difficulty: "mid"}, {slug: "design-a-cache", title: "Design a Distributed Cache", difficulty: "senior"}]} />
+
+## Further reading
+
+- **Dropbox Tech Blog — "How we built the Dropbox sync engine"**: the canonical first-hand account of the engineering decisions behind block chunking, delta sync, and the sync protocol. Covers the transition from full-file uploads to block-level sync and the performance results. Available at [dropbox.tech](https://dropbox.tech/infrastructure/how-we-built-the-dropbox-sync-engine).
+- **Dropbox Tech Blog — "Deduplication in Dropbox"**: describes the cross-user content-addressable store architecture, the ref-counting GC design, and the measured dedup ratios across the Dropbox user base. A rare primary source for production dedup numbers.
+- **Andrew Tridgell's rsync algorithm paper** (1996): the original description of the rolling-hash-based delta sync algorithm that underpins most modern file sync systems. Available at [rsync.samba.org/tech_report](https://rsync.samba.org/tech_report/). Understanding the Adler-32 rolling checksum and the two-level hash comparison is worth the hour it takes to read.
+- **AWS S3 multipart upload documentation**: the S3 API that production implementations of this design would use for individual block uploads. Covers part numbering, ETag validation, and the CompleteMultipartUpload call — which maps directly to the `upload/commit` endpoint in this design. Available at the [AWS S3 Developer Guide](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html).
+- **"CRDT: an overview"** (Martin Kleppmann): for the real-time collaborative editing path (Google Docs / Notion model), Kleppmann's lecture notes and his book "Designing Data-Intensive Applications" (Chapter 9) provide the best accessible treatment of CRDTs and their tradeoffs against OT. Available at [crdt.tech](https://crdt.tech).

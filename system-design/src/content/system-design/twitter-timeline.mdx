@@ -1,0 +1,566 @@
+---
+title: "Design Twitter's Home Timeline"
+slug: "twitter-timeline"
+category: "social"
+difficulty: "senior"
+estimatedReadMinutes: 22
+tags: ["fan-out", "timeline", "redis", "celebrity-problem", "social-graph"]
+companyFlavors: ["Twitter/X", "Mastodon", "Bluesky"]
+prerequisites: ["consistent-hashing", "design-a-cache"]
+relatedQuestions: ["instagram", "facebook-news-feed", "discord"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Build a home timeline feed that shows tweets from followed accounts in near-real-time. Navigate the fan-out trade-off, the celebrity problem, and Redis cache invalidation at 300 M DAU."
+javaPackages:
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+  - "org.springframework.boot:spring-boot-starter-data-redis:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="twitter-timeline" title="Design Twitter's Home Timeline" />
+
+<Tldr>
+- **Fan-out-on-write pre-populates each follower's Redis sorted-set** (score = tweet timestamp in epoch ms); reads are O(1) ZREVRANGE — no joins, no graph traversal at read time
+- **The celebrity problem**: authors with more than 1 M followers bypass write fan-out entirely; their tweets are merged at read-time by fetching from a hot Tweet Cache keyed on author_id
+- **Timeline cache**: one Redis ZSET per user, capped at 800 tweet IDs, TTL 72 h; content (text, media URLs, like counts) is hydrated lazily from a separate Tweet Cache on read
+- **Deletes and unfollows propagate via Kafka tombstones**; the timeline renderer skips deleted IDs during hydration (lazy cleanup — no thundering herd from mass ZREM fan-out)
+- **Up to 5 s delivery lag is acceptable**; only the most-recent 800 entries need to be fresh — users rarely scroll past page 2
+</Tldr>
+
+## The scale of the problem
+
+The home timeline looks conceptually simple: given a user, return the tweets of everyone they follow, sorted reverse-chronologically. In a relational database that is a two-table join: `SELECT t.* FROM tweets t JOIN follows f ON t.author_id = f.followee_id WHERE f.follower_id = ? ORDER BY t.created_at DESC LIMIT 20`. At 100 users, this query is trivial. At 300 million daily active users, each issuing this query on every app open and every pull-to-refresh, it is a catastrophe. The `follows` table alone — at an average of 200 mutual connections per user — contains 60 billion rows. A follower-id index scan returns hundreds of followee IDs, which then drive hundreds of random reads into the tweets table. At even moderate read rates — say, 300 M DAU each loading their timeline three times per day — you need to serve 900 M timeline reads per day, or roughly 10,400 reads per second at steady state. Each read touching a 60-billion-row join is a database killer. The query plan does not parallelize usefully, the working set far exceeds any realistic buffer pool, and every popular account becomes a hot shard.
+
+The write side compounds the problem. Twitter processes approximately 500 million tweets per day — about 5,800 per second at steady state, with peaks exceeding 11,000 per second during live events (World Cup finals, New Year's, breaking news). Each tweet, once written to the tweets table, must somehow become visible in the timelines of every follower within five seconds. If you attempt to serve timelines from the raw relational model, every new tweet invalidates a massive chunk of cached query results, and re-executing those queries at write time is itself catastrophically expensive. You cannot cache the join result because the cache invalidation surface is unbounded — a single tweet invalidates N follower timelines simultaneously, where N can be 100 million for a celebrity account.
+
+The only viable architecture at this scale is pre-computation: accept write amplification during the fan-out window, and make reads so cheap that they are essentially memory lookups. When a user posts a tweet, the system immediately inserts that tweet's ID into a Redis sorted set for each follower — the score being the tweet's Unix timestamp in milliseconds, which gives chronological ordering for free via ZREVRANGE. When a user loads their timeline, the system fetches a window of tweet IDs from their sorted set (a single O(log N + M) Redis call), then fetches the actual tweet content in parallel from a separate Tweet Cache. The join that was O(followers × tweets-per-follower) at read time becomes O(1) at read time and O(followers) at write time — a trade-off that is correct because timelines are read orders of magnitude more often than they are written.
+
+## Clarifying questions
+
+Ask these eight questions before drawing any boxes. Each collapses a significant design branch.
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| What is the maximum number of timeline entries to keep fresh per user? | 800 tweet IDs | Determines Redis ZSET cap size and memory footprint — the diff between 800 and 10,000 is 12.5× more Redis RAM |
+| What is the acceptable content freshness SLA for the timeline? | Up to 5 s end-to-end fan-out lag is acceptable | Allows async Kafka-based fan-out rather than synchronous inline write; relaxes consistency requirements significantly |
+| What is the threshold for "celebrity" routing? | Accounts with more than 1 M followers skip write fan-out | The crossover point where fan-out cost exceeds read-path merge cost; 1 M is the correct order of magnitude based on Twitter's disclosed architecture |
+| How are users geographically distributed? | Global, with US/EU/APAC clusters | Influences Redis cluster placement, Kafka replication factor, and whether to use geo-partitioned timelines or a single global store |
+| Are retweets and quote-tweets included in the timeline? | Yes, they are first-class timeline entries | Retweets go through the same fan-out pipeline; the tweet ID stored in the ZSET points to the retweet metadata, not the original |
+| Where do ads get injected? | Ad service injects at read time, not stored in timeline ZSET | Keeps the fan-out system decoupled from monetization logic; ads are fetched and interleaved at the timeline renderer layer |
+| Is muted-keyword or muted-account filtering applied? | Yes, at read time using a user's mute list | Mute lists change frequently; applying them at write time would require re-fan-out on every mute change — impractical at scale |
+| Chronological order or ranked/algorithmic? | Start with chronological (score = timestamp); ranking is a follow-on feature | Algorithmic ranking requires a separate ML scoring layer that re-orders the pre-fetched tweet IDs — out of scope for the core design |
+
+## Functional requirements
+
+The core functionality the system must deliver, scoped tightly to the home timeline:
+
+- **Home timeline read**: given an authenticated user, return a paginated list of tweets from followed accounts, ordered reverse-chronologically, with cursor-based pagination
+- **Tweet creation**: accept a tweet (text, optional media attachment, optional reply-to), persist it, and trigger async fan-out to all follower timelines
+- **Tweet deletion**: soft-delete a tweet and propagate a tombstone so deleted tweets are excluded from all in-flight and future timeline renders
+- **Unfollow propagation**: when user A unfollows user B, B's future tweets must not appear in A's timeline; B's past tweets may remain in A's timeline cache until TTL expiry (lazy cleanup is acceptable)
+- **Celebrity timeline merge**: for accounts exceeding the celebrity threshold, fetch their recent tweets at read time and merge with the pre-computed ZSET content
+- **Cold-start hydration**: for users whose timeline cache has expired (TTL 72 h, inactive users), reconstruct the timeline on first access by replaying the social graph query
+
+## Non-functional requirements
+
+Concrete targets to design toward — these are the numbers that determine which architectural choices are defensible:
+
+- **Scale**: 300 M DAU, 500 M tweets per day including retweets
+- **Read latency**: p99 home timeline GET under 100 ms end-to-end (including Tweet Cache hydration)
+- **Fan-out latency**: p99 tweet visible in all non-celebrity follower timelines within 5 s of creation
+- **Availability**: 99.99% for timeline reads; fan-out workers may lag transiently during degradation without data loss
+- **Tweet retention**: 7 years of tweet data in cold storage; timeline cache covers only the most-recent 72 h active window
+- **Timeline cache hit rate**: target 99%+ cache hit rate for active users (DAU); cold-start path must handle remaining 1%
+
+<Capacity title="Twitter Timeline Capacity Estimates">
+
+**Tweet ingestion rate**
+
+$$
+\frac{500\text{M tweets/day}}{86{,}400\text{ sec/day}} \approx 5{,}787 \text{ tweets/s sustained}
+$$
+
+Peak during live events (2× multiplier):
+
+$$
+5{,}787 \times 2 \approx 11{,}600 \text{ tps peak}
+$$
+
+**Fan-out write amplification**
+
+Average 200 followers per non-celebrity author. Each tweet triggers one ZADD per follower:
+
+$$
+5{,}787 \text{ tweets/s} \times 200 \text{ followers} = 1{,}157{,}400 \approx 1.16\text{M ZADD/s}
+$$
+
+With pipelining in batches of 500, this is roughly 2,300 Redis pipeline flushes per second — well within the throughput envelope of a 32-node Redis Cluster.
+
+**Timeline cache memory footprint**
+
+Each timeline ZSET stores up to 800 tweet IDs. A tweet ID is a 64-bit integer (8 bytes). Redis ZSET overhead per member (member string + score double + skip list node) is approximately 64 bytes in practice.
+
+$$
+300\text{M users} \times 800 \text{ entries} \times 64\text{ B/entry} \approx 15.4\text{ TB Redis}
+$$
+
+Not all 300 M users are active within any 72 h window. At 40% DAU-to-MAU ratio with 72 h TTL, the live set is closer to 120 M users:
+
+$$
+120\text{M users} \times 800 \times 64\text{ B} \approx 6.1\text{ TB Redis}
+$$
+
+A Redis Cluster with 32 nodes of 256 GB RAM each provides about 8 TB usable (accounting for replication and overhead) — tight but feasible.
+
+**Celebrity threshold analysis**
+
+Twitter's disclosed figure is approximately 1,000 accounts with more than 1 M followers. These accounts collectively post a small fraction of total tweets (estimated 0.1% of volume), but would account for a disproportionate fan-out burden if included in write fan-out. A single Elon Musk tweet at 150 M followers would require 150 M ZADD operations — more than 100× the average fan-out. Routing celebrities to the read-path merge eliminates this outlier entirely.
+
+$$
+\approx 1{,}000 \text{ celebrity accounts} \rightarrow \text{read-path merge only, zero ZADD fan-out}
+$$
+
+</Capacity>
+
+## API design
+
+Four REST endpoints covering the critical paths. Internal callers (mobile clients via API Gateway, web frontend) interact with the Timeline Service through these interfaces.
+
+```http
+GET /v1/timeline?cursor={cursor}&count={count}
+  Authorization: Bearer <jwt>
+  Response 200:
+  {
+    "tweets": [
+      {
+        "tweet_id": "1749283746172891136",
+        "author_id": "12345",
+        "content": "Hello world",
+        "created_at": "2025-01-15T10:23:45Z",
+        "like_count": 423,
+        "retweet_count": 87,
+        "is_deleted": false
+      }
+    ],
+    "next_cursor": "1749283700000000000",
+    "has_more": true
+  }
+```
+
+```http
+POST /v1/tweets
+  Authorization: Bearer <jwt>
+  Body: { "content": "string (max 280 chars)", "media_ids": ["string"], "reply_to_tweet_id": "string|null" }
+  Response 201:
+  { "tweet_id": "1749283746172891136", "created_at": "2025-01-15T10:23:45Z", "fan_out_status": "queued" }
+```
+
+```http
+DELETE /v1/tweets/{tweetId}
+  Authorization: Bearer <jwt>
+  Response 204: (no body)
+  Side effect: async tombstone published to Kafka "tweet-deleted" topic; fan-out workers call ZREM lazily
+```
+
+```http
+GET /v1/tweets/{tweetId}
+  Response 200:
+  { "tweet_id": "string", "author_id": "string", "content": "string", "created_at": "ISO8601", "is_deleted": false }
+  Response 404: tweet not found or permanently deleted
+  Note: used internally by Timeline Service during content hydration; also exposed publicly for direct tweet links
+```
+
+The `cursor` in the timeline GET is an epoch-millisecond timestamp — the score of the last tweet the client received. The Timeline Service translates this to a `ZREVRANGEBYSCORE` call with the cursor as the upper bound, making pagination stateless and resilient to pod restarts.
+
+## Data model
+
+**`tweets` table — MySQL, sharded by `tweet_id`**
+
+```sql
+CREATE TABLE tweets (
+    tweet_id    BIGINT UNSIGNED NOT NULL,
+    author_id   BIGINT UNSIGNED NOT NULL,
+    content     TEXT NOT NULL,
+    media_json  JSON,
+    reply_to    BIGINT UNSIGNED,
+    created_at  BIGINT NOT NULL,
+    is_deleted  TINYINT(1) NOT NULL DEFAULT 0,
+    PRIMARY KEY (tweet_id),
+    INDEX idx_author_created (author_id, created_at DESC)
+) ENGINE=InnoDB
+  PARTITION BY HASH(tweet_id DIV 1000000000) PARTITIONS 1024;
+```
+
+`tweet_id` is a Snowflake ID — 41 bits timestamp, 10 bits machine ID, 12 bits sequence — which provides monotonically increasing IDs, k-sortability by time, and natural distribution across shards. Sharding by `tweet_id` (range-based on the Snowflake epoch prefix) distributes write load evenly. The `author_id + created_at` index serves two lookups: celebrity tweet fetches and direct profile timeline reads.
+
+**`social_graph` table — MySQL, sharded by `follower_id`**
+
+```sql
+CREATE TABLE social_graph (
+    follower_id     BIGINT UNSIGNED NOT NULL,
+    followee_id     BIGINT UNSIGNED NOT NULL,
+    created_at      BIGINT NOT NULL,
+    PRIMARY KEY (follower_id, followee_id),
+    INDEX idx_followee (followee_id, follower_id)
+) ENGINE=InnoDB
+  PARTITION BY HASH(follower_id) PARTITIONS 512;
+```
+
+The primary key `(follower_id, followee_id)` serves the fan-out lookup: "give me all followers of author X" via the `idx_followee` index. Sharding by `follower_id` means the primary key lookup ("who does user A follow?") is on-shard, but the fan-out query ("who follows user B?") is a scatter-gather across all 512 shards. This is intentional — fan-out happens asynchronously in the background, scatter-gather latency is tolerable. The `followee_id` index is a separate index (not the shard key) so the fan-out query hits all shards but returns quickly from each.
+
+**Timeline cache — Redis ZSET**
+
+```yaml
+Key:    timeline:{userId}              # e.g. "timeline:12345678"
+Type:   Sorted Set
+Member: tweet_id as string             # e.g. "1749283746172891136"
+Score:  epoch_ms of tweet creation    # e.g. 1736935425000
+TTL:    259200 seconds (72 hours)
+Cap:    800 members max (ZREMRANGEBYRANK enforced after each ZADD)
+```
+
+The ZSET is capped at 800 members because: (1) users rarely scroll past 800 entries in a session, (2) 800 × 64 bytes = 51 KB per user is manageable in Redis, and (3) historical tweets beyond 800 are served by a cold-start replay from the social graph. The cap is enforced by trimming the lowest-scored (oldest) members after every ZADD batch.
+
+**User metadata — Redis Hash**
+
+```yaml
+Key:    user:{userId}                  # e.g. "user:12345678"
+Type:   Hash
+Fields:
+  follower_count: integer
+  is_celebrity: 0 or 1
+  display_name: string
+  profile_image_url: string
+TTL:    3600 seconds (1 hour, async-synced from MySQL)
+```
+
+The `is_celebrity` flag is the critical field for fan-out routing. It is cached here to avoid a MySQL read on every tweet creation. The fan-out consumer checks this field before deciding whether to ZADD or skip. When a user's follower count crosses the 1 M threshold, the MySQL-to-Redis sync job (runs every 60 seconds) flips `is_celebrity` to 1, and all subsequent tweets from that author skip write fan-out automatically.
+
+<Mermaid diagram={`flowchart LR
+  A["Mobile Client\nPOST /v1/tweets"] --> B["Timeline Service\n(Spring Boot)"]
+  B --> C["tweets table\nMySQL write"]
+  B --> D["Kafka\ntweet-created topic"]
+  D --> E{"Fan-out Consumer\ncheck is_celebrity?"}
+  E -->|"follower_count < 1M\nnon-celebrity"| F["Scatter-gather\nsocial_graph shards\n→ follower list"]
+  F --> G["Redis ZADD Pipeline\ntimeline:{followerId}\nbatch 500 per flush"]
+  G --> H["ZREMRANGEBYRANK\ntrim to 800 cap"]
+  E -->|"follower_count >= 1M\ncelebrity"| I["Skip ZADD\ntweet indexed in\nTweet Cache by author_id"]
+  J["Mobile Client\nGET /v1/timeline"] --> K["Timeline Service\nZREVRANGE timeline:{userId}"]
+  K --> L["Merge celebrity tweets\nfetch from Tweet Cache\nby followed celebrity IDs"]
+  L --> M["Parallel hydrate\nGET /v1/tweets/{id}\nfrom Tweet Cache"]
+  M --> N["Sort by timestamp\nSkip is_deleted=true\nReturn top count entries"]`} />
+
+## Deep dives
+
+### Fan-out-on-write vs fan-out-on-read
+
+The fundamental architectural question for any social feed is when to do the work of expanding one tweet into N timeline entries. The two extremes — fan-out-on-write and fan-out-on-read — each optimize for opposite sides of the read/write trade-off, and understanding where each breaks is more important than memorizing which one Twitter chose.
+
+**Fan-out-on-write** (push model) means that when a tweet is created, the system immediately writes the tweet ID into every follower's timeline cache. Reads become O(1): the timeline service fetches the user's ZSET and returns content. The cost is write amplification: one tweet creates N ZADD operations, where N is the follower count. For the median user with 200 followers, N = 200 — a trivially small fan-out, easily absorbed by a Redis pipeline flush. The system can sustain 5,800 tweets per second × 200 followers = 1.16 M ZADD operations per second, which a properly sized Redis Cluster handles without breaking a sweat. Write amplification is the right trade-off when followers are bounded and reads massively outnumber writes — exactly the Twitter usage pattern, where timelines are read roughly 300 M × 3 times per day (900 M reads) vs. 500 M writes per day.
+
+**Fan-out-on-read** (pull model) means the timeline is assembled at request time: fetch the list of followed accounts, query each account's recent tweets, merge and sort. Reads become O(following-count × tweets-per-author), which is expensive and non-cacheable at scale. For a user following 500 accounts, a timeline read might require 500 individual tweet lookups plus a merge sort — 500× more work than a single ZREVRANGE. This approach makes sense only for accounts with an extremely small following count (below roughly 50), where the per-request cost is low. The critical advantage of fan-out-on-read is that writes are O(1) — just insert into the tweets table — with no fan-out work. This is cheap, but the read cost at 300 M DAU is untenable.
+
+**The hybrid approach** is the correct answer at Twitter's scale: fan-out-on-write for all accounts below the celebrity threshold (1 M followers), and fan-out-on-read for celebrities. The 1 M threshold is not arbitrary. Below 1 M, the ZADD fan-out completes in under 5 seconds using a parallelized Kafka consumer with multiple instances each handling shard ranges of the follower list. Above 1 M, the fan-out would take longer than the 5 s SLA — a celebrity with 50 M followers requires 50 M ZADD operations, which at 1 M ZADD/s takes 50 seconds. The fan-out consumer explicitly checks the `is_celebrity` flag before deciding which path to take. The crossover at 1 M represents the point where read-path merge cost (fetching a celebrity's last N tweets from a hot Tweet Cache key) is cheaper than the write fan-out overhead amortized over each timeline read.
+
+One subtlety that interviewers probe: the celebrity threshold creates a dual-class citizen problem for accounts near the boundary. An account at 999,999 followers uses write fan-out; at 1,000,001 followers, it switches to read-path merge. The transition must be monotonic and non-lossy — tweets posted during the transition must not be dropped. The implementation is: once `is_celebrity` flips to 1 in the user's Redis Hash, all subsequent fan-out consumer events check the flag and skip ZADD. Tweets from before the flip are already in follower ZSETs from when the author was non-celebrity. Tweets from after the flip are served via the read-path merge. There is no gap.
+
+### Timeline cache design
+
+The Redis ZSET design deserves careful attention because its operational characteristics determine the system's memory budget, cache hit rate, and read latency.
+
+The core operations are:
+
+```redis
+ZADD timeline:{userId} NX {epochMs} {tweetId}
+ZREMRANGEBYRANK timeline:{userId} 0 -{TIMELINE_CAP+1}
+EXPIRE timeline:{userId} 259200
+ZREVRANGE timeline:{userId} 0 {count-1} WITHSCORES
+ZREVRANGEBYSCORE timeline:{userId} {cursor-epochMs} -inf WITHSCORES LIMIT 0 {count}
+```
+
+`ZADD NX` (Not eXists) makes the operation idempotent — if the fan-out consumer retries due to a Kafka redelivery, the ZADD is a no-op for already-present tweet IDs. This is the Redis equivalent of "upsert only if not exists" and eliminates duplicates without any additional deduplication layer.
+
+`ZREMRANGEBYRANK 0 -(CAP+1)` trims the ZSET to 800 members after each insertion. The rank 0 is the member with the lowest score (oldest tweet); `-(800+1)` is the 801st from the right. Everything older than the 800th most recent tweet is removed. This runs atomically within the same Redis pipeline as the ZADD, adding negligible overhead (O(log N) for the trim vs. O(log N) for the insert).
+
+The `EXPIRE 259200` call (72 hours) is issued conditionally: only if the ZADD created the key (return value 1 from ZADD). If the key already existed, the TTL is already set from a previous fan-out operation and should not be reset — resetting it on every ZADD would prevent inactive user keys from ever expiring, bloating memory. In the Lettuce pipeline implementation, this conditionality is handled by checking the ZADD pipeline response before issuing the EXPIRE command.
+
+The 800-entry cap is a product decision backed by data. Twitter's internal research (disclosed in the 2013 "Timelines at Scale" blog post) found that fewer than 0.5% of timeline requests fetch beyond page 4 at 20 items per page — that is, beyond 80 entries. The cap of 800 provides 40 pages of content, which covers the 99.5th percentile of user behavior with a factor-of-10 margin. Increasing the cap to 8,000 would cost 10× the Redis memory with zero user-visible benefit.
+
+Cold-start for inactive users (TTL expired) is the main edge case. When a user who has been away for more than 72 hours loads their timeline, the Redis key does not exist. The timeline service falls back to a synchronous social graph reconstruction: query `social_graph` for all followees, fetch the last 800 tweets per followee from the Tweet Cache (capped to 10 per followee to bound cost), merge-sort by timestamp, write the result to the user's ZSET, and return the first page. This path has higher latency (300–800 ms vs. 5 ms for a cache hit) but affects only a small fraction of requests. The cold-start response is still returned to the user immediately; the ZSET is populated in the background for subsequent reads.
+
+### Celebrity timeline merge at read-time
+
+When a user follows one or more celebrity accounts, their timeline GET must combine two data sources: the pre-computed ZSET (containing non-celebrity tweets) and fresh celebrity tweets fetched from the Tweet Cache.
+
+The read path looks like this. The timeline service reads the user's `user:{userId}` Redis Hash, which includes a `celebrity_following` field — a comma-separated list of celebrity user IDs the user follows. This list is maintained by the Follow Service whenever a follow/unfollow event involves a celebrity account. The timeline service then:
+
+1. Issues `ZREVRANGEBYSCORE timeline:{userId}` to get non-celebrity tweet IDs with timestamps (one Redis round-trip)
+2. For each celebrity in `celebrity_following`, issues `ZREVRANGEBYSCORE tweet-author:{celebrityId} +inf -inf LIMIT 0 50` to get that celebrity's last 50 tweet IDs (one round-trip per celebrity, but these are pipelined)
+3. Fetches tweet content for all IDs in parallel from the Tweet Cache (`GET tweet:{tweetId}`) — the Tweet Cache is a Redis String store holding serialized tweet JSON, with a hot-key replication strategy for celebrities
+4. Performs an in-memory merge sort by timestamp, applies mute filters, skips any `is_deleted = true` entries, and trims to the requested page size
+
+The `tweet-author:{celebrityId}` ZSET is a dedicated per-celebrity sorted set maintained by the fan-out consumer: even though celebrity tweets are not fan-out-written to follower timelines, the tweet ID is still indexed here for read-path access. This ZSET is capped at 800 entries and has no TTL (celebrity tweets must always be accessible). The Tweet Cache entries for celebrity tweets are pre-warmed and refreshed on every celebrity tweet event, and held with a long TTL (24 h) because celebrity content is extremely hot.
+
+An alternative implementation is Redis `ZUNIONSTORE`: merge the user's timeline ZSET with each celebrity's tweet ZSET into a temporary ZSET, then ZREVRANGE the result. `ZUNIONSTORE` is simpler to implement but has a critical problem: it blocks the Redis connection for the duration of the union computation, which for a user following 10 celebrities with 800-entry ZSETs each is a non-trivial Redis-side computation. At high concurrency, this can cause Redis CPU saturation and tail latency spikes. The in-process merge sort — client fetches the raw IDs and merges in application memory — distributes the computation across timeline service instances and is preferable at Twitter's request rate.
+
+### Consistency on delete and unfollow
+
+Deletes and unfollows are less frequent than reads or tweet creates, but their consistency properties are critical for user trust. A user who deletes a tweet must not see that tweet in their followers' timelines.
+
+**Tweet deletion** follows a lazy consistency model. When `DELETE /v1/tweets/{tweetId}` is called, the system immediately sets `is_deleted = 1` in the MySQL tweets table (synchronous, transactional) and publishes a tombstone event to the `tweet-deleted` Kafka topic. The fan-out consumer receives the tombstone and issues `ZREM timeline:{followerId} {tweetId}` for each follower's ZSET — the same fan-out mechanism as tweet creation, in reverse. For non-celebrity accounts, this ZREM fan-out completes within 5 s. For celebrity accounts (if a celebrity deletes a tweet), the ZREM fan-out is omitted — instead, the tweet's `is_deleted` flag in the Tweet Cache is updated immediately, and the timeline renderer skips it during content hydration. This is the correct trade-off: a celebrity deletion triggering 100 M ZREM operations would create a thundering herd on Redis; relying on `is_deleted` at render time achieves the same user-visible result with zero fan-out cost.
+
+**Unfollows** are more nuanced. When user A unfollows user B, B's future tweets must not appear in A's timeline. B's past tweets in A's ZSET can remain until TTL expiry — this is explicitly acceptable by product (users rarely go back to check whether an unfollowed account's old tweets have disappeared). The implementation is therefore: on unfollow, do not issue any ZREM operations against A's timeline. Instead, update the `social_graph` table to remove `(A, B)` and update `user:{A}.celebrity_following` in Redis if B is a celebrity. Going forward, the fan-out consumer will not include A in B's fan-out list (the `social_graph` scatter-gather reflects the unfollow), and the timeline renderer will not include B in the celebrity merge (the `celebrity_following` list no longer contains B). The cost of issuing ZREM for all of B's tweets in A's ZSET would require scanning A's ZSET for B's author IDs and then deleting them — O(ZSET size × author lookup) per unfollow. At Twitter's scale, with millions of unfollows per day, this is prohibitively expensive for zero immediate user-visible benefit.
+
+The practical implication: after an unfollow, the unfollowed user's tweets may linger in the unfollower's Redis ZSET for up to 72 hours (the TTL). If the unfollower loads their timeline during that window, the timeline renderer will attempt to hydrate the ex-follower's tweet IDs and include them in the response. This is the one subtle correctness issue. The correct fix is to embed `author_id` in the ZSET member value (e.g., store `"{authorId}:{tweetId}"` as the ZSET member string), so the renderer can filter out authors not in the user's current follow list before hydrating. This adds a `O(follow-list lookup)` step at render time but eliminates stale unfollow content without any fan-out ZREM cost.
+
+## Java integration
+
+### Part A — TimelineFanoutService.java
+
+```java
+package dev.pushkar.timeline;
+
+import io.lettuce.core.RedisFuture;
+import io.lettuce.core.api.async.RedisAsyncCommands;
+import io.lettuce.core.api.StatefulRedisConnection;
+import io.lettuce.core.cluster.api.async.RedisClusterAsyncCommands;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+@Service
+public class TimelineFanoutService {
+
+    private static final Logger log = LoggerFactory.getLogger(TimelineFanoutService.class);
+
+    static final long   CELEBRITY_THRESHOLD = 1_000_000L;
+    static final int    TIMELINE_CAP        = 800;
+    static final long   TTL_SECONDS         = 259_200L;
+    static final int    PIPELINE_BATCH_SIZE = 500;
+
+    private final StatefulRedisConnection<String, String> redisConnection;
+    private final UserMetadataService                     userMeta;
+
+    public TimelineFanoutService(StatefulRedisConnection<String, String> redisConnection,
+                                 UserMetadataService userMeta) {
+        this.redisConnection = redisConnection;
+        this.userMeta        = userMeta;
+    }
+
+    public void fanOutTweet(long tweetId, long authorId,
+                            long timestampMs, List<Long> followerIds) {
+        long followerCount = userMeta.getFollowerCount(authorId);
+        if (followerCount >= CELEBRITY_THRESHOLD) {
+            log.debug("Skipping fan-out for celebrity author {} ({} followers)",
+                      authorId, followerCount);
+            return;
+        }
+
+        String member = String.valueOf(tweetId);
+        String timelineKeyPrefix = "timeline:";
+        RedisAsyncCommands<String, String> async = redisConnection.async();
+
+        List<List<Long>> batches = partition(followerIds, PIPELINE_BATCH_SIZE);
+        for (List<Long> batch : batches) {
+            async.setAutoFlushCommands(false);
+            List<RedisFuture<Long>> zaddFutures = new ArrayList<>(batch.size());
+
+            for (long followerId : batch) {
+                String key = timelineKeyPrefix + followerId;
+                RedisFuture<Long> zadd = async.zadd(key, (double) timestampMs, member);
+                zaddFutures.add(zadd);
+                async.zremrangebyrank(key, 0, -(TIMELINE_CAP + 1));
+            }
+            async.flushCommands();
+
+            for (int i = 0; i < batch.size(); i++) {
+                try {
+                    Long added = zaddFutures.get(i).get(2, TimeUnit.SECONDS);
+                    if (added != null && added == 1L) {
+                        String key = timelineKeyPrefix + batch.get(i);
+                        async.expire(key, TTL_SECONDS);
+                    }
+                } catch (Exception e) {
+                    log.warn("ZADD failed for follower {}: {}", batch.get(i), e.getMessage());
+                }
+            }
+            async.setAutoFlushCommands(true);
+        }
+    }
+
+    private <T> List<List<T>> partition(List<T> list, int size) {
+        List<List<T>> result = new ArrayList<>();
+        for (int i = 0; i < list.size(); i += size) {
+            result.add(list.subList(i, Math.min(i + size, list.size())));
+        }
+        return result;
+    }
+}
+```
+
+### Part B — TimelineController.java
+
+```java
+package dev.pushkar.timeline;
+
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ZSetOperations;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+@RestController
+@RequestMapping("/v1")
+public class TimelineController {
+
+    private final StringRedisTemplate    redisTemplate;
+    private final TweetCacheService      tweetCache;
+    private final UserMetadataService    userMeta;
+
+    public TimelineController(StringRedisTemplate redisTemplate,
+                              TweetCacheService tweetCache,
+                              UserMetadataService userMeta) {
+        this.redisTemplate = redisTemplate;
+        this.tweetCache    = tweetCache;
+        this.userMeta      = userMeta;
+    }
+
+    @GetMapping("/timeline")
+    public ResponseEntity<PagedTimelineResponse> getTimeline(
+            @AuthenticationPrincipal JwtPrincipal principal,
+            @RequestParam(defaultValue = "0")   long cursor,
+            @RequestParam(defaultValue = "20")  int  count) {
+
+        long userId = principal.getUserId();
+        String timelineKey = "timeline:" + userId;
+
+        long upperBound = cursor > 0 ? cursor - 1 : Long.MAX_VALUE;
+        Set<ZSetOperations.TypedTuple<String>> zsetEntries =
+            redisTemplate.opsForZSet()
+                .reverseRangeByScoreWithScores(timelineKey,
+                    Double.NEGATIVE_INFINITY, (double) upperBound,
+                    0, count * 2L);
+
+        List<ScoredTweetId> candidates = new ArrayList<>();
+        if (zsetEntries != null) {
+            for (ZSetOperations.TypedTuple<String> t : zsetEntries) {
+                candidates.add(new ScoredTweetId(t.getValue(),
+                    t.getScore().longValue()));
+            }
+        }
+
+        List<Long> followedCelebrities = userMeta.getFollowedCelebrities(userId);
+        for (long celebId : followedCelebrities) {
+            List<ScoredTweetId> celebTweets = tweetCache.getRecentByAuthor(celebId, 50);
+            candidates.addAll(celebTweets);
+        }
+
+        candidates.sort((a, b) -> Long.compare(b.score(), a.score()));
+
+        List<TweetDto> hydrated = tweetCache.hydrate(
+            candidates.stream().map(ScoredTweetId::tweetId).collect(Collectors.toList())
+        ).stream()
+            .filter(t -> !t.isDeleted())
+            .limit(count)
+            .collect(Collectors.toList());
+
+        long nextCursor = hydrated.isEmpty() ? 0L :
+            hydrated.get(hydrated.size() - 1).createdAtMs();
+
+        return ResponseEntity.ok(new PagedTimelineResponse(hydrated, nextCursor,
+            hydrated.size() == count));
+    }
+}
+```
+
+The controller intentionally fetches `count * 2` entries from the ZSET to account for deleted tweet filtering — if up to half the fetched IDs resolve to deleted tweets, the rendered page still fills to `count` items without a second Redis round-trip. The cursor is timestamp-based, making pagination stateless and safe to resume after pod restarts or Redis failovers.
+
+<TradeoffTable title="Fan-out strategy comparison">
+
+| Approach | Write Amplification | Read Latency | Staleness | Best For |
+|---|---|---|---|---|
+| **Fan-out-on-write only** | O(followers) per tweet — 200 ZADD/tweet avg, 100M ZADD for celebrities | O(1) ZREVRANGE — 5 ms p99 | Up to 5 s fan-out lag (async) | Accounts under 1 M followers; dominant case at Twitter |
+| **Fan-out-on-read only** | O(1) — just write to tweets table | O(following-count × tweets-scanned) — 200–5000 ms for power users | Zero staleness — always fresh | Small-scale systems, niche social apps with bounded follow graphs |
+| **Hybrid threshold** | O(followers) for non-celebrities; O(1) for celebrities | O(1) ZSET + O(celeb-count × recent-tweets) merge — 20–80 ms p99 | 5 s for non-celeb; near-zero for celeb (read-path) | Large-scale social platforms with heavy follower distribution skew |
+| **Async Kafka fan-out** | Same O(followers) amplification, but decoupled — fan-out is not on the tweet-creation critical path | Same O(1) read if ZSET populated; graceful degradation if Kafka lags | 0–30 s depending on Kafka consumer lag | Production correctness — Kafka provides durability and replay; mandatory for at-scale deployments |
+
+</TradeoffTable>
+
+<Pitfall title="Writing celebrity tweets to all follower timelines creates a fan-out storm">
+
+Imagine Beyoncé (100 M followers) posts a tweet. If the fan-out consumer treats her account like any other and issues ZADD to all 100 M follower ZSETs, you are generating 100 M Redis write operations in a burst. At 1 M ZADD/s throughput, that fan-out takes 100 seconds — 20× over your 5 s SLA. Worse, the ZADD storm competes with all other fan-out work in the cluster, raising tail latency for every other user's timeline updates. A single celebrity tweet can saturate your entire Redis Cluster write capacity.
+
+The fix is the celebrity threshold check. The fan-out consumer reads `is_celebrity` from the user's Redis Hash before issuing any ZADDs. If the flag is set, the consumer indexes the tweet in the `tweet-author:{celebId}` ZSET (a per-celebrity store that is trivially cheap — one ZADD, not 100 M) and returns immediately. The 100 M reads that subsequently fetch this celebrity's tweet do so via the read-path merge, distributing the cost across many timeline reads over many seconds rather than concentrating it in a 100-second burst of Redis writes. The key insight: fan-out storms are a write-side problem; the read-path merge amortizes the cost across the demand curve.
+
+</Pitfall>
+
+<Pitfall title="Cache stampede after Redis failover when millions of users request cold-start timelines simultaneously">
+
+Redis Cluster failover takes 15–30 seconds — the time for a Sentinel or Cluster leader election to complete. During that window, no timeline reads or writes are served from cache. When the cluster comes back, all 120 M active users who load their timeline in the first minute after recovery find their ZSET key missing (TTL-based eviction does not happen, but a full failover with data loss would produce the same effect if AOF persistence is not configured). The cold-start path — synchronous social graph reconstruction — is triggered for all of them simultaneously. This is a thundering herd of O(120M) scatter-gather queries against the MySQL social graph shards, and it will take those shards down within seconds.
+
+The mitigations operate at multiple levels. First, enable Redis AOF persistence with `appendfsync everysec` so data survives restarts — a replica promotion does not lose ZSET data. Second, use a probabilistic early expiration strategy (Redis's built-in `OBJECT IDLETIME` combined with a background job that proactively refreshes ZSETs for users who are actively online, detected via WebSocket heartbeats). Third, add a rate limiter on the cold-start path: limit cold-start reconstructions to 10,000 per second cluster-wide, queuing excess requests with a short delay. Fourth, serve stale-while-revalidate responses: if a ZSET key is missing, return the user's last known timeline page from a secondary persistent store (Cassandra or DynamoDB) while rebuilding the ZSET in the background. The user sees their old timeline instantly; the fresh ZSET arrives in seconds.
+
+</Pitfall>
+
+<Curveball question="A celebrity account gains 50 M followers in 1 hour — how do you detect the threshold breach and sync the fan-out strategy without dropping tweets posted during the transition?">
+
+This is a temporal consistency problem disguised as a scaling problem. The key constraint is that tweets posted during the transition — when the account's follower count is rising through the 1 M threshold — must appear in all follower timelines regardless of which fan-out strategy was active at tweet creation time.
+
+The detection mechanism: a background sync job runs every 60 seconds, querying `SELECT user_id, follower_count FROM users WHERE follower_count > 900000 AND is_celebrity = 0` (accounts approaching the threshold). When an account's `follower_count` crosses 1 M, the job sets `is_celebrity = 1` in both MySQL and the `user:{userId}` Redis Hash. The 60-second polling interval means up to 60 seconds of transitional tweets fan out via the write path before the flag flips.
+
+The transition is safe because write fan-out and read-path merge are additive, not mutually exclusive. Tweets fan-out-written before the flag flip are in follower ZSETs. Tweets posted after the flag flip are in the `tweet-author:{celebId}` ZSET. At read time, the timeline renderer always merges both sources: the user's own ZSET (containing pre-flip fan-out tweets) and the `tweet-author:{celebId}` ZSET (containing post-flip celebrity tweets). There is no gap. The only risk is duplicate display — a tweet that was fan-out-written to a follower's ZSET before the flip may also appear in the `tweet-author:{celebId}` ZSET query at read time. Deduplication is handled by building a `Set<String>` of tweet IDs during the read-path merge and skipping duplicates before hydration.
+
+</Curveball>
+
+<Curveball question="A user follows 5,000 accounts including 200 celebrities — design the merge strategy so p99 timeline read stays under 100 ms">
+
+Five thousand follows is at the extreme tail of the follow-count distribution but is a real use case (power users, journalists, developers using the API). The challenge is that 200 celebrity merge operations — even if pipelined — add significant latency if done naively.
+
+The naive approach: for each of the 200 celebrities, issue a `ZREVRANGEBYSCORE tweet-author:{celebId}` command. Even with Redis pipelining (all 200 commands in a single round-trip), parsing 200 × 50 = 10,000 tweet ID entries adds 5–10 ms of deserialization time and creates a large response payload. Adding 10,000 ZSET members to the merge candidates list plus their hydration adds another 20–40 ms. You are at 30–50 ms just for celebrity merge before hydration.
+
+The optimized approach has three components. First, cap celebrity merge at 10 tweets per celebrity (not 50) — users rarely need more than the last 10 tweets from any single account to fill a page. 200 celebrities × 10 tweets = 2,000 candidates, 5× fewer than the naive approach. Second, maintain a pre-merged `celebrity-timeline:{userId}` ZSET that is kept current by a dedicated celebrity fan-out worker. When user A follows celebrity B, the worker pre-populates B's recent tweets into the `celebrity-timeline:{userId}` ZSET. On every new celebrity tweet, the worker ZADD's it to all followers' celebrity-timeline ZSETs — but this is a bounded operation because celebrity timelines are capped at 200 × 10 = 2,000 entries and the celebrity tweet rate is orders of magnitude lower than the total tweet rate. Third, the timeline read now fetches two ZSETs — the user's non-celebrity ZSET and the pre-merged celebrity ZSET — merges in memory, hydrates, and returns. Two ZREVRANGEBYSCORE calls in a pipeline is effectively O(1) regardless of how many celebrities the user follows. p99 latency target of 100 ms is comfortably met.
+
+</Curveball>
+
+<Curveball question="Your fan-out Kafka consumer falls 2 hours behind during a US election night event — what is your backpressure and catch-up strategy?">
+
+A 2-hour Kafka consumer lag means that tweet fan-out is 2 hours behind real time. Users who load their timeline see tweets that are 2 hours stale. This is a P1 incident, but the approach must prioritize correctness and controlled recovery over brute-force speed.
+
+First, diagnose the cause of lag. Is it a throughput problem (tweet volume exceeding consumer processing capacity) or a latency problem (Redis ZADD latency spiking, individual ZADD operations taking longer than usual)? Check two metrics: `kafka_consumer_group_lag` per partition and Redis `SLOWLOG` for commands exceeding 5 ms. On election night, both are likely elevated simultaneously — tweet volume is 3–5× normal, and Redis write latency is up due to sustained high throughput.
+
+For backpressure during the lag period: add a circuit breaker in the fan-out consumer that drops fan-out for non-celebrity tweets from accounts with fewer than 1,000 followers. These are low-reach accounts whose followers are unlikely to notice a 2-hour delay. This reduces per-tweet ZADD operations by roughly 60% (most accounts have under 1,000 followers) and lets the consumer focus capacity on higher-reach accounts. This is a graceful degradation, not a correctness violation — the dropped tweets will be served via cold-start ZSET reconstruction when affected users next load their timeline.
+
+For catch-up: increase the Kafka consumer group from, say, 12 to 48 instances temporarily. Kafka's consumer group rebalancing takes 30–60 seconds — tolerable. With 48 consumers × 4× throughput each (from reduced ZADD batch overhead), the consumer group processes at 16× normal rate and closes a 2-hour lag in roughly 8 minutes. After the event, scale back to 12 instances. The critical operational requirement is that the catch-up not create a Redis write storm that further destabilizes the cluster — rate-limit each consumer instance to a maximum of 50,000 ZADD operations per second and rely on horizontal scaling for aggregate throughput rather than per-instance burst.
+
+Long-term: pre-provision consumer instances for known high-traffic events (elections, Super Bowl, product launches). Twitter maintained a runbook for scaling Kafka consumer fleets proactively before events known to drive tweet volume spikes. The 2-hour lag scenario is a failure of capacity planning, not an architectural flaw — the system design is correct, the operational preparation was insufficient.
+
+</Curveball>
+
+## Further reading
+
+- Twitter Engineering Blog: "Timelines at Scale" (2013) — the primary public reference for Twitter's fan-out architecture, covering the push/pull hybrid model, the celebrity threshold, and the Redis ZSET timeline cache design; many of the specific numbers in this article originate from that post
+- "The Architecture Twitter Uses to Deal with 150M Active Users" — InfoQ interview with Twitter's infrastructure team (2012) covering the transition from pull-model timeline assembly to push-model fan-out; useful historical context for understanding why the hybrid approach was chosen
+- Redis Sorted Set documentation at redis.io/docs/data-types/sorted-sets — official reference for ZADD, ZREVRANGE, ZREVRANGEBYSCORE, ZREMRANGEBYRANK, and ZUNIONSTORE operations; the ZADD option flags (NX, XX, GT, LT) and the WITHSCORES modifier are particularly relevant for the timeline cache implementation
+- Bluesky's AT Protocol technical overview — Bluesky's federated social graph implementation faces similar fan-out challenges at smaller scale; their public architecture documentation covers how they handle timeline assembly differently from centralized approaches, and provides useful comparative perspective on the trade-offs
+
+<RelatedQuestions items={[
+  { slug: "instagram", title: "Design Instagram's Feed", difficulty: "senior" },
+  { slug: "facebook-news-feed", title: "Design Facebook News Feed", difficulty: "senior" },
+  { slug: "discord", title: "Design Discord's Messaging System", difficulty: "senior" },
+]} />

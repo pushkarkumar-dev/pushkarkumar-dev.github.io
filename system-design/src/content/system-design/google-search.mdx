@@ -1,0 +1,540 @@
+---
+title: "Design Google Search"
+slug: "google-search"
+category: "search-maps"
+difficulty: "staff"
+estimatedReadMinutes: 27
+tags: ["inverted-index", "bm25", "distributed-query", "pagerank", "sharding", "index-serving", "query-rewriting"]
+companyFlavors: ["Google", "Bing", "Elasticsearch", "Solr", "Meilisearch"]
+prerequisites: ["web-crawler", "consistent-hashing"]
+relatedQuestions: ["typeahead-autocomplete", "google-maps", "web-crawler"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Design a web-scale search engine covering the full pipeline: crawling and indexing billions of documents with an inverted index, scoring with BM25 + PageRank, distributed query execution across thousands of index servers, and real-time index updates for freshness."
+javaPackages: ["org.apache.lucene:lucene-core:9.10.0", "org.springframework.boot:spring-boot-starter:3.3.0", "redis.clients:jedis:5.1.3"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="google-search" title="Design Google Search" />
+
+<Tldr>
+- **Inverted index**: for each term, store a posting list — a sorted list of docIds that contain the term. A query for "distributed systems" intersects the posting lists for "distributed" AND "systems" → O(n) where n is the length of the smaller posting list. This is the core data structure of every search engine, from Lucene to Google.
+- **BM25 relevance scoring**: improves on TF-IDF by adding document length normalization. A high-frequency term in a short document scores higher than the same term in a long document. Google adds hundreds of additional signals on top of BM25 — PageRank, freshness, click-through rate, user intent — but BM25 is the text-relevance foundation.
+- **Distributed query execution**: split the index across N shards via document partitioning. A query fans out to all shards in parallel (scatter), each shard returns its local top-K results, and the root server merges and re-ranks globally (gather). N is in the thousands for web-scale search, meaning a single query triggers thousands of sub-queries simultaneously.
+- **Two-tier freshness**: maintaining a single massive index that is simultaneously comprehensive and up-to-date is physically impossible at web scale. The solution is two tiers — a large base index (weeks-old, high recall) and a small fresh index (hours-old, low recall). Every query hits both; results are merged with a freshness boost for the fresh tier.
+- **PageRank**: computed offline, iteratively. A page's rank equals the sum of (rank of each page linking to it / that page's outbound link count). The iteration converges in approximately 50 passes over the web graph. PageRank is a prior — a measure of a page's global authority — layered with text relevance scores at query time rather than computed on the fly.
+</Tldr>
+
+## The scale of the problem
+
+Google indexes approximately 130 billion web pages and serves 8.5 billion search queries per day — roughly 98,000 queries per second at peak, with a hard user-facing latency target of under 200 milliseconds end to end. These two numbers, taken together, define a design constraint that does not exist anywhere else in software engineering. You must search a petabyte-scale inverted index and return ranked results, globally, in under the time it takes a human to blink.
+
+A relational database query compares: given a table of 100 billion rows, a `SELECT` with a full-table scan would take hours even on the fastest hardware. An indexed lookup using a B-tree works for point queries and range queries on ordered keys, but text search — finding all documents containing the word "distributed" AND the word "systems" — does not map to B-tree semantics. The number of potential matching documents for a single common word can be billions. The query planner cannot skip to a pre-sorted answer; it must read posting lists, intersect them, and score survivors. This is fundamentally a different computational shape than the queries databases are optimized for.
+
+The freshness requirement adds a second dimension of impossibility. At web scale, pages are created, modified, and deleted at millions per hour. A batch-built index that was accurate last Tuesday is stale by Wednesday morning for any query about current events. Yet rebuilding a petabyte-scale index from scratch takes days of MapReduce-style computation. The production solution — a two-tier architecture combining a large base index with a continuously refreshed fresh index — is an engineering compromise that trades some recall accuracy for achievable freshness SLAs. Understanding why this compromise is necessary, and exactly where it breaks, is what separates a senior from a staff-level answer.
+
+## Clarifying questions
+
+Before committing to any architectural choices, establish the constraints that collapse the design space. The answers to these questions change the architecture substantially.
+
+| Question | Ideal answer to probe for | Why it changes the design |
+|---|---|---|
+| Web search or domain-specific (e-commerce, code search, internal docs)? | Web search across the open internet | Web search requires crawling infrastructure, link-graph analysis for PageRank, and adversarial spam filtering — none of which domain-specific search requires |
+| Expected index size in pages or documents? | 100 billion pages at web scale; single-tenant enterprise search might be 100 million documents | Determines sharding strategy, total storage, and whether a single Lucene node is viable |
+| Query latency target at p99? | Under 200ms end-to-end for web search | Drives the scatter-gather fan-out limit, hedged request timeout thresholds, and caching strategy |
+| Freshness requirement — how quickly must index updates be visible? | Under 4 hours for top-ranked pages; under 1 week for long-tail pages | Determines whether a single-tier batch index suffices or whether a two-tier base+fresh architecture is required |
+| What ranking signals matter beyond text relevance? | PageRank (link authority), click-through rate, freshness, user location, query intent | Each additional signal requires its own offline computation pipeline and integration point in the ranking stack |
+| Multilingual support required? | Yes — queries and documents in 100+ languages | Requires per-language tokenization and stemming, language detection at index time, and either language-segmented indexes or language-tagged posting lists |
+| Personalization — should results differ per user? | Yes for logged-in users (query history, location, language preference) | Adds a personalization layer at re-ranking time; raw index results remain the same, but final order is user-specific |
+| Index update model — real-time ingest or batch? | Batch rebuilds supplemented by near-real-time fresh index | Fully real-time inverted index updates at web scale require distributed write coordination that is architecturally expensive; batch + delta is the standard production pattern |
+
+## Functional requirements
+
+- Accept keyword queries and return a ranked list of results (URL, title, snippet)
+- Support phrase queries ("machine learning"), boolean operators (`site:example.com`), and field filters (date range, language, domain)
+- Index crawled web pages at scale — tokenize, stem, build inverted index, compute link graph
+- Score results using text relevance (BM25) combined with link authority (PageRank) and additional signals
+- Provide query autocomplete and spelling correction (spell-check before executing the query)
+- Support pagination (start offset parameter) for deep result pages
+- Serve freshly crawled pages within 4 hours of crawl for top-ranked domains
+
+## Non-functional requirements
+
+- **Index scale**: 100 billion pages indexed, petabyte-scale raw storage
+- **Query throughput**: 98,000 queries/second sustained
+- **Query latency**: p99 under 200ms end-to-end, measured at the user-facing load balancer
+- **Availability**: 99.99% — four nines translates to under 52 minutes of downtime per year; no single component can be a SPOF
+- **Index freshness**: top 10 million pages (by PageRank) updated within 4 hours of crawl; long-tail pages within 1 week
+- **Consistency**: eventual — a newly crawled page need not be visible immediately; short staleness windows are acceptable
+- **Spam resistance**: the ranking pipeline must detect and demote keyword-stuffing, link farms, and cloaked content without manual review of individual pages
+
+## Capacity estimation
+
+<Capacity>
+
+**Index storage:**
+
+100 billion pages, each with approximately 1,000 distinct indexed terms, and each posting list entry requiring 8 bytes (4-byte docId + 2-byte term frequency + 2-byte position metadata):
+
+$$100 \times 10^9 \text{ pages} \times 1{,}000 \text{ terms/page} \times 8 \text{ bytes} = 800 \text{ TB raw posting data}$$
+
+Delta encoding (storing differences between successive docIds rather than absolute values) combined with variable-length integer compression yields approximately $4\times$ compression:
+
+$$800 \text{ TB} \div 4 = \approx 200 \text{ TB compressed posting lists}$$
+
+Forward index (URL, title, PageRank score, fetchedAt, language, wordCount per document): roughly 512 bytes per document:
+
+$$100 \times 10^9 \times 512 \text{ bytes} = 50 \text{ TB forward index}$$
+
+**Sharding:**
+
+With 1,000 index shards (document-partitioned by docId hash):
+
+$$100 \times 10^9 \text{ docs} \div 1{,}000 \text{ shards} = 100 \text{ million docs/shard}$$
+
+Each shard's compressed posting index: $200 \text{ TB} \div 1{,}000 = 200 \text{ GB}$ — fits on a single NVMe SSD with room to spare.
+
+**Query fan-out:**
+
+$$98{,}000 \text{ queries/sec} \times 1{,}000 \text{ shards} = 98 \text{ million shard-queries/sec globally}$$
+
+Each index server handles ~100,000 shard-queries/sec — achievable with in-memory posting list caching for hot terms.
+
+**PageRank storage:**
+
+$$100 \times 10^9 \text{ pages} \times 8 \text{ bytes/rank score} = 800 \text{ GB}$$
+
+Computed offline weekly via distributed graph processing; stored in a flat file loaded into each index server's memory at startup.
+
+**Link graph:**
+
+$$100 \times 10^9 \text{ pages} \times 25 \text{ outbound links/page avg} \times 8 \text{ bytes/edge} = 20 \text{ TB}$$
+
+Stored in distributed object storage; processed with MapReduce for PageRank iteration, not queried at runtime.
+
+</Capacity>
+
+## API design
+
+The external-facing search API is deceptively simple. The complexity lives entirely in the serving infrastructure behind it.
+
+```
+GET /search?q=<query>&lang=en&num=10&start=0
+```
+
+Response:
+```json
+{
+  "results": [
+    {
+      "url": "https://example.com/article",
+      "title": "Distributed Systems: Principles and Paradigms",
+      "snippet": "...covers <em>distributed systems</em> patterns including consensus, replication...",
+      "score": 0.94,
+      "fetchedAt": "2026-05-06T14:30:00Z"
+    }
+  ],
+  "totalHits": 4200000,
+  "suggestedQuery": "distributed systems book",
+  "spellCorrection": null,
+  "queryTimeMs": 87
+}
+```
+
+Internal indexing pipeline APIs (not user-facing):
+
+```
+POST /index
+Body: { url, title, body, outboundLinks[], fetchedAt, language, contentHash }
+Response: { docId, shardId, status: "queued" }
+```
+
+```
+GET /suggest?q=<prefix>&lang=en&limit=10
+Response: { suggestions: ["distributed systems", "distributed tracing", "distributed database"] }
+```
+
+```
+POST /index/delete
+Body: { url }
+Response: { status: "deindex_queued" }
+```
+
+The `q` parameter is the raw user query string — query processing (spell correction, stemming, boolean rewriting) happens server-side in the query processor layer before the query ever reaches an index shard. The `start` parameter enables pagination: `start=10` returns results 11–20. Deep pagination (start > 1000) is rate-limited because it requires the scatter-gather layer to collect and sort proportionally more results from every shard.
+
+## Data model
+
+**Inverted index** — the core data structure:
+
+```
+term → PostingList
+PostingList = [ {docId: u32, termFreq: u16, positions: u32[]}, ... ]
+```
+
+Sorted ascending by docId within each posting list to enable merge-intersection. Delta-encoded and compressed using variable-length integers before storage. The positions array enables phrase queries ("distributed systems" requires "distributed" and "systems" to appear adjacent).
+
+**Forward index** (document store, used for snippet generation and re-ranking):
+
+```
+docId → {
+  url: string,
+  title: string,
+  pageRank: float32,
+  fetchedAt: epoch_ms,
+  language: string,
+  domain: string,
+  wordCount: u32,
+  contentHash: u64   // for deduplication and change detection
+}
+```
+
+**Link graph** (used for offline PageRank computation, not queried at runtime):
+
+```
+{ fromDocId: u64, toDocId: u64 }  -- stored as sorted adjacency lists
+```
+
+Stored in distributed object storage (e.g., GCS or S3), partitioned by fromDocId. Processed weekly by a distributed graph processing job (Pregel-style or MapReduce). The output — a flat `{docId → pageRank}` file — is distributed to all index servers and loaded into memory.
+
+**Query log** (used for click-through signal computation and autocomplete training):
+
+```
+{
+  queryHash: u64,
+  userId: string (anonymized),
+  timestamp: epoch_ms,
+  clickedDocId: u64,
+  clickedRank: u8,
+  sessionId: string
+}
+```
+
+Written to a Kafka topic; consumed by an offline pipeline that aggregates click-through rates per (query, docId) pair. The resulting click signal is merged with BM25 + PageRank at re-ranking time. Critically, this data is never read at query time — it is pre-computed into per-document click scores and distributed to index servers in batch.
+
+## High-level architecture
+
+<Mermaid>
+```
+graph TB
+  Query[User Query] --> LB[Load Balancer]
+  LB --> QP[Query Processor\nSpell check · Rewrite · NLP · Language detect]
+  QP --> Scatter[Scatter Layer\nFan-out to N=1000 shards]
+  Scatter --> IS1[Index Shard 1\nBM25 score · top-K local]
+  Scatter --> IS2[Index Shard 2\nBM25 score · top-K local]
+  Scatter --> ISN[Index Shard N\nBM25 score · top-K local]
+  IS1 --> Gather[Result Merger\nGlobal re-rank: BM25 + PageRank + freshness]
+  IS2 --> Gather
+  ISN --> Gather
+  Gather --> Snippets[Snippet Generator\nHighlight query terms · extract context window]
+  Snippets --> Response[Ranked Results]
+
+  Crawler[Web Crawler] --> Parser[HTML Parser\nLink extractor · language detect]
+  Parser --> Indexer[Indexer\nTokenize · stem · build posting lists]
+  Indexer --> IndexShards[Index Shards\nDocument-partitioned · 200GB each]
+  Indexer --> FreshIndex[Fresh Index\nRebuilt every 4 hours]
+  FreshIndex --> Gather
+
+  PRJob[PageRank Job\nWeekly MapReduce] --> PRStore[PageRank Scores\nDistributed to all shards at startup]
+  PRStore --> IS1
+  PRStore --> IS2
+  PRStore --> ISN
+```
+</Mermaid>
+
+The two independent paths — the query-serving path (top half) and the indexing pipeline (bottom half) — are fully decoupled. The indexing pipeline writes to index shards asynchronously; the serving path reads from them. This decoupling is what allows index updates (including shard rebuilds) to happen without taking the search service offline.
+
+## Deep dives
+
+### Inverted index construction
+
+Building an inverted index for 100 billion documents is a multi-stage offline pipeline, not a single pass. The stages are:
+
+**Tokenization and normalization.** The raw HTML body is stripped of markup, then split into tokens on whitespace and punctuation boundaries. Case folding converts everything to lowercase. Stop words ("the", "a", "of") are removed — they appear in virtually every document, their posting lists would be enormous, and they carry no discriminative signal. Stemming reduces morphological variants to a common root: Porter algorithm maps "running", "runs", "ran" → "run". Stemming is a tradeoff — it improves recall (a search for "running" finds documents containing "ran") at the cost of precision (a search for "running" now also matches a document only about "run" as a verb in a different sense).
+
+**In-memory segment construction.** Each indexer worker builds an in-memory hash map: `term → [(docId, termFreq, positions[])]`. When the segment reaches a memory threshold (e.g., 512 MB), it is sorted by term and flushed to a sorted segment file on disk. This is identical to the memtable-to-SSTable flush in an LSM tree.
+
+**Merge-sort.** Multiple segment files for the same shard are merge-sorted into a single posting list file — a sorted sequence of `(term, postingList)` pairs. The merge is a standard k-way merge: maintain a min-heap of (current term, file pointer) tuples, always pop the minimum term, write out its merged posting list, and advance the relevant file pointer.
+
+**Delta encoding.** After merge, absolute docIds within each posting list are replaced with deltas: `[1, 100, 200, 350]` becomes `[1, 99, 100, 150]`. Small deltas compress well with variable-length integers — most deltas between consecutive docIds in a term's posting list fit in 1–2 bytes. This reduces posting list storage by approximately 4×.
+
+**WAND and skip lists.** For queries involving common terms, naive posting list intersection reads billions of entries. Block-max WAND (Weak AND) is an optimization: each posting list is divided into blocks, and each block stores the maximum BM25 score achievable for any document in that block. The query processor uses this to skip entire blocks of the posting list that cannot contribute to the top-K results — without WAND, queries for common words like "the" would be unusably slow even with compression.
+
+### Distributed query execution
+
+The scatter-gather pattern is the load-bearing architectural choice for web-scale search. Understanding its failure modes is what distinguishes a staff-level answer.
+
+**Scatter phase.** The root server (query coordinator) receives the processed query and fans out to all N shards in parallel, via a single RPC broadcast. Each shard independently executes the same query against its local posting lists, computes BM25 scores for matching documents, and returns its local top-K results (typically K=10–50). The shard does not need to know about other shards — there is no cross-shard coordination during query execution.
+
+**Gather phase.** The root server receives up to N×K candidate results (1,000 shards × 50 results = 50,000 candidates). It merges these by re-ranking with global signals: BM25 score (normalized across shards), PageRank, freshness boost for fresh-tier results, and any personalization signals. The global top-10 results are selected and passed to the snippet generator.
+
+**Tail latency and hedged requests.** The query latency is determined by the slowest shard response — the classic "straggler" problem. If one shard in 1,000 is momentarily overloaded, the entire query waits. The mitigation is hedged requests: if a shard does not respond within a threshold (e.g., 50ms), the root server issues an identical request to a replica of that shard. Whichever responds first is used; the slower response is discarded. This costs extra load on replicas in exchange for dramatically reduced tail latency.
+
+**Result count estimation.** Each shard returns an estimated count of matching documents, not an exact count. The root server sums these estimates to display "About 4,200,000 results." Exact counts would require full posting list traversal on every shard — prohibitively expensive. The estimate is good enough for the UI.
+
+### BM25 scoring
+
+BM25 (Best Match 25) is the default scoring function used by Lucene, Elasticsearch, Solr, and serves as the text-relevance baseline for Google-scale search. It improves on raw TF-IDF by addressing two systematic failure modes: term saturation and document length bias.
+
+The BM25 score for query $q$ against document $d$ is:
+
+$$\text{BM25}(q,d) = \sum_{t \in q} \text{IDF}(t) \cdot \frac{f(t,d) \cdot (k_1 + 1)}{f(t,d) + k_1 \cdot \left(1 - b + b \cdot \frac{|d|}{\text{avgdl}}\right)}$$
+
+Where:
+- $f(t,d)$ = term frequency of term $t$ in document $d$
+- $|d|$ = length of document $d$ in words
+- $\text{avgdl}$ = average document length in the collection
+- $k_1 = 1.2$ (term saturation parameter — controls how much term frequency matters)
+- $b = 0.75$ (length normalization parameter — 0 = no normalization, 1 = full normalization)
+- $\text{IDF}(t) = \log\frac{N - \text{df}(t) + 0.5}{\text{df}(t) + 0.5}$ where $N$ = total documents, $\text{df}(t)$ = documents containing term $t$
+
+**Term saturation:** In raw TF-IDF, a document mentioning "python" 100 times scores 10× higher than one mentioning it 10 times. BM25's $k_1$ parameter caps this — as $f(t,d) \to \infty$, the BM25 component approaches $(k_1 + 1)$ asymptotically. More occurrences still help, but with diminishing returns.
+
+**Length normalization:** A long document naturally contains more term occurrences than a short one, even if the short document is more focused on the topic. The $b$ term penalizes documents longer than average. At $b = 0.75$, a 10,000-word document about "distributed systems" does not dominate a 500-word focused tutorial.
+
+**IDF:** Rare terms are more discriminative. A term appearing in 1 million documents has low IDF; a term appearing in 100 documents has high IDF. The $+0.5$ smoothing prevents division by zero for terms not in the collection.
+
+### Two-tier freshness index
+
+The fundamental tension in web-scale search is between comprehensiveness and freshness. Building a complete, accurate index of 100 billion pages requires weeks of crawling and days of batch index construction. But users expect to find articles published an hour ago in top results for breaking news queries.
+
+The two-tier architecture resolves this tension with an explicit architectural compromise:
+
+**Base index:** Comprehensive. Contains all 100+ billion indexed pages. Built via large-scale batch processing (MapReduce over the full crawl corpus) on a weekly cycle. High recall — it contains almost everything that has ever been indexed. Stale for recent content. Stored on NVMe SSDs across 1,000+ shards. This is the index that serves the overwhelming majority of queries with high relevance.
+
+**Fresh index:** Small (tens of millions of documents). Contains only recently crawled pages — the output of the crawler over the last 4 hours, focused on high-priority domains (news sites, social media, high-PageRank domains). Rebuilt every 4 hours using an incremental pipeline. Fits in memory on a small cluster. Low recall (does not contain long-tail pages) but captures breaking content.
+
+**Query merging:** Every query runs against both indexes in parallel. The fresh index results are given a freshness boost in the global re-ranking step — if a fresh-index result is highly relevant for the query, it can surface above older base-index results even with a lower raw BM25 score. The final ranking blends both result sets.
+
+**Deletion handling:** When a page is de-indexed (spam removal, DMCA takedown, robots.txt disallow), it must be suppressed from results immediately — waiting for the next weekly base index rebuild is unacceptable. De-indexed docIds are stored in a bloom filter or sorted exclusion list that is checked at gather time, before results are returned to the user.
+
+### PageRank computation
+
+PageRank is computed entirely offline, never at query time. The algorithm treats the web as a directed graph where each page is a node and each hyperlink is a directed edge. A page's rank is a function of the ranks of all pages linking to it:
+
+$$\text{PR}(A) = \frac{1 - d}{N} + d \sum_{P \to A} \frac{\text{PR}(P)}{L(P)}$$
+
+Where $d = 0.85$ is the damping factor (models the probability that a random web surfer follows a link rather than jumping to a random page), $N$ is the total number of pages, and $L(P)$ is the number of outbound links from page $P$.
+
+In practice, the computation is a sparse matrix-vector multiplication iterated until convergence. For the web graph, convergence typically occurs in approximately 50 iterations. Each iteration requires reading the entire link graph (~20 TB) and updating all 100 billion rank values. This is a weekly MapReduce job, not a query-time operation.
+
+The resulting `{docId → pageRank}` mapping is loaded into every index server's memory at startup. At gather time, each document's PageRank value is read from this in-memory table and combined with its BM25 score. Because PageRank is pre-computed and in-memory, adding it to query-time ranking is essentially free — a single float32 read per candidate document.
+
+### Query processing pipeline
+
+Before a query reaches any index shard, it passes through a multi-stage query processing pipeline:
+
+**Spell correction.** A noisy channel model (or a neural spell-checker in modern implementations) detects likely misspellings and either corrects silently or offers "Did you mean: X?" The correction must happen before the query is sent to shards, because posting lists are indexed against correct term forms.
+
+**Query rewriting.** Synonyms are expanded ("sofa" → OR query for "sofa OR couch"), stop words are stripped, and boolean structure is inferred from user intent. A query like `site:nytimes.com climate change 2025` is parsed into field constraints + keyword terms.
+
+**Language detection.** The query's language is detected (via fastText or similar), and the appropriate language-specific stemmer and stop-word list are selected. This also determines which language-tagged posting lists to read if the index is language-partitioned.
+
+**Intent classification.** A lightweight classifier categorizes the query into navigational (user wants a specific page), informational (user wants to learn something), or transactional (user wants to do something). Intent classification influences which ranking signals are emphasized — navigational queries weight exact URL match and domain authority more heavily; informational queries weight BM25 text relevance more heavily.
+
+## Java integration
+
+**Part A — Lucene-based index search**
+
+```java
+package dev.pushkar.search;
+
+import org.apache.lucene.analysis.standard.StandardAnalyzer;
+import org.apache.lucene.document.*;
+import org.apache.lucene.index.*;
+import org.apache.lucene.queryparser.classic.QueryParser;
+import org.apache.lucene.search.*;
+import org.apache.lucene.store.*;
+
+@Component
+public class SearchIndex implements AutoCloseable {
+    private final Directory directory;
+    private final StandardAnalyzer analyzer;
+    private final IndexWriter writer;
+    private DirectoryReader reader;
+    private IndexSearcher searcher;
+
+    public SearchIndex(@Value("${index.path}") String indexPath) throws IOException {
+        this.directory = FSDirectory.open(Path.of(indexPath));
+        this.analyzer = new StandardAnalyzer();
+        IndexWriterConfig config = new IndexWriterConfig(analyzer);
+        config.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
+        this.writer = new IndexWriter(directory, config);
+        this.reader = DirectoryReader.open(writer);
+        this.searcher = new IndexSearcher(reader);
+    }
+
+    public void indexDocument(WebPage page) throws IOException {
+        Document doc = new Document();
+        doc.add(new StringField("url", page.url(), Field.Store.YES));
+        doc.add(new TextField("title", page.title(), Field.Store.YES));
+        doc.add(new TextField("body", page.content(), Field.Store.NO));
+        doc.add(new FloatDocValuesField("pageRank", page.pageRank()));
+        doc.add(new LongField("fetchedAt", page.fetchedAt().toEpochMilli(), Field.Store.NO));
+        // Upsert by URL — updateDocument deletes any existing doc with the same url term
+        writer.updateDocument(new Term("url", page.url()), doc);
+    }
+
+    public List<SearchResult> search(String queryStr, int topK) throws Exception {
+        // Near-real-time reader: sees recent uncommitted docs without a full commit cycle
+        DirectoryReader newReader = DirectoryReader.openIfChanged(reader, writer);
+        if (newReader != null) {
+            reader.close();
+            reader = newReader;
+            searcher = new IndexSearcher(reader);
+        }
+
+        Query query = new QueryParser("body", analyzer).parse(queryStr);
+
+        // BM25 is Lucene's default similarity — no explicit configuration needed
+        // In production, combine with a FunctionScoreQuery to boost by pageRank docvalue
+        TopDocs hits = searcher.search(query, topK);
+        return Arrays.stream(hits.scoreDocs)
+            .map(sd -> {
+                try {
+                    Document doc = searcher.storedFields().document(sd.doc);
+                    return new SearchResult(doc.get("url"), doc.get("title"), sd.score);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            }).toList();
+    }
+
+    @Override
+    public void close() throws Exception {
+        writer.close();
+        reader.close();
+        directory.close();
+    }
+
+    record SearchResult(String url, String title, float score) {}
+    record WebPage(String url, String title, String content, float pageRank, Instant fetchedAt) {}
+}
+```
+
+Key Lucene details worth knowing at the staff level: `DirectoryReader.openIfChanged` is the near-real-time reader mechanism — it reflects documents written since the last `commit()` without the full flush cost. `updateDocument` with a `StringField` term is the correct upsert pattern — it deletes the old document atomically and inserts the new one. `FloatDocValuesField` stores per-document numeric data in a column-oriented structure (separate from the inverted index) — efficient for sort and score operations at query time.
+
+**Part B — Distributed query coordinator**
+
+```java
+@Service
+public class DistributedQueryService {
+    private static final Logger log = LoggerFactory.getLogger(DistributedQueryService.class);
+    private final List<SearchShardClient> shards;
+    private final ExecutorService virtualThreadPool = Executors.newVirtualThreadPerTaskExecutor();
+
+    public DistributedQueryService(List<SearchShardClient> shards) {
+        this.shards = shards;
+    }
+
+    public List<SearchResult> search(String query, int topK) throws Exception {
+        // Scatter: fan out to all shards in parallel using virtual threads
+        // Virtual threads are ideal here — thousands of blocked I/O waits, minimal CPU
+        var futures = shards.stream()
+            .map(shard -> CompletableFuture.supplyAsync(
+                () -> shard.search(query, topK),
+                virtualThreadPool))
+            .toList();
+
+        // Gather: collect results with per-shard timeout for tail latency control
+        var allResults = new ArrayList<SearchResult>();
+        for (var future : futures) {
+            try {
+                allResults.addAll(future.get(100, TimeUnit.MILLISECONDS));
+            } catch (TimeoutException e) {
+                // Hedged request: shard timed out; a replica will cover this shard's docs.
+                // Accepting partial coverage is better than waiting and blowing the p99 budget.
+                log.warn("Shard timeout during scatter — partial results for this query");
+            } catch (ExecutionException e) {
+                log.error("Shard error during scatter", e.getCause());
+            }
+        }
+
+        // Global re-rank: blend BM25 text score (70%) with pre-computed PageRank (30%).
+        // Weights are empirically tuned — informational queries favor BM25,
+        // navigational queries favor PageRank. A production system uses a learned ranker.
+        return allResults.stream()
+            .sorted(Comparator.comparingDouble(
+                r -> -(r.bm25Score() * 0.7 + r.pageRank() * 0.3)))
+            .limit(topK)
+            .toList();
+    }
+
+    record SearchResult(String url, String title, float bm25Score, float pageRank) {}
+}
+```
+
+The virtual thread pool is the correct executor choice here: scatter-gather involves thousands of concurrent blocking I/O waits (shard RPCs), and virtual threads eliminate the platform thread overhead that would otherwise require careful thread pool sizing. The 100ms shard timeout is conservative relative to a 200ms end-to-end budget — it leaves 100ms for gathering, snippet generation, and network round-trip from user to load balancer.
+
+<TradeoffTable
+  caption="Search architecture options at increasing scale"
+  rows={[
+    {
+      option: "Single Lucene node",
+      pros: "Zero operational overhead, sub-10ms query latency, instant index updates via NRT reader",
+      cons: "Hard cap at ~100M docs before RAM pressure degrades latency; single SPOF",
+      bestFor: "Site search, internal tool search, startup MVPs"
+    },
+    {
+      option: "Elasticsearch cluster",
+      pros: "Horizontal scale via shards and replicas, managed refresh cycle, rich query DSL",
+      cons: "Minutes-scale refresh latency, fan-out overhead at high shard counts, JVM GC pauses at scale",
+      bestFor: "Enterprise search, log analytics, e-commerce product search up to billions of docs"
+    },
+    {
+      option: "Doc-sharded Lucene (custom)",
+      pros: "Full control over shard routing, scoring, and caching; linear scale to trillions of docs",
+      cons: "High engineering cost, scatter-gather adds 100–500ms fan-out latency, requires custom hedging and replica management",
+      bestFor: "Web-scale search requiring tuned ranking — the Google / Bing architecture"
+    },
+    {
+      option: "Two-tier (base + fresh)",
+      pros: "Balances comprehensiveness and freshness; base index has high recall; fresh index captures recent content",
+      cons: "Architectural complexity; result merging requires freshness-aware re-ranking; base index rebuild is expensive weekly batch job",
+      bestFor: "Google-scale web search where both coverage and freshness matter"
+    }
+  ]}
+/>
+
+<Pitfall title="Skipping document length normalization in BM25">
+Raw TF-IDF scoring without document length normalization causes long documents to systematically dominate search results, regardless of relevance. A 50,000-word Wikipedia article will contain more raw occurrences of almost any query term than a 500-word blog post that is actually more focused on the topic. BM25's $b$ parameter (default 0.75) normalizes each document's term frequency by the ratio of its length to the collection's average document length. Without this normalization, your results will be crowded with legal documents, academic papers, and long-form content even for queries that should surface concise, authoritative short-form answers. The fix is never "just use BM25" — you need to verify that the $b$ parameter is nonzero and tuned for your document length distribution.
+</Pitfall>
+
+<Pitfall title="Partitioning the index by term instead of by document">
+Term-partitioned sharding (each shard owns a disjoint set of terms) sounds appealing because it eliminates the scatter phase — a query only needs to contact the shards that own its query terms. In practice it is deeply problematic. Multi-term queries require contacting multiple shards and merging results, with no local BM25 scoring possible (IDF depends on the global document frequency of a term, which is not available if the postings for a term live on a single shard). More critically, high-frequency terms create severe load imbalance — the shard that owns "the" or "python" receives every query containing those words, while shards owning rare terms sit idle. Document-partitioned sharding (each shard owns a disjoint set of documents) distributes load evenly and allows each shard to compute complete BM25 scores locally. Always shard by document, never by term.
+</Pitfall>
+
+<Curveball>
+**Breaking news within 5 minutes:** A magnitude 7.8 earthquake strikes. Your base index is 3 days stale for the affected region, and your standard fresh index rebuilds every 4 hours. How do you surface the breaking news story as the top result within 5 minutes of first publication?
+
+The answer requires a third tier: a real-time index for a curated set of high-priority domains (major news outlets, official government emergency accounts, wire services like AP and Reuters). This tier maintains a continuously refreshed index — new pages appear within seconds of crawl, using a streaming pipeline (crawler → Kafka → incremental Lucene segment write → NRT reader refresh) rather than a batch rebuild. The real-time tier covers only tens of thousands of domains, so its index is small enough to maintain in memory with sub-second refresh. Query routing sends all queries to all three tiers (real-time, fresh, base) and merges results. For a breaking news query, the real-time tier returns the freshly crawled earthquake article; its recency boost elevates it above stale base-index results even with a lower initial PageRank. This is architecturally identical to how Google News surfaces breaking content faster than the main web index.
+</Curveball>
+
+<Curveball>
+**Spam detection at scale:** A coordinated spammer creates 10 million pages with keyword stuffing targeting the query "cheap flights." Each page passes a naive text relevance check because it genuinely contains the target keywords at high frequency. How does your ranking pipeline detect and demote these pages without manually reviewing 10 million documents?
+
+Several automated signals fire in combination. First, link graph analysis: spam pages typically have zero or near-zero inbound PageRank — no legitimate sites link to them. A PageRank floor (demote any page below a threshold) eliminates most spam before it reaches the text ranking stage. Second, host-level spam signals: if a single domain registers 10 million new pages within a 48-hour window, that domain is quarantined for human review — legitimate sites do not grow that fast. Third, content fingerprinting: duplicate or near-duplicate content across a domain family (detected via MinHash / SimHash at crawl time) is collapsed — only one representative page is indexed, and duplicate spam pages are discarded. Fourth, click-through signal: even if spammy pages surface initially, they generate near-zero user clicks (users immediately return to the search results page — a "long click" vs "short click" signal). The CTR pipeline feeds this back into a ranking demotion within hours. None of these signals require manual review of individual pages; they operate on statistical aggregates computed offline and applied at ranking time.
+</Curveball>
+
+<Curveball>
+**Multilingual ranking without 50 separate indexes:** Your "python tutorial" query is indexed primarily against English-language PageRank and English query logs. A user in Brazil searches in Portuguese — "tutorial python" — and expects Portuguese-language results. How do you serve localized, language-appropriate results without maintaining fully independent indexes per language?
+
+The production approach is language tagging rather than language isolation. Each document in the forward index carries a language tag (detected at crawl time via a language classifier). The inverted index stores language-specific posting list segments within the same physical shard — term "tutorial" in Portuguese and term "tutorial" in English share the same term string but are stored in separate language-tagged posting lists. At query time, the language detector on the query processor identifies the query language, and the shard filters or boosts posting list segments accordingly — Portuguese-tagged documents receive a scoring boost; English documents are not excluded but rank lower. PageRank is computed on the full web graph, but a language-specific authority signal is overlaid: a Portuguese-language page with high inbound links from other Portuguese-language pages receives a language-local authority boost independent of its global PageRank. This avoids the catastrophic cost of maintaining 50 full index replicas (which would multiply storage and maintenance cost by 50) while still delivering language-relevant results.
+</Curveball>
+
+## Further reading
+
+- **The Anatomy of a Large-Scale Hypertextual Web Search Engine** — Brin & Page (1998). The original Google paper. Still worth reading: the description of the inverted index format, the two-tier index architecture, and the PageRank algorithm are the direct ancestors of production web search today.
+- **The PageRank Citation Ranking: Bringing Order to the Web** — Page, Brin, Motwani, Winograd (1999). The formal treatment of the PageRank algorithm, including the damping factor derivation and convergence analysis.
+- **Apache Lucene documentation** — [lucene.apache.org](https://lucene.apache.org). The reference implementation for production inverted index construction, BM25 scoring, and near-real-time search. Reading the source of `BM25Similarity.java` and `IndexWriter.java` is more instructive than any tutorial.
+- **Elasticsearch: The Definitive Guide** — Clinton Gormley & Zachary Tong. A thorough treatment of distributed search architecture built on Lucene: shard allocation, replica routing, refresh vs flush lifecycle, and the scatter-gather query execution model.
+- **IR Compendium (Introduction to Information Retrieval)** — Manning, Raghavan, Schütze (freely available online). Chapters 1–6 cover the inverted index, Boolean retrieval, TF-IDF, and BM25 with mathematical rigor. This is the graduate textbook behind most production search scoring implementations.
+
+<RelatedQuestions items={[{slug: "typeahead-autocomplete", title: "Design Typeahead / Autocomplete", difficulty: "mid"}, {slug: "google-maps", title: "Design Google Maps", difficulty: "senior"}, {slug: "web-crawler", title: "Design a Web Crawler", difficulty: "senior"}]} />

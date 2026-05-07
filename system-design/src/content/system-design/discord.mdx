@@ -1,0 +1,659 @@
+---
+title: "Design Discord"
+slug: "discord"
+category: "social"
+difficulty: "senior"
+estimatedReadMinutes: 23
+tags: ["websocket", "guilds", "sharding", "voice", "presence", "cassandra", "elixir"]
+companyFlavors: ["Discord", "Slack", "TeamSpeak", "IRC"]
+prerequisites: ["slack", "whatsapp-messenger", "consistent-hashing"]
+relatedQuestions: ["slack", "whatsapp-messenger", "zoom-video-conferencing"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design Discord's real-time messaging infrastructure: persistent WebSocket fleet across millions of connections, guild sharding, voice channel SFU, online presence at scale, and the Cassandra message store behind 4 billion messages per day."
+javaPackages:
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+  - "org.springframework.boot:spring-boot-starter-websocket:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "org.springframework.data:spring-data-cassandra:4.3.0"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="discord" title="Design Discord" />
+
+<Tldr>
+- **Guild as the unit of organization**: every server (guild) has channels, roles, and members; guilds are assigned to Gateway Servers via consistent hashing on `guild_id`, so all events for a guild flow through a predictable shard of the fleet.
+- **Cassandra message store**: messages partitioned by `(channel_id, bucket)` where bucket is a time-window derived from the Snowflake message ID; clustering key is `message_id DESC` so "get last N messages" is a narrow range scan, never a full partition read.
+- **Persistent WebSocket per client**: every connected client holds one long-lived WebSocket to a Gateway Server; the gateway dispatches all real-time events — messages, presence updates, typing indicators, membership changes — over that single connection.
+- **Guild fan-out via Kafka**: a sent message is written to Cassandra then published to a Kafka topic keyed by `guild_id`; a Guild Fan-out Service, consuming with `guild_id` affinity, looks up online members from Redis and pushes `MESSAGE_CREATE` events to the appropriate Gateway Servers via gRPC.
+- **Voice is a separate system**: voice channels run on dedicated voice servers operating as Selective Forwarding Units (SFU); clients signal via a separate WebSocket and exchange WebRTC SDP; voice and text share only the initial Gateway connection for coordination, not media transport.
+</Tldr>
+
+## The scale of the problem
+
+Discord launched in 2015 as a voice and text chat tool for gamers, explicitly designed to replace TeamSpeak and Skype in gaming sessions where low-latency voice and frictionless text communication mattered more than enterprise features. Within three years it had escaped that niche: communities formed around programming, anime, music production, study groups, and political organizing. By 2023 Discord reported over 500 million registered accounts, 19 million active guilds ("servers"), and roughly 4 billion messages sent per day. At peak hours the platform sustains more than 8 million concurrent WebSocket connections — each connection held open by the gateway fleet and fed a continuous stream of real-time events.
+
+The architectural signature of Discord is the **guild** — Discord's word for a server, which is a persistent community space that owns channels, roles, members, and permissions. This is the organizing primitive that separates Discord from Twitter or Instagram. On those platforms the fundamental relationship is a social graph edge (follow/follower) between individuals. On Discord the fundamental relationship is membership in a guild: you join a guild, and from that moment every message in every channel of that guild is potentially relevant to you. Fan-out is not determined by traversing a social graph — it is determined by enumerating the members of a guild and finding which ones are online. This bounded-membership fan-out model is both a simplification (no graph traversal) and a scaling challenge (large guilds can have 500,000 members, of which 50,000 may be online simultaneously during a major event).
+
+Discord's growth path also created engineering tensions that differ from enterprise messaging tools like Slack. Discord users are often engaged in real-time activities — gaming sessions, watch parties, live events — where presence, typing indicators, and voice-channel activity matter as much as text messages. This drives the requirement for sub-100ms event delivery to online recipients, a tighter SLA than most enterprise chat tools demand. It also drives the complexity of the presence subsystem: determining which of 500 million registered users is online right now, at guild scope, is a non-trivial distributed systems problem when a single user may be a member of dozens of guilds simultaneously.
+
+## Clarifying questions
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| What is the maximum guild (server) size? | Up to 500,000 members for partner and verified community guilds; most guilds are under 1,000 | Directly drives the fan-out strategy: a 500K-member guild with 50K online cannot use naive per-member enumeration for every message |
+| Are DMs (direct messages) handled the same as guild channels? | Yes — DMs are modeled as private channels between 2–10 users; the same Cassandra schema and fan-out logic applies | Simplifies schema design; routing differs (no guild_id for DMs, use a virtual "DM guild" for Kafka partitioning) |
+| Are voice channels in scope? | Yes, brief coverage — voice is architecturally separate but shares the gateway connection for signaling | Determines whether the design must cover WebRTC SFU architecture or only text infrastructure |
+| How long is message history retained? | Indefinitely — Discord does not delete messages unless a user or moderator deletes them explicitly | Drives Cassandra time-bucketing and storage tiering; a channel active since 2016 can have billions of rows across hundreds of buckets |
+| How are file attachments handled? | Files are uploaded to a separate CDN (Discord uses Cloudflare); messages carry attachment metadata (URL, filename, size) | Keeps message payloads small; binary content never flows through the Kafka fan-out pipeline |
+| Are threads (forum channels) in scope? | Threads are sub-channels within a channel; they share the same message schema with a `parent_id` linking to the root channel | Minor schema addition; fan-out for threads is scoped to thread participants rather than full guild membership |
+| How are bots treated? | Bots use the same Gateway WebSocket protocol with a bot token; they receive events based on declared intents | Bots with GUILD_MESSAGES intent receive all channel messages in their guilds — a significant multiplier on fan-out recipients |
+| What rate limits apply? | Per-user per-channel: 5 messages per 5 seconds; bots may have higher limits; enforced at the Gateway on IDENTIFY | Rate limiting at the gateway prevents runaway bots from flooding Kafka and overwhelming the fan-out service |
+
+## Functional requirements
+
+- Users can send text messages to guild channels and direct message channels; messages are delivered in real time (p99 < 100ms) to all online members via persistent WebSocket connections.
+- Guild membership is managed via join and leave operations; users may belong to up to 100 guilds simultaneously; guild membership determines which events a client receives.
+- Online presence is visible at guild scope: members of a guild can see who is online, idle, in do-not-disturb mode, or offline; presence updates propagate in real time to all online members of shared guilds.
+- Voice channels allow multiple users to participate in real-time audio (and optionally video); Discord's SFU infrastructure manages audio stream routing and active-speaker detection.
+- File sharing is supported via separate upload to a CDN; messages reference attachments by URL; the messaging pipeline carries only metadata.
+- Message history is queryable through the REST API with cursor-based pagination by message ID; search is a separate product (not covered in depth here).
+
+## Non-functional requirements
+
+- **Scale**: 500M registered users; 19M active guilds; 4 billion messages per day; 8M+ concurrent WebSocket connections.
+- **Delivery latency**: p99 < 100ms from message send to delivery for online recipients on the same geographic region.
+- **Availability**: 99.99% for the gateway and message send paths; planned for multi-region active-active deployment.
+- **Durability**: messages must never be lost after acknowledgement; Cassandra replication factor 3 across availability zones.
+- **Presence freshness**: presence state must reflect reality within 5 seconds; stale presence (missed heartbeats) expires via Redis TTL.
+- **Voice quality**: voice latency < 50ms within a region; the SFU must support up to 50,000 simultaneous voice participants per large-guild event.
+
+<Capacity title="Discord Capacity Estimates">
+
+**Message throughput**
+
+Average message rate: $\frac{4{,}000{,}000{,}000}{86{,}400} \approx 46{,}296 \text{ msg/s}$
+
+Peak (3× average): $46{,}296 \times 3 \approx 139{,}000 \text{ msg/s}$
+
+**Cassandra storage**
+
+Average message size 300 bytes (content + metadata). Over 5 years:
+
+$$300 \text{ B} \times 4 \times 10^9 \text{ msg/day} \times 365 \times 5 \approx 2.19 \text{ PB}$$
+
+With replication factor 3: $2.19 \times 3 \approx 6.57 \text{ PB}$ raw storage across the Cassandra cluster.
+
+**Gateway fleet sizing**
+
+Each gateway pod sustains 1M concurrent WebSocket connections (tuned Linux kernel, epoll, Erlang/Elixir process model). At 8M concurrent:
+
+$$\lceil 8{,}000{,}000 / 1{,}000{,}000 \rceil = 8 \text{ pods minimum}$$
+
+In practice: 3× overprovisioning for HA + geographic distribution → approximately 24–32 gateway pods across regions.
+
+**Guild fan-out rate**
+
+Average guild: 150 members, 10% online = 15 online members.
+
+$$46{,}296 \text{ msg/s} \times 15 \text{ pushes/msg} = 694{,}440 \text{ WebSocket pushes/s}$$
+
+**Large guild fan-out (single event)**
+
+500K-member guild, 10% online = 50,000 concurrent online members.
+
+A single viral message → 50,000 WebSocket push events. At 1 KB per event payload: $50{,}000 \times 1{,}024 \approx 48 \text{ MB}$ per message burst, delivered within the 100ms SLA.
+
+</Capacity>
+
+## API design
+
+Discord's real-time protocol is a WebSocket-based gateway with numeric opcodes, distinct from the REST API used for stateful operations. Understanding both layers is essential for the system design.
+
+**WebSocket connection URL**
+
+```text
+wss://gateway.discord.gg/?v=10&encoding=json
+```
+
+Clients may also request ETF (Erlang Term Format) encoding and zlib-stream compression for efficiency. The version parameter (`v=10`) determines protocol compatibility.
+
+**Client-to-server opcodes**
+
+```json
+{
+  "op": 2,
+  "d": {
+    "token": "Bot MTk4NjIyNDgzNDcxOTI1MjQ4.Cl2FDg.ZnCjm...",
+    "properties": { "os": "linux", "browser": "disco", "device": "disco" },
+    "intents": 33280
+  }
+}
+```
+
+Opcode 2 (IDENTIFY) authenticates the client and declares which event categories it wants to receive via the `intents` bitmask. Intent flags gate high-volume event streams: `GUILD_MESSAGES` (bit 9), `GUILD_PRESENCES` (bit 8), `GUILD_MEMBERS` (bit 1). Bots must declare intents explicitly; large bots require "privileged intents" approved by Discord.
+
+```json
+{ "op": 1, "d": 1337 }
+```
+
+Opcode 1 (HEARTBEAT) is sent by the client every 41,250ms (Discord's specific interval, plus ±15% jitter to prevent thundering herd). The `d` field is the sequence number of the last event received. The gateway responds with Opcode 11 (HEARTBEAT_ACK). Missing two consecutive heartbeats causes the gateway to close the connection with close code 4009 (session timed out).
+
+```json
+{ "op": 6, "d": { "token": "...", "session_id": "abc123", "seq": 1337 } }
+```
+
+Opcode 6 (RESUME) allows reconnecting clients to replay missed events without a full IDENTIFY cycle. The gateway maintains an in-memory replay buffer of the last 250 events per session. Events beyond that window require a fresh IDENTIFY and full state re-download.
+
+**Server-to-client dispatched events (Opcode 0)**
+
+`MESSAGE_CREATE` — delivered for every new message in any channel the client is subscribed to:
+
+```json
+{
+  "op": 0,
+  "t": "MESSAGE_CREATE",
+  "s": 1338,
+  "d": {
+    "id": "1234567890123456789",
+    "channel_id": "987654321098765432",
+    "guild_id": "111122223333444455",
+    "author": { "id": "55566677788899900", "username": "pushkar", "discriminator": "0" },
+    "content": "Shipping at midnight, let's go",
+    "timestamp": "2025-01-15T22:30:00.000000+00:00",
+    "attachments": [],
+    "embeds": []
+  }
+}
+```
+
+`PRESENCE_UPDATE` — triggers whenever a guild member's status changes:
+
+```json
+{
+  "op": 0,
+  "t": "PRESENCE_UPDATE",
+  "d": {
+    "user": { "id": "55566677788899900" },
+    "guild_id": "111122223333444455",
+    "status": "online",
+    "activities": [{ "name": "Visual Studio Code", "type": 0 }]
+  }
+}
+```
+
+`TYPING_START` — fires when a user starts typing in a channel:
+
+```json
+{
+  "op": 0,
+  "t": "TYPING_START",
+  "d": { "channel_id": "987654321098765432", "user_id": "55566677788899900", "timestamp": 1705359000 }
+}
+```
+
+**REST API endpoints**
+
+```text
+GET  /api/v10/channels/{channel_id}/messages?limit=50&before={message_id}
+POST /api/v10/channels/{channel_id}/messages
+DELETE /api/v10/channels/{channel_id}/messages/{message_id}
+GET  /api/v10/guilds/{guild_id}/members?limit=1000&after={user_id}
+PATCH /api/v10/guilds/{guild_id}/members/{user_id}
+```
+
+The message history endpoint is cursor-based using `before` (and optionally `after` or `around`), where the cursor is a Snowflake message ID. This maps directly onto Cassandra clustering key range scans, avoiding offset-based pagination which would degrade with deep pages.
+
+## Data model
+
+**messages (Cassandra)**
+
+```sql
+CREATE TABLE messages (
+    channel_id   bigint,
+    bucket       int,
+    message_id   bigint,
+    guild_id     bigint,
+    author_id    bigint,
+    content      text,
+    attachments  text,
+    embeds       text,
+    edited_at    timestamp,
+    deleted_at   timestamp,
+    PRIMARY KEY ((channel_id, bucket), message_id)
+) WITH CLUSTERING ORDER BY (message_id DESC)
+   AND compaction = { 'class': 'TimeWindowCompactionStrategy',
+                      'compaction_window_unit': 'DAYS',
+                      'compaction_window_size': 7 };
+```
+
+The `bucket` column is derived from the Snowflake message ID: `bucket = (message_id >> 22) / (1000 * 3600 * 24 * 7)` — effectively a week number since the Discord epoch (January 1, 2015). Old buckets become append-only as soon as the week rolls over, making them ideal candidates for TimeWindowCompactionStrategy (TWCS) which avoids expensive cross-SSTable compactions on historical data.
+
+**guilds and channels (PostgreSQL)**
+
+```sql
+CREATE TABLE guilds (
+    guild_id        bigint PRIMARY KEY,
+    name            varchar(100),
+    owner_id        bigint NOT NULL,
+    member_count    int    DEFAULT 0,
+    features        text[],
+    created_at      timestamptz DEFAULT now()
+);
+
+CREATE TABLE channels (
+    channel_id          bigint PRIMARY KEY,
+    guild_id            bigint REFERENCES guilds(guild_id),
+    type                smallint NOT NULL,
+    name                varchar(100),
+    position            int,
+    parent_id           bigint,
+    permission_overwrites jsonb DEFAULT '[]'
+);
+
+CREATE TABLE guild_members (
+    guild_id    bigint,
+    user_id     bigint,
+    roles       bigint[],
+    joined_at   timestamptz DEFAULT now(),
+    nickname    varchar(32),
+    PRIMARY KEY (guild_id, user_id)
+);
+```
+
+Channel `type` enum: 0 = GUILD_TEXT, 2 = GUILD_VOICE, 4 = GUILD_CATEGORY, 5 = GUILD_ANNOUNCEMENT, 11 = GUILD_PUBLIC_THREAD.
+
+**Presence and session state (Redis)**
+
+```text
+Key: presence:{user_id}
+Value: {"status":"online","activities":[{"name":"VS Code","type":0}]}
+TTL: 120 seconds (refreshed on each heartbeat)
+
+Key: members:{guild_id}
+Type: Redis SET
+Value: {user_id_1, user_id_2, ...}  -- only ONLINE members
+TTL: none (managed by presence update logic)
+
+Key: session:{session_id}
+Value: {"user_id":123,"gateway_addr":"gw-03.us-east-1:9000","seq":1337,"guilds":[guild_id_1,...]}
+TTL: 600 seconds (refreshed on heartbeat)
+
+Key: user_guilds:{user_id}
+Type: Redis SET
+Value: {guild_id_1, guild_id_2, ...}
+TTL: none (invalidated on guild join/leave)
+```
+
+The `members:{guild_id}` Redis SET is the performance-critical structure for fan-out: a single `SMEMBERS` call returns all online user IDs for a guild in O(N) where N is the number of *online* members, not total members. Total membership lives in PostgreSQL; only the online subset is materialized in Redis.
+
+## System flow
+
+<Mermaid diagram={`flowchart TD
+    A[Client] -->|WebSocket OP2 IDENTIFY| B[Gateway Server]
+    B -->|Auth token, load guilds| C[Auth Service]
+    B -->|SETEX session:xyz| D[Redis Cluster]
+    B -->|SADD members:guildId| D
+    A -->|POST /channels/id/messages| E[Message API]
+    E -->|Assign Snowflake ID| E
+    E -->|INSERT channel_id bucket message_id| F[Cassandra]
+    E -->|Produce key=guildId| G[Kafka guild-messages]
+    G -->|Consume partitioned by guildId| H[Fan-out Service]
+    H -->|SMEMBERS members:guildId| D
+    H -->|HGET session:userId per member| D
+    H -->|Group by gateway_addr| H
+    H -->|gRPC pushEvent userIds event| B
+    B -->|OP0 MESSAGE_CREATE| A
+    subgraph Presence Flow
+    A -->|OP1 Heartbeat seq=N| B
+    B -->|SETEX presence:userId 120s| D
+    B -->|if status changed produce PRESENCE_UPDATE| G
+    G -->|Fan-out service SMEMBERS each guild| D
+    end`} />
+
+**Message send flow (step by step)**
+
+1. Client sends an HTTP POST to the Message API (REST, not WebSocket). The API validates the user's permissions for the target channel by checking `permission_overwrites` from PostgreSQL cache.
+2. The API generates a Snowflake message ID: `(milliseconds_since_discord_epoch << 22) | (worker_id << 12) | increment`. The Snowflake encodes the timestamp, making it both a unique ID and a time cursor for Cassandra range scans.
+3. The API writes the message row to Cassandra with partition key `(channel_id, bucket)`. Cassandra write quorum is LOCAL_QUORUM (2 of 3 replicas in the same AZ). The API waits for the Cassandra write acknowledgement before responding 200 to the client.
+4. The API publishes a `GuildMessageEvent` to the Kafka topic `guild-messages` with key `guild_id.toString()`. Kafka's default partitioner routes messages with the same key to the same partition, guaranteeing ordering within a guild.
+5. The Guild Fan-out Service (stateless, horizontally scalable) consumes from `guild-messages`. Each consumer instance is assigned specific Kafka partitions, which correspond to specific guild ID ranges — this creates natural affinity so that messages from the same large guild are always processed by the same consumer instance, keeping Redis `SMEMBERS` results warm in the consumer's local cache.
+6. The consumer calls `SMEMBERS members:{guild_id}` to retrieve all currently-online user IDs. For the average guild (15 online members) this is a trivial Redis operation. For a large guild (50K online members), this returns 50K user IDs — still a single Redis call, though the subsequent processing is the bottleneck.
+7. For each online user ID, the consumer retrieves `session:{user_id}` from Redis to get the `gateway_addr`. These are batched into a single Redis pipeline call to minimize round trips.
+8. The consumer groups user IDs by `gateway_addr`, then makes one gRPC call per distinct gateway server: `GatewayRpcService.PushEvent(gateway_addr, [user_id_list], event_payload)`. The gateway server, upon receiving this gRPC call, looks up each user's WebSocket connection and writes the `MESSAGE_CREATE` event.
+
+**Presence update flow**
+
+Every 41.25 seconds the client sends Opcode 1 (HEARTBEAT). The gateway responds with Opcode 11 (ACK) and calls `SETEX presence:{user_id} 120 {json}` to refresh the TTL. If the status field in the incoming heartbeat differs from the cached value, the gateway also publishes a `PRESENCE_UPDATE` event to Kafka. The fan-out service handles presence fan-out by iterating `user_guilds:{user_id}` (the set of guilds the user belongs to) and, for each guild, pushing the `PRESENCE_UPDATE` event to online members of that guild via the same gRPC mechanism. When a heartbeat is missed and the 120s TTL expires, Redis passive expiration handles "going offline" detection; a separate TTL expiry listener (Redis keyspace notifications) publishes an offline event.
+
+## Deep dives
+
+### Guild sharding and large guild fan-out
+
+Discord calls guilds with more than 250,000 members "very large servers" (VLS). The fan-out challenge for VLS is significant: a single message from a popular channel can require 50,000 WebSocket pushes, all expected within 100ms. Naive per-member enumeration is untenable at this scale for several reasons. First, iterating 50,000 session lookups from Redis, even pipelined, introduces latency. Second, making thousands of individual gRPC calls to gateway servers wastes CPU. Third, the fan-out service becomes a bottleneck if a single large guild fires multiple messages in rapid succession.
+
+Discord's production solution for VLS is a **gateway subscription model**. Rather than the fan-out service enumerating members, each Gateway Server *subscribes* to the Kafka topic for guilds where it has active connections. When a message for a VLS arrives in Kafka, every subscribed gateway server receives it from Kafka directly and delivers it to its locally-connected members. This inverts the fan-out model: instead of the fan-out service knowing about all gateways and pushing to them, each gateway pulls from the relevant guild topic. The fan-out service is only needed for small-to-medium guilds where per-member enumeration is cheap.
+
+For guilds below the VLS threshold, the explicit enumeration model described above works well. The bucket boundary (at roughly 10,000 online members) is tuned empirically based on the cost of Redis SMEMBERS vs. Kafka consumer group overhead.
+
+### Gateway fleet and connection management
+
+Discord's original gateway was written in Elixir, running on the BEAM virtual machine. Elixir/Erlang's actor model (processes) maps naturally onto WebSocket connections: each connection is a lightweight process (typically 2–3 KB of memory overhead), and BEAM's preemptive scheduler prevents any single connection from blocking others. At 1 million connections per node, this requires roughly 2–3 GB of process memory, well within the capacity of modern servers. BEAM's supervisor trees provide fault isolation: a crashing connection process is restarted by its supervisor without affecting neighboring connections.
+
+The connection lifecycle is:
+
+1. Client connects to `wss://gateway.discord.gg`. A load balancer (L4, not L7, to avoid WebSocket upgrade overhead) routes the TCP connection to a gateway pod using least-connections balancing.
+2. The gateway immediately sends Opcode 10 (HELLO) with the `heartbeat_interval` (41,250ms).
+3. Client sends Opcode 2 (IDENTIFY) with token and intents. Gateway validates the token against the Auth Service (Redis-cached token → user_id mapping), loads the user's guild list, and streams the initial state as a `READY` event containing guild IDs (but not full guild data — clients lazy-load guild details via REST).
+4. Gateway registers the session: `SETEX session:{session_id} 600 {user_id, gateway_addr, seq, guilds}`.
+5. Gateway registers online presence: for each guild the user belongs to, calls `SADD members:{guild_id} {user_id}`.
+
+On disconnect (clean or dirty), the gateway calls `SREM members:{guild_id} {user_id}` for each guild and publishes a `PRESENCE_UPDATE` (offline) event. If the disconnect is dirty (TCP reset without close frame), the heartbeat miss + TTL expiry mechanism handles cleanup within 120 seconds.
+
+Session resume (Opcode 6) is the critical reliability mechanism. After a reconnect, the client sends its `session_id` and last received `seq` number. If the session is still alive in Redis and the replay buffer covers the gap, the gateway streams the missed events without requiring a full state reload. Missed events beyond the buffer cause a session invalidation: the gateway responds with close code 4007 (Invalid Session) and the client must IDENTIFY fresh.
+
+### Message storage: Cassandra time-bucketing in depth
+
+The naive Cassandra schema — partition key `channel_id`, clustering key `message_id DESC` — works for new channels but degrades catastrophically over time. A Discord channel active since 2016 with moderate activity might accumulate 50 million messages. A single Cassandra partition of 50 million rows means:
+
+- Tombstone accumulation for deleted messages bloats SSTable reads
+- Compaction must process the entire partition even when only the recent slice is queried
+- Partition size exceeds Cassandra's recommended 100 MB limit, causing coordinator timeouts
+
+The time-bucketed partition key `(channel_id, bucket)` solves this by capping partition size. The bucket formula:
+
+```java
+long DISCORD_EPOCH = 1420070400000L; // Jan 1, 2015 UTC in ms
+long WEEK_MS = 7L * 24 * 3600 * 1000;
+
+int getBucket(long snowflakeMessageId) {
+    long timestampMs = (snowflakeMessageId >> 22) + DISCORD_EPOCH;
+    return (int) ((timestampMs - DISCORD_EPOCH) / WEEK_MS);
+}
+```
+
+Each bucket covers exactly one week. A channel sending 1,000 messages/day accumulates 7,000 rows per bucket — a tiny partition that compacts instantly and fits in memory. Even a channel sending 100,000 messages/day (an extremely active Discord channel) produces 700,000 rows/week, still within comfortable Cassandra partition limits.
+
+**Reading history with time buckets**
+
+A paginated history query `GET /channels/{id}/messages?limit=50&before={message_id}` resolves as follows:
+
+1. Compute `before_bucket = getBucket(before_message_id)`.
+2. Execute: `SELECT * FROM messages WHERE channel_id = ? AND bucket = ? AND message_id < ? LIMIT 50`.
+3. If the result set has fewer than 50 rows, the page spans a bucket boundary. Decrement `bucket` and continue scanning until 50 results are accumulated or bucket underflows (channel has no more history).
+
+Bucket boundary crossings are rare for most queries (the last 50 messages almost always fit in the current bucket) but must be handled correctly for long-running channels scrolling back through years of history.
+
+**TimeWindowCompactionStrategy (TWCS)**
+
+Old buckets are write-frozen after their week ends. TWCS is configured with `compaction_window_size: 7 DAYS`: it creates one SSTable per compaction window and never merges SSTables across windows. This means historical buckets (years old) are compacted once and never touched again — dramatically reducing I/O on the Cassandra cluster. Discord later migrated from Cassandra to ScyllaDB (a C++ reimplementation of the Cassandra protocol) for better tail latency and more predictable GC behavior, but the time-bucketing schema remained unchanged.
+
+### Presence at 500 million users
+
+Presence is the hardest scaling problem in Discord's design because it is inherently O(N × M) in the naive formulation: N users × M guilds per user × average guild size for fan-out. Discord's approach has three key constraints that make it tractable:
+
+**Scope to guild membership.** Presence is only meaningful within a shared guild context. You cannot see the online status of a random Discord user unless you share a guild. This transforms the global presence problem (N² comparisons) into N independent guild-scoped subproblems.
+
+**Online-only Redis materialization.** The `members:{guild_id}` Redis SET contains only currently-online members. Total membership (potentially 500K) lives in PostgreSQL. The online subset (perhaps 10% = 50K for a large guild) lives in Redis. Fan-out complexity is proportional to the online subset, not total membership.
+
+**Large guild presence cap.** For guilds above a threshold (Discord's VLS threshold), the client only receives presence data for members the client has recently interacted with or has added as friends, rather than the full 50K-member online set. This "lazy presence" model is triggered by the gateway when it detects a very large server in the user's guild list. The client can explicitly request member presence data via Opcode 14 (Request Guild Members) for specific ranges of the member list, enabling the UI to virtualize the member sidebar.
+
+**Heartbeat-driven TTL expiry.** Presence does not require an explicit "go offline" API call. The 120s TTL on `presence:{user_id}` means that if a client closes without a clean disconnect (e.g., laptop lid closed), the stale presence naturally expires within two minutes. Redis keyspace notifications can trigger a cleanup job, but even without active cleanup the system self-heals within the TTL window.
+
+### Voice channels: SFU architecture
+
+Voice channels are architecturally decoupled from text channels. The flow for joining a voice channel:
+
+1. Client sends `PUT /api/v10/guilds/{guild_id}/voice-states/@me` with `channel_id`.
+2. The REST API stores the voice state in Redis (`voice_state:{guild_id}:{user_id}`) and publishes a `VOICE_STATE_UPDATE` event through the fan-out pipeline. This notifies other guild members that someone joined the voice channel — delivered via text gateway.
+3. The REST API responds with a `voice_server` object containing the address of the assigned Voice Server for this channel.
+4. Client opens a *second* WebSocket connection to the Voice Gateway at the assigned Voice Server address. This is separate from the text gateway.
+5. Client sends `IDENTIFY` on the voice gateway, receives `HELLO`, and exchanges SDP offer/answer via `SESSION_DESCRIPTION` events. The Voice Server is the SFU peer.
+6. Client establishes a UDP media transport directly to the Voice Server using SRTP (Secure RTP over UDP, negotiated via WebRTC DTLS handshake).
+
+**SFU mechanics.** A Selective Forwarding Unit receives one encoded audio stream per sender (Opus codec at 64 kbps by default). Unlike an MCU (Multipoint Control Unit), the SFU does not decode and re-encode audio — it forwards RTP packets from each sender to each receiver, selecting which streams to forward based on active-speaker detection (Voice Activity Detection on the RTP stream). For a 10-person voice call, the SFU receives 10 upstream Opus streams and forwards up to 10 streams to each participant — with active-speaker logic reducing the forwarded count to the 3–5 loudest speakers.
+
+**Voice server scaling.** Voice servers are assigned to channels by consistent hashing on `channel_id`. Each voice server handles 500–1,000 concurrent voice participants (not channels — a single 500-person voice stage occupies one server). For Discord's Stage Channels (broadcast audio, up to 1,000 listeners), the SFU fans out one or a few speaker streams to 1,000 receivers — a straightforward multicast problem that the SFU handles natively.
+
+## Java integration
+
+### Part A — GuildFanoutService.java
+
+```java
+package com.example.discord.fanout;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.stereotype.Service;
+import io.lettuce.core.api.sync.RedisCommands;
+import java.util.*;
+import java.util.stream.Collectors;
+
+public record GuildMessageEvent(
+    String messageId,
+    String channelId,
+    String guildId,
+    String authorId,
+    String content,
+    long timestamp
+) {}
+
+@Service
+public class GuildFanoutService {
+
+    private final RedisCommands<String, String> redis;
+    private final GatewayRpcClient gatewayClient;
+    private static final int LARGE_GUILD_THRESHOLD = 10_000;
+
+    public GuildFanoutService(RedisCommands<String, String> redis,
+                              GatewayRpcClient gatewayClient) {
+        this.redis = redis;
+        this.gatewayClient = gatewayClient;
+    }
+
+    @KafkaListener(topics = "guild-messages", groupId = "fanout-service",
+                   containerFactory = "kafkaListenerContainerFactory")
+    public void fanOutMessage(ConsumerRecord<String, GuildMessageEvent> record) {
+        GuildMessageEvent event = record.value();
+        Set<String> onlineUserIds = redis.smembers("members:" + event.guildId());
+
+        if (onlineUserIds.size() > LARGE_GUILD_THRESHOLD) {
+            gatewayClient.broadcastToGuildSubscribers(event.guildId(), event);
+            return;
+        }
+
+        List<String> sessionKeys = onlineUserIds.stream()
+            .map(uid -> "session:" + uid)
+            .collect(Collectors.toList());
+
+        List<KeyValue<String, String>> sessions = redis.mget(sessionKeys.toArray(new String[0]));
+
+        Map<String, List<String>> gatewayToUsers = new HashMap<>();
+        for (int i = 0; i < sessions.size(); i++) {
+            if (sessions.get(i) == null) continue;
+            String gatewayAddr = extractGatewayAddr(sessions.get(i).getValue());
+            String userId = onlineUserIds.toArray(new String[0])[i];
+            gatewayToUsers.computeIfAbsent(gatewayAddr, k -> new ArrayList<>()).add(userId);
+        }
+
+        gatewayToUsers.forEach((gatewayAddr, userIds) ->
+            gatewayClient.pushEvent(gatewayAddr, userIds, event));
+    }
+
+    private String extractGatewayAddr(String sessionJson) {
+        return sessionJson.replaceAll(".*\"gateway_addr\":\"([^\"]+)\".*", "$1");
+    }
+}
+```
+
+### Part B — MessageController.java
+
+```java
+package com.example.discord.api;
+
+import org.springframework.web.bind.annotation.*;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.data.cassandra.core.CassandraTemplate;
+import org.springframework.http.ResponseEntity;
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/v10/channels/{channelId}/messages")
+public class MessageController {
+
+    private static final long DISCORD_EPOCH = 1420070400000L;
+    private static final long WEEK_MS = 7L * 24 * 3600 * 1000;
+
+    private final CassandraTemplate cassandra;
+    private final KafkaTemplate<String, GuildMessageEvent> kafka;
+    private final SnowflakeGenerator snowflake;
+
+    public MessageController(CassandraTemplate cassandra,
+                             KafkaTemplate<String, GuildMessageEvent> kafka,
+                             SnowflakeGenerator snowflake) {
+        this.cassandra = cassandra;
+        this.kafka = kafka;
+        this.snowflake = snowflake;
+    }
+
+    @PostMapping
+    public ResponseEntity<MessageResponse> sendMessage(
+            @PathVariable String channelId,
+            @RequestBody SendMessageRequest req,
+            @RequestAttribute("userId") String userId) {
+
+        long messageId = snowflake.nextId();
+        int bucket = getBucket(messageId);
+
+        cassandra.insert(new MessageRow(channelId, bucket, messageId,
+            req.guildId(), userId, req.content()));
+
+        var event = new GuildMessageEvent(String.valueOf(messageId),
+            channelId, req.guildId(), userId, req.content(), System.currentTimeMillis());
+        kafka.send("guild-messages", req.guildId(), event);
+
+        return ResponseEntity.ok(new MessageResponse(messageId, channelId, userId, req.content()));
+    }
+
+    @GetMapping
+    public ResponseEntity<List<MessageResponse>> getMessages(
+            @PathVariable String channelId,
+            @RequestParam(defaultValue = "50") int limit,
+            @RequestParam(required = false) Long before) {
+
+        long cursorId = before != null ? before : Long.MAX_VALUE;
+        int bucket = getBucket(cursorId);
+        List<MessageResponse> results = new ArrayList<>();
+
+        while (results.size() < limit && bucket >= 0) {
+            var rows = cassandra.select(
+                "SELECT * FROM messages WHERE channel_id=? AND bucket=? AND message_id<? LIMIT ?",
+                MessageRow.class, channelId, bucket, cursorId, limit - results.size());
+            rows.stream().map(MessageResponse::from).forEach(results::add);
+            cursorId = Long.MAX_VALUE;
+            bucket--;
+        }
+        return ResponseEntity.ok(results.subList(0, Math.min(results.size(), limit)));
+    }
+
+    private int getBucket(long messageId) {
+        long ts = (messageId >> 22) + DISCORD_EPOCH;
+        return (int) ((ts - DISCORD_EPOCH) / WEEK_MS);
+    }
+}
+```
+
+## Tradeoffs
+
+<TradeoffTable
+  headers={["Approach", "Fan-out Method", "Presence Scale", "Message Storage", "Gateway Coupling"]}
+  rows={[
+    [
+      "Naive per-member push",
+      "Enumerate all guild members, push to each WebSocket directly from Message API",
+      "Full presence graph — O(N²) updates as guild grows",
+      "Single Cassandra partition per channel — degrades after millions of rows",
+      "Message API must know gateway topology; tight coupling breaks with fleet changes"
+    ],
+    [
+      "Kafka per-guild topic + per-member routing",
+      "Fan-out service consumes guild topic, enumerates online members from Redis, routes to gateways via gRPC",
+      "Redis SET of online members per guild; fan-out proportional to online count only",
+      "Time-bucketed partition (channel_id, week); TWCS compaction; bounded partition size",
+      "Gateway addresses in Redis session store; fan-out service decoupled from WebSocket layer"
+    ],
+    [
+      "Redis pub/sub per guild",
+      "Message API publishes to Redis pub/sub channel per guild; gateways subscribe to relevant guild channels",
+      "Pub/sub fan-out — Redis broadcasts to all subscribers; works for moderate guild sizes",
+      "Cassandra with or without bucketing; pub/sub doesn't constrain storage design",
+      "Gateways maintain Redis subscriptions; connection loss drops subscription silently"
+    ],
+    [
+      "Discord's actual (Kafka + gateway subscription + ScyllaDB)",
+      "Small guilds: fan-out via member enumeration; large guilds (VLS): gateway subscribes to Kafka topic directly",
+      "Online-only Redis SETs + large guild lazy presence cap; Redis TTL for offline detection",
+      "Time-bucketed Cassandra/ScyllaDB with TWCS; historical buckets frozen and compacted once",
+      "Fan-out service owns small guild routing; Kafka consumer groups on gateways own large guild routing"
+    ]
+  ]}
+/>
+
+<Pitfall>
+**Storing all guild members in a single Redis structure for presence.** A common mistake is using a single Redis SET or ZSET keyed by `guild_id` that contains all guild members — including offline ones — with their presence scores. For a 500,000-member guild this structure grows to 500K entries. `SMEMBERS` on a 500K-element Redis SET is a blocking O(N) operation that holds the Redis event loop for tens of milliseconds, degrading every other operation on that Redis shard during fan-out. The correct design maintains `members:{guild_id}` as the **online-only** subset (typically 10% of total membership) and stores total membership in PostgreSQL. Offline users are never in the Redis SET; they are added on connect and removed on disconnect or TTL expiry.
+</Pitfall>
+
+<Pitfall>
+**Using a single Cassandra partition per channel without time bucketing.** The naive `PRIMARY KEY (channel_id, message_id)` schema creates unbounded partition growth. Discord's `#general` channels in large servers have been active since 2015 — potentially accumulating hundreds of millions of rows in a single Cassandra partition. Cassandra's recommended maximum partition size is 100 MB; a row-dense partition far exceeds this, causing coordinator timeouts, compaction storms, and GC pressure on the Cassandra nodes holding that partition. Time-bucketing with weekly windows caps each partition at a manageable size, makes old data append-only (enabling TWCS), and allows historical data to be cold-tiered without touching the hot recent bucket.
+</Pitfall>
+
+<Curveball>
+**A Twitch streamer with 2 million Discord server members goes live — all 2M members receive a push notification and 200,000 open Discord simultaneously within 30 seconds. How does your gateway fleet and fan-out system handle the connection storm?**
+
+The connection storm hits the gateway fleet first: 200,000 TCP connections arrive within 30 seconds (roughly 6,700 connections/second). The L4 load balancer distributes these across gateway pods using least-connections. Each gateway pod must process IDENTIFY opcodes for tens of thousands of clients, validating tokens against the Auth Service and loading initial state. If the Auth Service (typically backed by Redis) is not pre-warmed, the token validation lookup rate spikes to 6,700 RPS — manageable for Redis, but the Auth Service application layer may need horizontal scaling.
+
+The fan-out storm is the deeper problem. The streamer's announcement message fans out to 200,000 online members across dozens of gateway pods. If this is a VLS with gateway subscription, Kafka naturally rate-limits delivery — each gateway pod consumes its partition at its own pace. If the fan-out service is doing per-member enumeration, a 200K-member Redis SMEMBERS call is the bottleneck. Mitigation: pre-warm the fan-out service by pre-computing the online member set on a background schedule for known large guilds; use Redis Cluster with the `members:{guild_id}` key sharded to multiple slots to parallelize SMEMBERS.
+
+The gateway connection storm can be smoothed by applying exponential backoff jitter on the client side (which Discord's client already does) and by implementing connection rate limiting per IP subnet at the L4 load balancer. Deploying additional gateway pod replicas ahead of scheduled large events (Discord does this for known esports tournaments) also absorbs the peak.
+</Curveball>
+
+<Curveball>
+**Discord wants to add "Message Search" within a server — search across all channels in a guild by keyword, with results from 5 years of history. How do you index 4 billion Cassandra rows into Elasticsearch without impacting live serving?**
+
+The backfill challenge is a classic large-scale ETL problem. A naive approach — streaming all 4 billion rows from Cassandra to Elasticsearch — would saturate Cassandra read I/O and starve the live serving path. The production approach uses several techniques: first, Cassandra SSTable files are exported to object storage (S3) using `cassandra-medusa` or `sstableloader` without touching the live cluster; Spark reads the SSTables from S3 in parallel, transforms rows into Elasticsearch documents, and bulk-indexes using the high-level REST client with 5,000-document batch sizes. Spark is throttled to consume S3 bandwidth during off-peak hours to avoid cold-cache reads impacting live Cassandra.
+
+The Elasticsearch index design: one index per guild (Discord's actual approach for isolation and per-guild index management). Each document contains `message_id`, `channel_id`, `guild_id`, `author_id`, `content`, `timestamp`. A `channel_ids` term filter on every search query enforces permission boundaries — the query layer checks which channel IDs the requesting user has access to and injects a `terms` filter. Private channel messages are indexed but never returned to unauthorized users.
+
+For ongoing indexing, a Kafka consumer group (`search-indexer`) subscribes to `guild-messages` and indexes new messages in near-real-time with < 5 second lag. This decouples the search indexing latency from the message delivery path.
+</Curveball>
+
+<Curveball>
+**A bot sends 10,000 messages per second to a channel for 60 seconds (runaway bot). How do you detect, rate-limit, and clean up the messages retroactively from Cassandra and client caches?**
+
+Detection: the Gateway rate limiter tracks per-user per-channel message rates in a sliding window using Redis (token bucket: `INCRBY rate:{user_id}:{channel_id}:{window} 1` with `EXPIRE`). At 5 messages per 5 seconds the bucket saturates; subsequent messages receive a `429 Too Many Requests` via the WebSocket (Opcode 0, event `MESSAGE_CREATE` is rejected with a rate limit close code). For a bot sending at 10,000 RPS, the Gateway detects the violation within the first second and begins dropping messages at the WebSocket level — the majority of the 10,000 × 60 = 600,000 messages never reach Cassandra.
+
+Messages that did reach Cassandra before rate limiting kicked in (first ~5,000) must be bulk-deleted. Discord provides a Bulk Delete endpoint (`DELETE /api/v10/channels/{id}/messages/bulk-delete`) accepting up to 100 message IDs. A cleanup job reads the bot's messages from Cassandra using `SELECT message_id FROM messages WHERE channel_id = ? AND bucket = ? AND author_id = ?` (requires a secondary index on `author_id` within a bucket), collects the message IDs, and issues bulk delete operations in batches of 100. Cassandra deletes are tombstones — the data is not immediately reclaimed but is excluded from reads immediately and physically removed after the `gc_grace_seconds` compaction window (default 10 days).
+
+Client-side cleanup: the Gateway broadcasts `MESSAGE_DELETE_BULK` events (up to 100 IDs per event) to all online members of the channel. Clients receiving these events must purge the deleted messages from their local Redux/message-store cache and re-render the channel view. The cascade of `MESSAGE_DELETE_BULK` events for 5,000 messages (50 events × 100 IDs) arrives within seconds via the existing fan-out pipeline, causing visible scroll-jump in the client UI — an unavoidable artifact of retroactive bulk deletion.
+</Curveball>
+
+## Further reading
+
+- **Discord Engineering Blog: "How Discord Stores Billions of Messages"** — the canonical account of the Cassandra time-bucketing design and the subsequent migration to ScyllaDB for improved GC latency and tail latency predictability. Required reading for any distributed message store design.
+- **Discord Engineering Blog: "How Discord Handles Two and Half Million Concurrent Voice Users"** — covers the SFU architecture, UDP media transport, active-speaker detection algorithms, and how voice server capacity planning differs from text infrastructure.
+- **Discord Engineering Blog: "Scaling Elixir for the Guild System"** — the original architecture document describing how Discord used Elixir's actor model and BEAM process isolation to manage millions of concurrent WebSocket connections and guild presence state on a small server footprint.
+- **Discord Engineering Blog: "How Discord Stores Trillions of Messages"** — the follow-up to the Cassandra article, describing the eventual migration to a hybrid Cassandra + ScyllaDB + object storage tiered architecture as message volume grew from billions to trillions over six years.
+
+<RelatedQuestions items={[
+  { slug: "slack", title: "Design Slack", difficulty: "senior" },
+  { slug: "whatsapp-messenger", title: "Design WhatsApp Messenger", difficulty: "senior" },
+  { slug: "zoom-video-conferencing", title: "Design Zoom Video Conferencing", difficulty: "senior" },
+]} />

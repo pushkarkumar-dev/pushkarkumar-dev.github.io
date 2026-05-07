@@ -1,0 +1,804 @@
+---
+title: "Design Airbnb"
+slug: "airbnb"
+category: "commerce"
+difficulty: "senior"
+estimatedReadMinutes: 23
+tags: ["search", "booking", "calendar", "geo-search", "availability", "pricing", "two-sided-marketplace"]
+companyFlavors: ["Airbnb", "Vrbo", "Booking.com", "Hotels.com"]
+prerequisites: ["google-search", "stripe-payment-gateway", "design-a-cache"]
+relatedQuestions: ["uber-ride-matching", "ticketmaster", "stripe-payment-gateway"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design Airbnb's two-sided marketplace: geo-spatial listing search with availability filtering, calendar-based booking with double-booking prevention, dynamic pricing, and the data model that handles 7 million listings across 220 countries."
+javaPackages:
+  - "org.springframework.boot:spring-boot-starter-data-jpa:3.3.0"
+  - "org.springframework.boot:spring-boot-starter-data-elasticsearch:3.3.0"
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="airbnb" title="Design Airbnb" />
+
+<Tldr>
+- **Listing search**: geo-spatial query (Elasticsearch `geo_distance`) combined with date-range availability filter and amenity/price filters; returns ranked listing cards scored on search relevance × host quality × price competitiveness — Elasticsearch handles the geo and filter work, a second pass through PostgreSQL's calendar table handles the hard availability check.
+- **Availability model**: `listing_calendar` table with one row per `(listing_id, date)` — simple to reason about, scales to billions of rows with partition pruning, and supports complex block patterns like minimum-stay rules, gap rules, and custom per-night pricing that a range-based model cannot express cleanly.
+- **Double-booking prevention**: booking creates one calendar row per night using a conditional insert inside a serializable transaction — `INSERT INTO listing_calendar WHERE NOT EXISTS (SELECT 1 WHERE status != 'available')`; exactly one concurrent booking attempt wins, the rest receive a 409 with "dates no longer available."
+- **Dynamic pricing**: Airbnb Smart Pricing suggests nightly prices to hosts based on comparable listings in the area, demand forecasting, day-of-week patterns, and lead time; hosts can accept, override, or decline the suggestion; the final price in search results is either Smart Pricing or the host's manually set base price.
+- **Two-sided trust**: both guest and host rate each other only after a stay completes; reviews are verified against actual booking records to prevent manipulation; the Superhost badge requires sustained high ratings plus acceptance rate thresholds over a rolling 12-month window.
+</Tldr>
+
+## The scale of the problem
+
+Airbnb launched in 2008 with an air mattress and a breakfast in San Francisco. By 2024 it operates in 220 countries with more than 7 million active listings, has served over 1.5 billion guest arrivals, and has more than 150 million registered guests in its marketplace. The breadth of listing types — an entire beachfront villa in Bali, a private room in a Brooklyn brownstone, a treehouse in Oregon — means that unlike a hotel chain, no two listings share the same calendar, amenity set, pricing structure, or house rules. Every listing is a snowflake managed by an individual host.
+
+This matters architecturally because the availability problem for Airbnb is fundamentally harder than for a hotel booking system. A hotel chain has a known, bounded inventory of room types per property and manages availability through a centralized Property Management System (PMS). Airbnb's host may block dates when their mother-in-law visits, open a weekend with a two-night minimum, charge a premium on New Year's Eve, and then accidentally double-book by forgetting to update their iCal sync. The system must handle host-managed calendars with arbitrary update patterns, sync with external calendar sources (iCal, VRBO, other OTAs), and still guarantee that two guests can never book the same listing for the same night regardless of how many concurrent requests arrive.
+
+The key architectural insight is that **search and booking are separate systems with different consistency requirements**. Search is a read-heavy, eventually consistent operation — a listing appearing in search results that turns out to be unavailable when a guest tries to book is merely an inconvenience, solved by a graceful error message. A double-booking is a catastrophic failure that harms two guests, one host, and Airbnb's reputation simultaneously. This asymmetry dictates the architecture: Elasticsearch for fast, approximate geo-search with eventual consistency on availability, and PostgreSQL with serializable transactions for the authoritative calendar that prevents double-bookings. Mixing the two into a single system, or trusting Elasticsearch for availability truth, is the most dangerous mistake in this design.
+
+## Clarifying questions
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| What listing types need to be supported? | Entire home, private room, and shared room — each has different availability semantics (an entire home books all rooms; private rooms can be booked independently in the same property) | Determines whether availability is at the property level or room level; for this design we treat each listing as an independently bookable unit regardless of type |
+| What search filters must be supported at launch? | Location (lat/lng or city), check-in/check-out dates, guest count, price range, amenities (pool, WiFi, kitchen, pet-friendly), listing type, instant book toggle | Drives the Elasticsearch field mapping and query DSL structure; amenities are a multi-value field that requires a `terms` query |
+| Do we support Instant Book and Request to Book? | Both — Instant Book (host pre-approves all guests meeting criteria, booking is confirmed immediately) and Request to Book (host reviews and approves within 24 hours) | Instant Book and Request to Book have different calendar locking semantics: Instant Book locks dates immediately at payment capture; Request to Book creates a soft hold during the approval window |
+| How is cancellation handled? | Hosts define their own cancellation policy (Flexible, Moderate, Strict, Super Strict); the policy determines refund amounts; cancellation releases the calendar dates | Cancellation must atomically release calendar rows and trigger a refund via the payment service; the cancellation policy table drives the refund calculation |
+| Are reviews bidirectional? | Yes — after a stay completes, both guest and host have 14 days to leave a review; reviews are only revealed to both parties simultaneously after both submit or the window closes | Simultaneous reveal prevents the second reviewer from being influenced by the first; requires a reveal-after-deadline job |
+| Is in-app messaging in scope? | In-app messaging between hosts and guests exists but is out of scope for the booking design — treat it as an independent service | Clarifies boundaries; messaging is eventually consistent and does not participate in the booking transaction |
+| How flexible is pricing? | Per-night base price + weekly/monthly discounts + cleaning fee + Airbnb service fee (≈14%) + local taxes; Smart Pricing suggests dynamic adjustments per night | Pricing is computed at booking time from live rate rules, not stored as a fixed total; the booking record stores the final computed breakdown |
+| Are minimum and maximum stay rules required? | Yes — hosts can set global min/max stay and per-date overrides (e.g., 3-night minimum on weekends, 7-night minimum during peak season) | Minimum stay rules must be validated at booking time; they are also factored into the search filter so guests requesting 1 night don't see listings with a 3-night minimum |
+
+## Functional requirements
+
+- Guests can search listings by location (city name or map bounding box), check-in and check-out dates, number of guests, price range, amenities, and listing type; results are paginated and ranked by relevance.
+- Guests can view a full listing detail page including photos, description, amenities, house rules, host profile, cancellation policy, reviews, and a calendar showing available and blocked dates.
+- Guests can submit a booking request for available dates; the system validates availability, charges the payment method, and either confirms the booking (Instant Book) or creates a pending request (Request to Book).
+- Hosts can manage their listing's calendar: block dates, set custom prices per night, define minimum and maximum stay rules, and sync with external iCal feeds.
+- Payment is processed at booking confirmation; the host payout is held in escrow and released 24 hours after guest check-in, minus the Airbnb host service fee.
+- After a completed stay, both guest and host can leave a verified review; reviews appear on the listing and user profile.
+
+## Non-functional requirements
+
+- **Scale**: 7 million active listings across 220 countries; 150 million registered guests; peak search traffic during summer and major holidays at 5× baseline.
+- **Search latency**: p99 search response < 300ms including geo-filter, availability second-pass, and ranking; p50 < 80ms.
+- **Booking consistency**: zero double-bookings — this is a hard requirement, not a target; the system must guarantee that no two confirmed bookings share a listing night.
+- **Search availability**: 99.99% uptime for the search path; a degraded search experience (without availability filtering) is acceptable under extreme load, booking must never return wrong data.
+- **Booking availability**: 99.9% uptime for the booking write path; short maintenance windows acceptable with clear messaging to guests.
+- **Calendar propagation**: host calendar updates (block/unblock dates, price changes) must propagate to the Elasticsearch search index within 30 seconds.
+- **Storage**: calendar table for 7M listings × 730-day lookahead ≈ 5.1 billion rows; photo CDN for approximately 420 TB of listing photos.
+
+<Capacity title="Airbnb Capacity Estimates">
+
+**Search query rate**
+
+$$\frac{150\text{M guests} \times 10\text{ sessions/month}}{30 \times 86{,}400} \approx 578 \text{ search queries/s (baseline)}$$
+
+Peak (summer/holiday 5× spike): $578 \times 5 \approx 2{,}890 \text{ queries/s}$
+
+**Calendar table size**
+
+$$7\text{M listings} \times 730\text{ days lookahead} \times 1\text{ row/night} = 5.11\text{B rows}$$
+
+At 50 bytes per row (listing_id, date, status, price_cents, booking_id): $5.11 \times 10^9 \times 50 \approx 256\text{ GB}$ raw data — small enough to partition by `listing_id` across a modest PostgreSQL cluster.
+
+**Elasticsearch index size**
+
+$$7\text{M listing documents} \times 2\text{ KB avg} = 14\text{ GB}$$
+
+Trivially fits in a single Elasticsearch cluster; no sharding complexity required. With replicas: $14\text{ GB} \times 2 \approx 28\text{ GB}$.
+
+**Booking write rate**
+
+$$\frac{150\text{M guests} \times 3\text{ bookings/year}}{86{,}400 \times 365} \approx 14.3 \text{ bookings/s}$$
+
+Peak (holiday season, 10× baseline): $\approx 143\text{ bookings/s}$ — easily handled by a single PostgreSQL primary with connection pooling via PgBouncer.
+
+**Photo storage**
+
+$$7\text{M listings} \times 20\text{ photos avg} \times 3\text{ MB avg} = 420\text{ TB}$$
+
+Stored in S3 with CloudFront CDN; multiple resolutions per photo (thumbnail 400×300, medium 1024×768, full 2048×1536) — approximately $420 \times 3 \approx 1.26\text{ PB}$ total including variants.
+
+</Capacity>
+
+## API design
+
+**Search listings**
+
+```text
+GET /api/v2/search
+  ?location={lat},{lng}
+  &check_in={YYYY-MM-DD}
+  &check_out={YYYY-MM-DD}
+  &guests={n}
+  &price_min={cents}
+  &price_max={cents}
+  &amenities[]={wifi,pool,kitchen,pets_allowed}
+  &listing_type={entire_home|private_room|shared_room}
+  &instant_book={true|false}
+  &page={n}
+  &page_size={20}
+```
+
+Response: `ListingSearchResponse { results: ListingCard[], total: int, next_cursor: string }`
+
+Each `ListingCard` contains: `listing_id`, `title`, `cover_photo_url`, `location { city, country, lat, lng }`, `price_per_night_cents`, `cleaning_fee_cents`, `avg_rating`, `review_count`, `is_instant_book`, `is_available` (set to true at this stage — confirmed in second pass).
+
+**Get listing detail**
+
+```text
+GET /api/v2/listings/{listing_id}
+```
+
+Response: full `Listing` object with photos array, amenities, host profile, house rules, cancellation policy, review summaries, and Smart Pricing enabled flag.
+
+**Get listing availability**
+
+```text
+GET /api/v2/listings/{listing_id}/availability
+  ?start_date={YYYY-MM-DD}
+  &end_date={YYYY-MM-DD}
+```
+
+Response: `AvailabilityResponse { available_dates: [date], blocked_dates: [date], booked_dates: [date], min_stay_by_date: {date: int} }` — drives the date picker UI on the listing detail page.
+
+**Create booking**
+
+```text
+POST /api/v2/bookings
+Content-Type: application/json
+
+{
+  "listing_id": "abc123",
+  "check_in": "2025-07-15",
+  "check_out": "2025-07-18",
+  "guests": 2,
+  "payment_method_id": "pm_stripe_xyz"
+}
+```
+
+Response (201 Created, Instant Book confirmed):
+
+```json
+{
+  "booking_id": "bk_789",
+  "listing_id": "abc123",
+  "check_in": "2025-07-15",
+  "check_out": "2025-07-18",
+  "total_nights": 3,
+  "subtotal_cents": 45000,
+  "cleaning_fee_cents": 8000,
+  "service_fee_cents": 7420,
+  "total_cents": 60420,
+  "status": "confirmed",
+  "cancellation_policy": "moderate"
+}
+```
+
+Response (409 Conflict, dates taken):
+
+```json
+{
+  "error": "dates_unavailable",
+  "message": "These dates are no longer available. Please select new dates."
+}
+```
+
+**Get booking status**
+
+```text
+GET /api/v2/bookings/{booking_id}
+```
+
+**Host calendar update**
+
+```text
+PATCH /api/v2/listings/{listing_id}/calendar
+Content-Type: application/json
+
+{
+  "updates": [
+    { "date": "2025-08-01", "status": "blocked", "reason": "personal_use" },
+    { "date": "2025-08-02", "status": "available", "price_cents": 18000 },
+    { "date": "2025-08-03", "status": "available", "min_stay_override": 3 }
+  ]
+}
+```
+
+**Submit review**
+
+```text
+POST /api/v2/bookings/{booking_id}/review
+Content-Type: application/json
+
+{
+  "rating": 5,
+  "cleanliness": 5,
+  "accuracy": 4,
+  "communication": 5,
+  "location": 5,
+  "check_in": 5,
+  "value": 4,
+  "comment": "Wonderful host, exactly as described."
+}
+```
+
+## Data model
+
+**listings (PostgreSQL)**
+
+```sql
+CREATE TABLE listings (
+  listing_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  host_id           UUID NOT NULL REFERENCES users(user_id),
+  title             VARCHAR(255) NOT NULL,
+  description       TEXT,
+  listing_type      VARCHAR(20) NOT NULL CHECK (listing_type IN ('entire_home','private_room','shared_room')),
+  lat               DECIMAL(9,6) NOT NULL,
+  lng               DECIMAL(9,6) NOT NULL,
+  city              VARCHAR(100),
+  country           VARCHAR(100),
+  max_guests        SMALLINT NOT NULL,
+  base_price_cents  INT NOT NULL,
+  cleaning_fee_cents INT NOT NULL DEFAULT 0,
+  amenities         TEXT[] NOT NULL DEFAULT '{}',
+  min_stay_nights   SMALLINT NOT NULL DEFAULT 1,
+  max_stay_nights   SMALLINT,
+  cancellation_policy VARCHAR(20) NOT NULL DEFAULT 'moderate',
+  is_instant_book   BOOLEAN NOT NULL DEFAULT FALSE,
+  smart_pricing_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  avg_rating        DECIMAL(3,2),
+  review_count      INT NOT NULL DEFAULT 0,
+  is_active         BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_listings_host ON listings(host_id);
+CREATE INDEX idx_listings_location ON listings USING GIST (
+  ll_to_earth(lat, lng)
+);
+```
+
+**listing_calendar (PostgreSQL, partitioned by listing_id)**
+
+```sql
+CREATE TABLE listing_calendar (
+  listing_id        UUID NOT NULL,
+  date              DATE NOT NULL,
+  status            VARCHAR(20) NOT NULL DEFAULT 'available'
+                    CHECK (status IN ('available','blocked','pending','booked')),
+  price_cents       INT NOT NULL,
+  booking_id        UUID,
+  min_stay_override SMALLINT,
+  PRIMARY KEY (listing_id, date)
+) PARTITION BY HASH (listing_id);
+
+CREATE TABLE listing_calendar_p0 PARTITION OF listing_calendar
+  FOR VALUES WITH (MODULUS 16, REMAINDER 0);
+CREATE TABLE listing_calendar_p1 PARTITION OF listing_calendar
+  FOR VALUES WITH (MODULUS 16, REMAINDER 1);
+```
+
+The `PRIMARY KEY (listing_id, date)` composite primary key is the linchpin of double-booking prevention — the database itself enforces uniqueness of the `(listing_id, date)` pair. No two rows can exist for the same listing and date, which means the conditional insert either succeeds or fails with a unique constraint violation, giving us conflict detection for free at the storage layer.
+
+**bookings (PostgreSQL)**
+
+```sql
+CREATE TABLE bookings (
+  booking_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  listing_id          UUID NOT NULL REFERENCES listings(listing_id),
+  guest_id            UUID NOT NULL REFERENCES users(user_id),
+  host_id             UUID NOT NULL,
+  check_in            DATE NOT NULL,
+  check_out           DATE NOT NULL,
+  total_nights        SMALLINT NOT NULL,
+  guest_count         SMALLINT NOT NULL,
+  subtotal_cents      INT NOT NULL,
+  cleaning_fee_cents  INT NOT NULL,
+  service_fee_cents   INT NOT NULL,
+  total_cents         INT NOT NULL,
+  status              VARCHAR(20) NOT NULL DEFAULT 'pending'
+                      CHECK (status IN ('pending','confirmed','cancelled','completed','disputed')),
+  cancellation_policy VARCHAR(20) NOT NULL,
+  payment_intent_id   VARCHAR(255),
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_bookings_listing ON bookings(listing_id, check_in);
+CREATE INDEX idx_bookings_guest   ON bookings(guest_id, created_at DESC);
+CREATE INDEX idx_bookings_host    ON bookings(host_id, created_at DESC);
+```
+
+**search_index (Elasticsearch)**
+
+```json
+{
+  "mappings": {
+    "properties": {
+      "listing_id":        { "type": "keyword" },
+      "title":             { "type": "text", "analyzer": "english" },
+      "description":       { "type": "text", "analyzer": "english" },
+      "location":          { "type": "geo_point" },
+      "listing_type":      { "type": "keyword" },
+      "max_guests":        { "type": "integer" },
+      "base_price_cents":  { "type": "integer" },
+      "amenities":         { "type": "keyword" },
+      "avg_rating":        { "type": "float" },
+      "review_count":      { "type": "integer" },
+      "is_instant_book":   { "type": "boolean" },
+      "is_active":         { "type": "boolean" },
+      "host_quality_score":{ "type": "float" },
+      "updated_at":        { "type": "date" }
+    }
+  }
+}
+```
+
+Note that `listing_calendar` data is deliberately **not** in Elasticsearch. The search index carries only listing metadata. Availability is always resolved against PostgreSQL in the second pass. This separation is the central architectural decision of the system.
+
+## System flows
+
+<Mermaid diagram={`flowchart TD
+  A[Guest: search request] --> B[Search API Gateway]
+  B --> C[Elasticsearch geo_distance + filters]
+  C --> D[Top 50 listing_ids ranked by score]
+  D --> E[Availability Service]
+  E --> F[PostgreSQL: listing_calendar batch query\\nWHERE listing_id IN ... AND date BETWEEN check_in AND check_out\\nAND status != 'available']
+  F --> G{Filter unavailable listings}
+  G --> H[Return ranked listing cards to guest]
+
+  I[Guest: submit booking] --> J[Booking API]
+  J --> K{Validate: dates, guests, listing active}
+  K --> L[BookingService.createBooking]
+  L --> M[BEGIN SERIALIZABLE transaction]
+  M --> N[INSERT calendar rows per night\\nON CONFLICT DO NOTHING]
+  N --> O{All nights inserted?}
+  O -- No conflicts --> P[INSERT bookings record]
+  P --> Q[Stripe charge payment]
+  Q --> R[COMMIT transaction]
+  R --> S[Publish booking-confirmed to Kafka]
+  S --> T[Elasticsearch index update async]
+  S --> U[Notify host via push/email]
+  O -- Conflict detected --> V[ROLLBACK]
+  V --> W[Return 409 dates_unavailable]`} />
+
+**Search flow (top half):** The guest's search request hits the Search API, which fires a single Elasticsearch query combining `geo_distance` filter (listing location within radius or viewport bounding box), `range` filter on `base_price_cents`, `terms` filter on `amenities`, `range` filter on `max_guests`, and `term` filter on `is_active=true`. Elasticsearch returns the top 50 `listing_id` values ranked by a combination of BM25 text score, `host_quality_score`, and price competitiveness. The Availability Service then batch-queries `listing_calendar` for all 50 listing IDs across the requested date range, filters out any listing with at least one night in a non-available status, and returns the surviving listings as the final result page. This two-pass approach means the guest sees at most 20 listings on the page (after filtering), but the Elasticsearch query always fetches 50 to ensure enough candidates survive the availability filter.
+
+**Booking flow (bottom half):** The guest submits `POST /api/v2/bookings`. The Booking API validates the request synchronously (listing exists and is active, check-in is today or future, check-out > check-in, guest count ≤ max_guests, minimum stay rule satisfied). Then `BookingService.createBooking` opens a serializable transaction, attempts to insert one `listing_calendar` row per night using `ON CONFLICT DO NOTHING`, counts how many rows were actually inserted, and compares against the expected night count. If any night was already occupied (the INSERT was silently skipped by conflict), the transaction rolls back and the guest receives a 409. If all nights inserted successfully, the booking record is created, Stripe captures payment, the transaction commits, and a Kafka event triggers async propagation to Elasticsearch and host notifications.
+
+## Deep dives
+
+### Geo-spatial listing search
+
+Elasticsearch's `geo_point` field type stores each listing's `(lat, lng)` as a single indexed point. A search by map viewport uses a `geo_bounding_box` query; a search by city name uses a `geo_distance` query with a computed center and radius (typically 25km for city searches, viewport-derived for map searches).
+
+The full Elasticsearch query for a search request looks like this:
+
+```json
+{
+  "query": {
+    "bool": {
+      "filter": [
+        { "term":  { "is_active": true } },
+        { "range": { "max_guests": { "gte": 2 } } },
+        { "range": { "base_price_cents": { "gte": 5000, "lte": 30000 } } },
+        { "terms": { "amenities": ["wifi", "pool"] } },
+        {
+          "geo_distance": {
+            "distance": "25km",
+            "location": { "lat": 37.7749, "lon": -122.4194 }
+          }
+        }
+      ],
+      "should": [
+        { "match": { "title": { "query": "beach house", "boost": 1.5 } } },
+        { "match": { "description": { "query": "beach house" } } }
+      ]
+    }
+  },
+  "sort": [
+    { "_score": "desc" },
+    { "host_quality_score": "desc" },
+    { "avg_rating": "desc" }
+  ],
+  "size": 50,
+  "_source": ["listing_id", "title", "location", "base_price_cents", "avg_rating", "is_instant_book"]
+}
+```
+
+The `filter` context is cached by Elasticsearch and does not contribute to relevance scoring, making it significantly faster than `query` context for hard constraints. The `should` clauses in query context contribute to BM25 relevance scoring for text searches like "beach house San Francisco."
+
+**`host_quality_score`** is a denormalized field computed offline (a nightly batch job) and stored in the Elasticsearch document. It combines: Superhost status (binary), acceptance rate (0–100%), response rate, average rating across all reviews, and number of verified amenities. This avoids any join at query time.
+
+**Availability freshness in the search index:** The Elasticsearch document does not carry day-level availability, so there is no staleness risk for the core question of "is this listing booked on July 15?" However, if a host deactivates a listing (`is_active = false`), that change must propagate to Elasticsearch within 30 seconds to prevent it from appearing in search. The `listing_calendar` Kafka consumer also updates the Elasticsearch `updated_at` field when a listing's availability changes significantly (e.g., all remaining July dates become booked), which can optionally trigger a de-prioritization signal.
+
+**Redis bitfield availability cache (optimization for hot listings):** For high-demand listings — those in the top 1% by booking frequency — the Availability Service maintains a Redis bitfield with one bit per day for the next 365 days. Bit 0 = unavailable, bit 1 = available. A date-range availability check becomes a bitfield range operation: `BITCOUNT key start_offset end_offset` or a Lua script that ANDs the range bits against an all-ones mask. This brings popular listing availability checks down from a PostgreSQL query to a sub-millisecond Redis read. Cache is updated synchronously on every calendar change for hot listings, and on a TTL-based refresh (30s) for warm listings.
+
+### Calendar model and double-booking prevention
+
+The `listing_calendar` table's design philosophy is **one row per night, not one row per booking**. This is the single most important data modeling decision in the system and it is worth defending in detail.
+
+**The alternative — storing bookings as date ranges** — is tempting because it matches how humans think: a booking is a check-in and check-out pair. A range-based model would be:
+
+```sql
+CREATE TABLE availability_blocks (
+  listing_id UUID NOT NULL,
+  start_date DATE NOT NULL,
+  end_date   DATE NOT NULL,
+  status     VARCHAR(20),
+  booking_id UUID
+);
+```
+
+To detect whether a new booking (say, July 15–18) conflicts with existing blocks, you write a query like:
+
+```sql
+SELECT COUNT(*) FROM availability_blocks
+WHERE listing_id = ?
+  AND status != 'available'
+  AND start_date < '2025-07-18'
+  AND end_date   > '2025-07-15';
+```
+
+This is an overlap query on intervals. It works, but it has serious problems: (1) it requires a `SELECT FOR UPDATE` to prevent TOCTOU races under concurrent load; (2) it cannot easily express non-contiguous patterns like "blocked every weekend but available weekdays" without creating many rows; (3) computing the price for a stay requires joining against potentially many rate rule rows; (4) minimum-stay rules per date are hard to represent.
+
+The per-night model eliminates all of these problems. Conflict detection is a simple `COUNT(*)` with equality predicates on `(listing_id, date, status)` — no interval arithmetic. The `PRIMARY KEY (listing_id, date)` constraint makes the database itself the conflict detector: a duplicate insert fails immediately. Custom pricing per night is a single column on the row. Minimum-stay overrides per night are a single column. Gap rules ("no 1-night gaps between bookings") are detectable by scanning adjacent calendar rows.
+
+**Double-booking prevention in detail.** The booking transaction works as follows:
+
+```sql
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+
+SELECT COUNT(*) AS conflicts
+FROM listing_calendar
+WHERE listing_id = 'abc123'
+  AND date BETWEEN '2025-07-15' AND '2025-07-17'
+  AND status != 'available';
+
+-- Application logic: if conflicts > 0, ROLLBACK and return 409.
+
+INSERT INTO listing_calendar (listing_id, date, status, price_cents, booking_id)
+VALUES
+  ('abc123', '2025-07-15', 'booked', 15000, 'bk_789'),
+  ('abc123', '2025-07-16', 'booked', 15000, 'bk_789'),
+  ('abc123', '2025-07-17', 'booked', 15000, 'bk_789')
+ON CONFLICT (listing_id, date) DO NOTHING;
+
+-- Application logic: verify 3 rows were actually inserted.
+-- If rows_inserted < 3: ROLLBACK and return 409.
+
+INSERT INTO bookings (booking_id, listing_id, ...) VALUES ('bk_789', 'abc123', ...);
+
+COMMIT;
+```
+
+Why `SERIALIZABLE` isolation? Under `READ COMMITTED` (PostgreSQL's default), two concurrent transactions can both read "0 conflicts" before either writes, then both proceed to insert — creating a double-booking. `REPEATABLE READ` prevents some anomalies but allows phantom reads, which is exactly the scenario here (a new row inserted by another transaction between the `SELECT COUNT` and the `INSERT`). `SERIALIZABLE` ensures that the execution is equivalent to some serial order, which guarantees exactly one transaction wins.
+
+In practice, the `ON CONFLICT DO NOTHING` clause with the `PRIMARY KEY` constraint provides an additional safety net. Even if the isolation level is weaker than desired, a duplicate `(listing_id, date)` insert silently does nothing, and the row count check catches the conflict. The combination of `SERIALIZABLE` + `ON CONFLICT DO NOTHING` + row count verification provides triple-layered protection.
+
+**Checkout night convention:** Following the hotel industry standard, the check-out night is never booked. A guest checking out July 18 means the listing_id rows for July 15, 16, 17 are marked `booked`; July 18 remains `available`. This allows a new guest to check in on July 18 without any gap, matching host and guest expectations.
+
+### Availability search integration
+
+The two-pass availability architecture deserves scrutiny because it introduces latency. Why not include availability in the Elasticsearch query and avoid the second pass entirely?
+
+The answer is the **consistency gap**: Elasticsearch is an eventually consistent search engine. When a booking completes, the calendar rows in PostgreSQL are updated immediately and durably. The Kafka event that triggers the Elasticsearch index update propagates with a 10–30 second lag. During this window, Elasticsearch may still show a listing as "available for July 15" when PostgreSQL knows it is booked. If Elasticsearch were the source of truth for availability, a guest could see an available listing, click through, and attempt to book — then get a confusing error after investing time on the listing detail page.
+
+More importantly, Elasticsearch does not support transactional reads. It cannot participate in the booking transaction. Any design that relies on Elasticsearch for availability correctness has a fundamental race condition.
+
+The two-pass design acknowledges this reality and works with it:
+
+1. **Elasticsearch** answers the question: "which listings in this area roughly match the guest's criteria?" It is fast (< 50ms), scalable, and handles geo-search natively. It is allowed to be slightly stale on availability.
+2. **PostgreSQL** answers the question: "of these candidates, which are definitively available for the requested dates?" It is the source of truth. The batch query `WHERE listing_id IN (50 ids) AND date BETWEEN ? AND ? AND status != 'available'` is a point lookup on the primary key — extremely fast with proper indexing.
+
+The batch calendar query for 50 listings over a 7-day stay requires checking 350 (listing × night) combinations. With the `PRIMARY KEY (listing_id, date)` index, PostgreSQL resolves this in a single index scan per partition. Total latency for this second pass: 15–40ms depending on cache temperature.
+
+**Availability filter hit rate:** During peak season for popular destinations, the second pass may filter out 70–80% of Elasticsearch candidates (many listings are fully booked). The search result page returns fewer than 20 listings despite requesting 50 candidates. The solution is to fetch more candidates from Elasticsearch (100–200) during high-demand periods, detected by a demand signal from the booking rate time-series.
+
+### Dynamic pricing and Smart Pricing
+
+Airbnb's Smart Pricing is an ML model that suggests nightly prices to hosts. Understanding the feature design is important even if the ML internals are out of scope for a system design interview.
+
+**Host base price** is set by the host and stored in `listings.base_price_cents`. This is the default price for any available night.
+
+**Smart Pricing suggestions** are computed by a batch pricing pipeline running nightly (and reactively on significant demand changes). The pipeline outputs a suggested price per night for each listing for the next 365 days. These suggestions are stored in a `listing_price_suggestions` table with `(listing_id, date, suggested_price_cents, computed_at)`. The host sees the suggestions in their hosting dashboard and can accept (updating `listing_calendar.price_cents` for the date) or override.
+
+**Pricing features for the ML model:**
+
+```yaml
+temporal_features:
+  - day_of_week (Sunday commands premium in leisure markets, Friday in business markets)
+  - days_until_check_in (high lead time = lower demand = lower price suggestion)
+  - is_holiday (major holidays: 1.5-3x multiplier)
+  - is_local_event (concerts, sports, conferences: 1.2-5x multiplier)
+
+market_features:
+  - median_price_comparable_listings_25km (base market rate signal)
+  - occupancy_rate_local_market_30d (high occupancy = higher prices)
+  - search_impressions_for_listing_7d (high demand signal for this specific listing)
+
+listing_features:
+  - historical_booking_rate_same_date_last_year
+  - avg_booking_lead_time_for_listing
+  - host_acceptance_rate (reluctant hosts need lower prices to fill calendar)
+```
+
+**Price shown to guests in search:** The listing card in search results shows the `listing_calendar.price_cents` for the first available night in the requested range, plus cleaning fee amortized across nights. If the guest hasn't specified dates, the `listings.base_price_cents` is shown with a "starting from" label.
+
+**Pricing transparency on the booking page:** The breakdown is always shown before confirmation:
+
+```text
+$150 × 3 nights          $450
+Cleaning fee              $80
+Airbnb service fee        $74
+Total                    $604
+```
+
+The service fee (~14%) is non-negotiable and goes to Airbnb. The host receives the nightly rate plus cleaning fee minus a host service fee (typically 3%).
+
+### Instant Book vs. Request to Book
+
+**Instant Book** (approximately 60% of active listings) is the simpler flow: the guest submits the booking request, the system immediately runs the calendar conflict check and payment capture in a single transaction, and the booking is confirmed. The host is notified after the fact. Airbnb strongly incentivizes Instant Book because it eliminates friction in the booking funnel and reduces the "browsing paralysis" that comes from waiting for host approval.
+
+**Request to Book** introduces a 24-hour approval window. During this window:
+
+1. The calendar rows for the requested dates are set to `status = 'pending'` with the `booking_id` of the pending request.
+2. No other booking can claim those dates (the pending status is treated as occupied in the conflict check).
+3. The payment method is authorized but not captured.
+4. The host receives a notification and has 24 hours to accept or decline.
+
+If the host **accepts**: the calendar rows flip from `pending` to `booked`, payment is captured, and the booking is confirmed.
+
+If the host **declines or times out**: a background job (`PendingBookingExpiry` scheduled every 5 minutes) scans for pending bookings older than 24 hours, rolls back the calendar rows to `available`, voids the payment authorization, and notifies the guest.
+
+The soft-hold period has a subtle trade-off: while a Request to Book is pending, the listing appears as unavailable to other guests for those dates. This is intentional — it prevents a host from entertaining multiple simultaneous requests for the same dates. However, it does create a scenario where a guest's dates are "held hostage" during the host review window. Airbnb mitigates this by enforcing response time SLAs and penalizing hosts with low response rates in search ranking.
+
+### iCal sync for multi-platform hosts
+
+Many hosts list on multiple platforms (Airbnb, VRBO, Booking.com) simultaneously. To prevent double-bookings across platforms, Airbnb supports iCal export (allowing other platforms to read Airbnb's calendar) and iCal import (allowing Airbnb to consume external calendars).
+
+The iCal import flow works as follows:
+
+1. Host provides a URL to their external iCal feed in their Airbnb hosting dashboard.
+2. A `CalendarSyncJob` runs every 15 minutes per synced listing, fetching the iCal feed via HTTP.
+3. The iCal events are parsed and compared against the current `listing_calendar` state.
+4. Dates newly blocked on the external calendar are set to `status = 'blocked'` in Airbnb's `listing_calendar`.
+5. Dates that were previously blocked by the external calendar but are now open are set back to `status = 'available'`.
+
+The sync job uses a `calendar_sync_sources` table to track the last-synced etag/timestamp per feed, avoiding redundant processing. iCal-imported blocks use `reason = 'external_ical'` to distinguish them from host-created blocks, enabling clean rollback if the feed changes.
+
+## Java integration
+
+### Part A — BookingService.java
+
+```java
+@Service
+@RequiredArgsConstructor
+public class BookingService {
+
+    private final ListingCalendarRepository calendarRepo;
+    private final BookingRepository         bookingRepo;
+    private final PaymentService            paymentService;
+    private final KafkaTemplate<String, BookingEvent> kafka;
+
+    @Transactional(isolation = Isolation.SERIALIZABLE)
+    public BookingResult createBooking(BookingRequest req) {
+        List<LocalDate> nights = datesInRange(req.checkIn(), req.checkOut());
+
+        long conflicts = calendarRepo.countConflicts(
+            req.listingId(), req.checkIn(), req.checkOut()
+        );
+        if (conflicts > 0) {
+            return BookingResult.unavailable("Dates already taken.");
+        }
+
+        UUID bookingId = UUID.randomUUID();
+        int  rowsInserted = 0;
+        for (LocalDate night : nights) {
+            rowsInserted += calendarRepo.insertIfAvailable(
+                req.listingId(), night, bookingId, req.pricePerNightCents()
+            );
+        }
+        if (rowsInserted < nights.size()) {
+            throw new OptimisticLockException("Concurrent booking conflict detected.");
+        }
+
+        Booking booking = bookingRepo.save(Booking.builder()
+            .bookingId(bookingId)
+            .listingId(req.listingId())
+            .guestId(req.guestId())
+            .checkIn(req.checkIn())
+            .checkOut(req.checkOut())
+            .totalNights(nights.size())
+            .guestCount(req.guests())
+            .subtotalCents(req.pricePerNightCents() * nights.size())
+            .cleaningFeeCents(req.cleaningFeeCents())
+            .serviceFeeCents(req.serviceFeeCents())
+            .totalCents(req.totalCents())
+            .status(BookingStatus.PENDING)
+            .cancellationPolicy(req.cancellationPolicy())
+            .build());
+
+        PaymentResult payment = paymentService.capture(
+            req.paymentMethodId(), booking.getTotalCents(), bookingId.toString()
+        );
+        if (!payment.isSuccess()) {
+            throw new PaymentFailedException(payment.errorCode());
+        }
+
+        booking.setStatus(BookingStatus.CONFIRMED);
+        booking.setPaymentIntentId(payment.intentId());
+        bookingRepo.save(booking);
+
+        kafka.send("booking-events", bookingId.toString(),
+            new BookingEvent(bookingId, req.listingId(), BookingEventType.CONFIRMED));
+
+        return BookingResult.success(booking);
+    }
+
+    private List<LocalDate> datesInRange(LocalDate checkIn, LocalDate checkOut) {
+        return checkIn.datesUntil(checkOut).collect(Collectors.toList());
+    }
+
+    public sealed interface BookingResult permits BookingResult.Success, BookingResult.Unavailable {
+        record Success(Booking booking) implements BookingResult {}
+        record Unavailable(String reason) implements BookingResult {}
+
+        static BookingResult success(Booking b) { return new Success(b); }
+        static BookingResult unavailable(String r) { return new Unavailable(r); }
+    }
+}
+```
+
+### Part B — BookingController.java
+
+```java
+@RestController
+@RequestMapping("/api/v2")
+@RequiredArgsConstructor
+public class BookingController {
+
+    private final BookingService     bookingService;
+    private final ListingService     listingService;
+    private final AvailabilityService availabilityService;
+
+    @PostMapping("/bookings")
+    public ResponseEntity<?> createBooking(
+            @RequestBody BookingRequest req,
+            @AuthenticationPrincipal JwtUser caller) {
+
+        req = req.withGuestId(caller.userId());
+
+        Listing listing = listingService.getActiveOrThrow(req.listingId());
+        if (req.guests() > listing.maxGuests()) {
+            return ResponseEntity.badRequest().body(Map.of(
+                "error", "too_many_guests",
+                "message", "This listing allows up to " + listing.maxGuests() + " guests."
+            ));
+        }
+        if (!req.checkIn().isBefore(req.checkOut()) || req.checkIn().isBefore(LocalDate.now())) {
+            return ResponseEntity.badRequest().body(Map.of(
+                "error", "invalid_dates",
+                "message", "Check-in must be today or future and before check-out."
+            ));
+        }
+
+        BookingService.BookingResult result = bookingService.createBooking(req);
+
+        return switch (result) {
+            case BookingService.BookingResult.Success s ->
+                ResponseEntity.status(HttpStatus.CREATED).body(BookingResponse.from(s.booking()));
+            case BookingService.BookingResult.Unavailable u ->
+                ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of(
+                    "error", "dates_unavailable",
+                    "message", "These dates are no longer available. Please select new dates."
+                ));
+        };
+    }
+
+    @GetMapping("/listings/{listingId}/availability")
+    public ResponseEntity<AvailabilityResponse> getAvailability(
+            @PathVariable UUID listingId,
+            @RequestParam @DateTimeFormat(iso = ISO.DATE) LocalDate startDate,
+            @RequestParam @DateTimeFormat(iso = ISO.DATE) LocalDate endDate) {
+
+        AvailabilityResponse response = availabilityService.getAvailability(
+            listingId, startDate, endDate
+        );
+        return ResponseEntity.ok(response);
+    }
+}
+```
+
+**Key design notes for the Java implementation:**
+
+The `@Transactional(isolation = Isolation.SERIALIZABLE)` annotation on `createBooking` is non-negotiable. PostgreSQL's default `READ COMMITTED` allows two concurrent transactions to both pass the `countConflicts` check before either writes, creating a double-booking. `SERIALIZABLE` ensures the execution is equivalent to running the two transactions sequentially — one will succeed, one will get a serialization failure exception (SQLSTATE 40001), which Spring retranslates to a `CannotAcquireLockException`. The controller should catch this and retry with exponential backoff or return a 409.
+
+The `calendarRepo.insertIfAvailable` method maps to a native query using `INSERT ... ON CONFLICT (listing_id, date) DO NOTHING` and returns the number of rows actually inserted. This provides the secondary conflict check: even if `SERIALIZABLE` is somehow bypassed (e.g., due to connection pool misconfiguration), the unique constraint violation catches the duplicate and `rowsInserted < nights.size()` triggers a rollback.
+
+The `PaymentFailedException` causes Spring to roll back the transaction, which cascade-deletes the calendar rows that were inserted in the same transaction. This is critical: if payment fails, the calendar must be restored to `available` — we cannot leave the dates marked `booked` with no associated payment. The transactional guarantee handles this automatically.
+
+<TradeoffTable
+  columns={["Approach", "Double-Booking Risk", "Search + Availability Integration", "Write Load", "Consistency"]}
+  rows={[
+    ["Single table (bookings only, no calendar)", "HIGH — interval overlap queries have TOCTOU races without aggressive locking", "Complex — must join bookings table for every search availability check; slow at scale", "Low write load (one row per booking)", "Weak — race conditions under concurrent bookings for the same listing"],
+    ["Relational DB row lock (SELECT FOR UPDATE on booking ranges)", "MEDIUM — SELECT FOR UPDATE serializes access but requires full table scan for overlap detection; deadlock risk with multiple listings", "Hard — no per-night index; availability check is an interval query across potentially many overlapping rows", "Low — one range row per booking; many fewer rows than per-night model", "Strong if implemented correctly, but complex to get right; deadlock recovery adds latency"],
+    ["Calendar table with conditional insert (per-night rows)", "LOW — PRIMARY KEY constraint + SERIALIZABLE transaction provides database-enforced uniqueness per (listing_id, date)", "Clean — availability check is a point lookup on the primary key; O(listing_count × nights) batch query is fast", "Higher — one row per night × per listing; 5.1B rows for 7M listings × 730 days", "Strong — unique constraint is enforced at the storage layer, not the application layer"],
+    ["Calendar table + Redis bitfield availability cache (Airbnb approach)", "LOW — same as above; Redis is only for read acceleration, PostgreSQL is still the write source of truth", "Best — hot listing availability is sub-millisecond via Redis bitfield; cold listing fallback to PostgreSQL; Elasticsearch handles geo+filter independently", "Same as calendar table + Redis write-through on every calendar change for hot listings", "Strong — two layers of consistency: PostgreSQL for writes, Redis as accelerated read cache updated synchronously"]
+  ]}
+/>
+
+<Pitfall>
+**Mixing availability into the Elasticsearch search index.** Elasticsearch is eventually consistent by design — index updates after a booking lag by 10 to 30 seconds. If availability is stored in the ES document (e.g., an `available_dates` array or `next_available_date` field), the search result will show listings as available when they are actually booked in PostgreSQL. A guest clicks through, invests time reading the listing, goes to book, and gets a jarring "dates unavailable" error. More dangerously, if you attempt to use Elasticsearch as the conflict check in the booking flow, you have introduced a race condition: ES returns "available" while PostgreSQL's calendar table already has those dates marked booked by a concurrent transaction that committed 20 seconds ago. Always perform the availability check against PostgreSQL's `listing_calendar` as the source of truth. Elasticsearch's role is geo-spatial filtering and relevance ranking only.
+</Pitfall>
+
+<Pitfall>
+**Storing availability as date ranges instead of per-night rows.** A `(start_date, end_date)` range model for calendar blocks seems natural — it maps directly to how bookings are described. But it turns conflict detection into an interval overlap problem: `WHERE start_date < checkout AND end_date > checkin`. This query has no clean primary key to enforce uniqueness, requiring application-level locking via `SELECT FOR UPDATE`. Minimum-stay rules per date, custom nightly pricing, and gap rules (no single-night gaps between bookings) become painful to represent. Under concurrent load, the `SELECT FOR UPDATE` on range rows creates lock contention and deadlock risk. The per-night row model — one row per `(listing_id, date)` — makes conflict detection a trivial `COUNT(*)` on equality predicates, makes per-night pricing a single column, and lets the `PRIMARY KEY` constraint be the conflict enforcer. The cost is a larger table (5.1 billion rows), which is manageable with PostgreSQL hash partitioning by `listing_id`.
+</Pitfall>
+
+<Curveball>
+**"Airbnb wants to add 'Flexible Dates' search — show me listings available for any 3-night stay in July. How do you efficiently query availability across all July date combinations for 7M listings?"**
+
+This is a genuinely hard query optimization problem. A naive approach — iterate over all July start dates (July 1–29 for 3-night stays), check availability for each combination — is 29 queries per listing × 7M listings = 203M queries, obviously untenable.
+
+The correct approach uses a pre-computed availability bitmap. For each listing, maintain a Redis bitfield where bit `n` = 1 if night `n` (offset from today) is available, 0 if not. A "3 consecutive available nights starting any time in July" check becomes: iterate over July offsets and use `GETBIT` + two adjacent bits to find any 3-consecutive-1s subsequence. This is O(30) Redis operations per candidate listing. With Elasticsearch pre-filtering to ~10K candidates, that's 300K Redis operations — fast enough.
+
+Alternatively, add an Elasticsearch field `available_night_count_by_month` (e.g., `{"2025-07": 22}`) updated by the async calendar sync job. Filter candidates with `available_night_count_by_month.2025-07 >= 3` before the Redis bitfield check. This two-stage filter reduces candidates further.
+
+At the database level, a covering index on `(listing_id, date, status)` allows a fast GROUP BY query: `SELECT listing_id, COUNT(*) as available_nights FROM listing_calendar WHERE date BETWEEN '2025-07-01' AND '2025-07-31' AND status = 'available' GROUP BY listing_id HAVING COUNT(*) >= 3`. This works for "at least 3 available nights in July" but not for "3 consecutive nights." The bitfield approach handles the consecutive requirement.
+</Curveball>
+
+<Curveball>
+**"A property management company manages 50 listings on Airbnb and needs to sync availability from their PMS to Airbnb in real-time via API. How do you design the calendar sync API to handle 50 calendars updating simultaneously without double-bookings?"**
+
+The key insight is that PMS sync must treat existing confirmed bookings as sacred — the PMS cannot overwrite an Airbnb-confirmed booking by pushing a "blocked" status for those dates. The sync API needs to distinguish between host-controlled blocks and booking-controlled blocks.
+
+Design: the `PATCH /api/v2/listings/{listingId}/calendar` endpoint accepts a `source = 'pms'` flag. For each date in the update:
+- If `listing_calendar.status = 'booked'` (an Airbnb-confirmed booking): skip the update, return a warning in the response.
+- If `listing_calendar.status = 'pending'` (a pending request): skip the update, treat as booked for the PMS.
+- If `listing_calendar.status = 'available'` or `'blocked'`: apply the PMS update.
+
+For 50 simultaneous calendar pushes, use optimistic concurrency: each `PATCH` includes the `updated_at` timestamp of the last sync, and the calendar table has a `pms_sync_version` column. If the `pms_sync_version` has changed since the PMS last read, return a 409 with the conflicting dates so the PMS can re-fetch and reconcile.
+
+Rate limiting: 50 listings × 365 days = 18,250 potential calendar rows per sync cycle. Batch the updates: accept up to 500 date updates per API call, allowing a full year sync in 37 calls. The API processes updates within a single transaction per listing to avoid partial updates leaving the calendar in an inconsistent state.
+</Curveball>
+
+<Curveball>
+**"After booking, a guest discovers the listing doesn't match its description — fake photos, missing amenities. Design the dispute resolution flow that freezes the host's payout, documents evidence, and resolves the dispute within 72 hours."**
+
+The dispute flow spans three systems: the booking system, the payments system, and a human-in-the-loop review system (Airbnb's Trust and Safety team).
+
+**Day 0 (dispute filed):** Guest submits a dispute via `POST /api/v2/bookings/{bookingId}/dispute` with `reason`, `description`, and photo evidence (S3 URLs). The booking status transitions to `disputed`. The host's payout — which is normally released 24 hours after check-in — is frozen: the payment service marks the payout hold as `dispute_hold` and does not release funds.
+
+**Day 0–72 (evidence collection):** Both parties have 24 hours to submit evidence via `POST /api/v2/disputes/{disputeId}/evidence`. Evidence is stored in an `dispute_evidence` table referencing the dispute_id. The system automatically collects supporting data: original listing photos (versioned in S3 with timestamps to detect post-booking edits), the guest's check-in location (GPS from the app), and the original listing description at time of booking (stored as a snapshot in the bookings table at booking creation time — `listing_snapshot_json`).
+
+**Automated triage:** An ML classifier scores the dispute on likely validity based on: photo similarity between reported evidence and listing photos (embedding cosine distance), prior dispute rate for this host, guest's dispute history, and description delta between listing snapshot and current listing. High-confidence fraudulent listings are auto-resolved in the guest's favor; ambiguous cases route to a human Trust and Safety agent.
+
+**Resolution:** Agent makes a decision within 72 hours via the internal admin tool. Outcome options: (a) full refund to guest, host payout cancelled; (b) partial refund, reduced host payout; (c) no refund, full host payout released. The booking status updates to `dispute_resolved`. The listing may be flagged for re-verification or delisted if fraud is confirmed.
+</Curveball>
+
+## Further reading
+
+- Airbnb Engineering Blog: "Chronos: Airbnb's Distributed Calendar Service" — covers the evolution of Airbnb's calendar storage from a range-based model to the per-night row model, and the distributed coordination challenges at scale.
+- Airbnb Engineering Blog: "How We Built Our Search Discovery Experience" (2022) — covers the two-pass search architecture, Elasticsearch query structure, and the ranking model that weights host quality, price competitiveness, and availability freshness.
+- PostGIS documentation — spatial indexing for lat/lng queries using GiST indexes and the `earth_distance` extension, an alternative to Elasticsearch geo_point for smaller datasets where SQL is preferred over a separate search cluster.
+- "Designing Data-Intensive Applications" by Martin Kleppmann — Chapter 7 (Transactions) provides the theoretical foundation for why SERIALIZABLE isolation is required for the booking conflict check and what "serializability" means in terms of concurrent execution equivalence.
+- Stripe API documentation: Payment Intents and the authorize-then-capture flow — relevant for understanding how payment authorization works during the Request to Book window and how payment capture is triggered on host acceptance.
+
+<RelatedQuestions items={[
+  { slug: "uber-ride-matching", title: "Design Uber Ride Matching", difficulty: "senior" },
+  { slug: "ticketmaster", title: "Design Ticketmaster", difficulty: "senior" },
+  { slug: "stripe-payment-gateway", title: "Design Stripe's Payment Gateway", difficulty: "staff" },
+]} />

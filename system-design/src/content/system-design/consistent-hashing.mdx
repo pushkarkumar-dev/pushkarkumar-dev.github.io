@@ -1,0 +1,441 @@
+---
+title: "Design a Consistent Hashing & Sharding Service"
+slug: "consistent-hashing"
+category: "foundations"
+difficulty: "senior"
+estimatedReadMinutes: 20
+tags: ["consistent-hashing", "virtual-nodes", "sharding", "rebalancing", "dynamo", "jump-hash"]
+companyFlavors: ["Amazon DynamoDB", "Apache Cassandra", "Riak", "Chord DHT", "Redis Cluster"]
+prerequisites: []
+relatedQuestions: ["distributed-kv-store", "design-a-cache", "distributed-rate-limiter"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Design the ring-based consistent hashing algorithm that powers DynamoDB and Cassandra — covering virtual nodes, rebalancing cost, hotspot prevention, and when to use jump hash instead."
+javaPackages: ["com.google.guava:guava:33.2.1"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="consistent-hashing" title="Design a Consistent Hashing & Sharding Service" />
+
+<Tldr>
+- **Consistent hashing** maps both keys and nodes to a ring `[0, 2^32)`; a key is served by the first node clockwise. Adding or removing a node moves only `O(k/n)` keys — not the entire keyspace.
+- **Naive hashing** (`key % n`) moves `O(k)` keys on any topology change — a cache cluster of 100 nodes replacing one node invalidates nearly the entire working set.
+- **Virtual nodes (vnodes)**: each physical node holds 100–150 positions on the ring, producing statistically uniform load distribution even with heterogeneous hardware — a 2× more powerful node gets 2× the vnode count.
+- **Replication**: each key is stored on the next `R` nodes clockwise; coordinator handles reads/writes with quorum (`N=3, R=2, W=2` is the DynamoDB default), ensuring at least one replica overlap between any read and write quorum.
+- **Jump hash**: `O(1)` time, `O(1)` space alternative to the ring; perfect for stateless partitioning on homogeneous nodes, but requires sequential numeric node IDs — unusable when nodes have arbitrary names, when you need replication grouping, or when a specific node must own a specific key range.
+</Tldr>
+
+## The problem with modular hashing
+
+Modular hashing is seductive in its simplicity: `shard = hash(key) % n`. Hash the key to an integer, take the modulus of the node count, and you have a perfectly balanced mapping. For a static cluster this works fine. The problem arrives the moment `n` changes.
+
+When you add a single node to a 100-node cluster, `n` changes from 100 to 101. Every key whose `hash(key) % 100 != hash(key) % 101` — which is approximately 99% of all keys — now maps to a different shard. For a distributed cache, this is catastrophic: the entire working set is simultaneously invalidated, and every request falls through to the origin database. If your cache was absorbing 95% of traffic, you just fired a full-load SQL volley at a database provisioned for 5% of that traffic. This pattern has a name in post-mortems: the **re-shard storm**.
+
+The same problem manifests for a distributed key-value store or a sharded database. Removing a node (whether planned for scale-down or unplanned due to failure) means that the data those keys pointed to must be migrated across the cluster — and if you don't have a clean mapping of "this key was on shard 7, now it belongs on shard 3", you have a consistency problem, not just a performance problem. The migration has to be coordinated, and during migration, reads can return stale or missing data.
+
+Consistent hashing was introduced precisely to break this dependency between key assignment and cluster size. The insight: instead of computing `hash(key) % n`, map both keys and nodes onto the same abstract ring and use proximity — "which node is clockwise-nearest to this key?" — as the assignment function. Now adding or removing a single node only affects the keys in the arc immediately preceding it on the ring, leaving all other assignments untouched.
+
+## Clarifying questions
+
+Before sketching any architecture, lock down these eight questions. Each one gates a significant design decision:
+
+| Question | Ideal answer | Why it matters |
+|---|---|---|
+| Are nodes homogeneous or heterogeneous? | Heterogeneous (different RAM/CPU) | Determines vnode count per node — equal vnodes on unequal hardware causes load imbalance |
+| What is the read/write ratio and consistency requirement? | Read-heavy with eventual consistency | Drives quorum configuration: lower R for read perf, lower W for write perf |
+| What replication factor? | 3 (standard for HA) | N=3 is the DynamoDB/Cassandra default; fewer means less fault tolerance, more means write amplification |
+| Do nodes need stable names or IDs? | Yes, nodes are named (e.g., `redis-1.us-east`) | Named nodes → consistent hashing ring; anonymous sequential IDs → jump hash is viable |
+| Is the key space known upfront? | No — keys are user-generated | Rules out range-based sharding; consistent hashing handles arbitrary hash distributions |
+| How often do nodes join and leave? | Infrequently (planned scaling events, not seconds) | Frequent churn means the ring is constantly rebalancing; at very high churn, Chord-style DHT routing may be preferred |
+| Is this cross-datacenter? | Multi-region active-active | Adds rack/zone awareness to replica placement — you never want all 3 replicas in the same AZ |
+| What is being sharded? | Distributed cache, KV store, or database partition | Cache tolerates key movement (cache miss); database does not — data must be physically migrated |
+
+## Functional requirements
+
+- `getNode(key)` — return the primary node responsible for a given key in `O(log n)` time
+- `getReplicaNodes(key, count)` — return the next `count` distinct physical nodes clockwise from the key's hash position (for replication)
+- `addNode(nodeInfo)` — add a node to the ring, distributing its vnodes across the ring; only keys in the predecessor arc migrate
+- `removeNode(nodeId)` — gracefully remove a node, transferring its key range to the successor node
+- Ring state must be consistent across all clients querying the same ring instance; ring updates must be serializable
+- Support heterogeneous node weights: a node with `weight=2` receives 2× as many vnodes as a node with `weight=1`
+
+## Non-functional requirements
+
+- **Lookup latency**: `O(log n)` per key lookup using a sorted ring structure — for 15,000 vnode positions this is ~14 comparisons, sub-microsecond in memory
+- **Load balance**: even distribution within ±10% of the mean across all physical nodes, sustained across the full key distribution
+- **Key movement on topology change**: adding or removing one node should move at most `O(k/n)` keys — ideally exactly `1/n` of the keyspace
+- **Replication placement**: replica nodes must be distinct physical nodes (not just distinct vnodes) and should span availability zones when possible
+- **Ring state convergence**: after a topology change, all clients should observe the updated ring within a configurable gossip TTL (typically < 5 seconds in Cassandra's implementation)
+
+## Capacity estimation
+
+<Capacity title="Ring sizing and rebalancing cost for a 100-node cluster with 150 vnodes each">
+
+**Ring size and vnode density**
+
+The ring spans $[0, 2^{32})$ — approximately $4 \times 10^9$ positions.
+
+With $100$ physical nodes and $150$ vnodes each:
+
+$$
+\text{total vnode positions} = 100 \times 150 = 15{,}000
+$$
+
+$$
+\text{average arc span} = \frac{2^{32}}{15{,}000} \approx 286{,}331 \text{ positions per vnode}
+$$
+
+If keys are uniformly distributed, each vnode owns roughly $286K$ keys. With 150 vnodes per physical node, each physical node owns about $286K \times 150 = 42.9M$ keys on average.
+
+**Rebalancing cost: consistent hashing vs. modular hashing**
+
+Adding 1 node to a 100-node consistent hash ring:
+
+$$
+\text{keys moved} = \frac{k}{n+1} \approx \frac{k}{101} \approx 0.99\% \text{ of total keys}
+$$
+
+Adding 1 node to a 100-node modular hash ring:
+
+$$
+\text{keys moved} \approx \frac{n}{n+1} \times k = \frac{100}{101} \times k \approx 99\% \text{ of total keys}
+$$
+
+**Ring memory footprint**
+
+Each ring entry: 8 bytes (hash position as `long`) + pointer to `NodeInfo` object (~64 bytes). For 15,000 vnodes:
+
+$$
+\text{ring memory} = 15{,}000 \times (8 + 64) \approx 1.08 \text{ MB}
+$$
+
+The ring lives entirely in process memory — it is cheap to replicate to every application node via gossip.
+
+</Capacity>
+
+## API design
+
+The hashing service exposes four operations. Keep the surface minimal — callers should never need to know internal ring mechanics:
+
+```
+// Core lookup — returns the primary node for a given key
+NodeInfo getNode(String key)
+
+// Replica lookup — returns count distinct physical nodes, in clockwise order
+List<NodeInfo> getReplicaNodes(String key, int count)
+
+// Topology mutation — adds a node with an optional weight (default 1)
+void addNode(NodeInfo node, int weight)
+
+// Topology mutation — removes a node by its stable ID
+void removeNode(String nodeId)
+```
+
+`NodeInfo` is a plain value type: `{ id: String, host: String, port: int, datacenter: String, rack: String }`. The datacenter and rack fields drive zone-aware replica placement. Clients poll for topology changes via a gossip protocol or subscribe to a configuration store (ZooKeeper, etcd) — the hash ring itself is stateless given a node list.
+
+## Data model
+
+The ring is represented as a `TreeMap<Long, NodeInfo>` — a red-black tree keyed by hash position. This gives `O(log n)` insertion, deletion, and range search. The critical operation — "find the first node clockwise from position `p`" — maps directly to `TreeMap.ceilingKey(p)`, with a wrap-around fallback to `firstKey()` when `p` exceeds all positions.
+
+```
+Ring (TreeMap<Long, NodeInfo>):
+  Position 0x0A3F...  → NodeInfo { id="node-A", host="10.0.1.1", ... }
+  Position 0x1C22...  → NodeInfo { id="node-B", host="10.0.1.2", ... }
+  Position 0x2B91...  → NodeInfo { id="node-A", host="10.0.1.1", ... }  ← vnode #2 of A
+  Position 0x3E4D...  → NodeInfo { id="node-C", host="10.0.1.3", ... }
+  ...                   (15,000 entries for 100 nodes × 150 vnodes)
+```
+
+Virtual nodes are stored as separate entries in the same TreeMap. The vnode key is computed as `hash(nodeId + "#" + vnodeIndex)` — this spreads each node's positions uniformly across the ring, rather than clustering them, which is what produces the statistical load balance guarantee.
+
+## High-level architecture
+
+<Mermaid caption="Consistent hash ring with 3 nodes (A, B, C) and 3 vnodes each. Key K1 falls between C3 and A1, so it routes to node A. Key K2 falls between A2 and B1, routing to node B." diagram={`graph LR
+  subgraph Ring["Hash Ring — 0 to 2³²"]
+    direction LR
+    A1["A vnode-1\n0x0A3F"] --> B1["B vnode-1\n0x1C22"]
+    B1 --> A2["A vnode-2\n0x2B91"]
+    A2 --> C1["C vnode-1\n0x3E4D"]
+    C1 --> B2["B vnode-2\n0x5A10"]
+    B2 --> A3["A vnode-3\n0x6F88"]
+    A3 --> C2["C vnode-2\n0x80C4"]
+    C2 --> B3["B vnode-3\n0xA312"]
+    B3 --> C3["C vnode-3\n0xCB70"]
+    C3 --> A1
+  end
+  K1["key K1\nhash=0xD100"] -->|clockwise| A1
+  K2["key K2\nhash=0x2E00"] -->|clockwise| C1`} />
+
+<Mermaid caption="Request flow: client hashes a key, looks up the ring, gets a node list, and routes the request. The coordinator node handles replication to the next N-1 clockwise nodes." diagram={`sequenceDiagram
+  autonumber
+  participant C as Client
+  participant RL as HashRing
+  participant N1 as Node A (primary)
+  participant N2 as Node B (replica-1)
+  participant N3 as Node C (replica-2)
+
+  C->>RL: getReplicaNodes("user:123", 3)
+  RL-->>C: [Node-A, Node-B, Node-C]
+  C->>N1: PUT user:123 = {data} (W=2 quorum)
+  N1->>N2: replicate user:123
+  N2-->>N1: ACK
+  N1-->>C: 200 OK (W quorum met)
+  N1->>N3: replicate user:123 (async)
+  Note over N1,N3: Third replica written asynchronously`} />
+
+## Deep dives
+
+### Ring construction and lookup
+
+Hash function selection is the first decision. **MD5 and SHA-1** produce good uniform distributions but are slower than purpose-built non-cryptographic hashes. **MurmurHash3** (128-bit output) is the production choice: it runs at ~2 GB/s on modern hardware, has excellent avalanche properties (small input changes → large output changes), and produces near-uniform bucket distributions. **xxHash** is faster still and used in newer systems. Avoid CRC32 for key distribution — it has structural patterns that cluster certain inputs.
+
+For vnode placement, hash the string `nodeId + "#" + vnodeIndex`. The `#` separator prevents collisions between a node `"node1"` with vnode index `2` and a node `"node12"` with vnode index `""`. Each resulting hash is stored as a `long` (64 bits, though most implementations use only 32 bits to keep ring positions within `[0, 2^32)`).
+
+Lookup proceeds in three steps:
+1. Hash the key: `long pos = hash(key)`
+2. Find the ceiling entry: `SortedMap<Long, N> tail = ring.tailMap(pos)`
+3. Wrap around if at the end of the ring: `tail.isEmpty() ? ring.firstKey() : tail.firstKey()`
+
+The `TreeMap.tailMap(pos)` call returns a live view of all entries with keys `>= pos`. Taking `firstKey()` on that view returns the nearest clockwise neighbor. This is `O(log n)` in the number of vnode positions.
+
+### Virtual nodes
+
+Without virtual nodes, a 3-node ring has only 3 positions. Any non-uniform key distribution will cause one node to receive dramatically more traffic than others. More concretely: if keys hash uniformly but positions are fixed, the arc sizes between adjacent nodes follow an exponential distribution — the largest arc is expected to be `O(log n)` times larger than the average. At 3 nodes, that imbalance is severe.
+
+Adding 150 vnodes per physical node changes the mathematics. With 450 total ring positions for 3 nodes, the central limit theorem kicks in: the total arc owned by any physical node converges toward the mean. The standard deviation of load across nodes scales as `1/sqrt(v)` where `v` is the vnode count per node — 150 vnodes gives ~8× better balance than 2 vnodes.
+
+Heterogeneous hardware gets proportional allocation: a node with 2× the RAM and CPU gets `vnodeCount = 300` instead of `150`. It receives 2× the key space, 2× the read/write traffic, and 2× the storage — exactly proportional to its capacity.
+
+The cost of vnodes is **rebalancing granularity**: when a node joins, it only takes over the specific arcs where its vnodes land. If those arcs happen to cluster in one part of the ring (statistically unlikely with 150 vnodes but possible), the load may not rebalance as evenly as expected in the short term. This self-corrects as more vnodes are added.
+
+### Replication and consistency
+
+Each key is assigned to a **preference list** of `N` nodes: the primary (first clockwise node) and the next `N-1` distinct physical nodes clockwise. "Distinct physical nodes" is critical — you must skip vnodes that belong to already-selected physical nodes to ensure replication spans actual failure domains.
+
+DynamoDB's default is `N=3, R=2, W=2`:
+- `R + W > N` guarantees at least one node is in both the read and write quorum — ensuring reads always see the latest write in the common case
+- Allows 1 node failure without losing read or write availability
+- A write to 2-of-3 nodes is acknowledged; the third is updated asynchronously
+
+For zone-aware placement, filter the preference list to ensure replicas span at least 2 availability zones. Cassandra's `NetworkTopologyStrategy` implements this by separating the preference list into per-datacenter sub-lists and placing `replicationFactor/datacenters` replicas in each.
+
+Consistency levels are caller-controlled at query time. A read with `QUORUM` reads from R nodes and returns the value with the highest version (vector clock or timestamp). A read with `LOCAL_QUORUM` only counts replicas in the local datacenter — useful for latency-sensitive reads that tolerate brief cross-DC inconsistency.
+
+### Jump hash
+
+Lamping and Veach's jump hash (2014) is a radical simplification: given a 64-bit key and a bucket count, it produces the correct bucket assignment in `O(log n)` iterations (empirically ~`log2(n)` jumps), uses zero memory beyond two integer registers, and achieves perfect load balance.
+
+The algorithm is strikingly short:
+
+```java
+static int jumpHash(long key, int numBuckets) {
+    long b = -1, j = 0;
+    while (j < numBuckets) {
+        b = j;
+        key = key * 2862933555777941757L + 1;
+        j = (long) ((b + 1) * (double) (1L << 31) / (double) ((key >>> 33) + 1));
+    }
+    return (int) b;
+}
+```
+
+Jump hash has three hard constraints that make it unsuitable for many production use cases:
+
+1. **Sequential numeric node IDs required**: nodes are numbered `0, 1, ..., n-1`. There are no named nodes. You cannot say "this key must go to the node at IP `10.0.1.7`" — you only know "this key goes to bucket 12".
+2. **No replication groups**: the algorithm returns a single bucket. Getting the next `R` buckets requires running the algorithm `R` times with modified parameters — and the resulting groups have no topological guarantees (zone awareness, rack awareness).
+3. **Node removal is add-only in spirit**: removing a node from the middle of the range (not the last added) requires renaming buckets, which reshuffles keys. Jump hash is designed for append-only growth with occasional removal of the highest-numbered bucket.
+
+Use jump hash for: stateless request routing in homogeneous fleets (e.g., splitting analytics writes across identical Kafka partitions), batch job partition assignment, or anywhere you need perfect balance without the overhead of maintaining a ring data structure in memory.
+
+Use consistent hashing for: any system where nodes have identities, where replication requires topological placement, or where the cluster undergoes arbitrary add/remove operations.
+
+## Java integration
+
+### Part A — Consistent hash ring implementation
+
+```java
+package dev.pushkar.hashing;
+
+import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.List;
+import java.util.SortedMap;
+import java.util.TreeMap;
+
+public final class ConsistentHashRing<N> {
+    private final SortedMap<Long, N> ring = new TreeMap<>();
+    private final int vnodeCount;
+
+    public ConsistentHashRing(int vnodeCount) {
+        this.vnodeCount = vnodeCount;
+    }
+
+    public void addNode(N node) {
+        for (int i = 0; i < vnodeCount; i++) {
+            long pos = hash(node.toString() + "#" + i);
+            ring.put(pos, node);
+        }
+    }
+
+    public void removeNode(N node) {
+        for (int i = 0; i < vnodeCount; i++) {
+            long pos = hash(node.toString() + "#" + i);
+            ring.remove(pos);
+        }
+    }
+
+    public N getNode(String key) {
+        if (ring.isEmpty()) throw new IllegalStateException("Ring is empty");
+        long pos = hash(key);
+        SortedMap<Long, N> tail = ring.tailMap(pos);
+        // wrap around the ring if no node clockwise
+        Long nodePos = tail.isEmpty() ? ring.firstKey() : tail.firstKey();
+        return ring.get(nodePos);
+    }
+
+    public List<N> getReplicaNodes(String key, int count) {
+        var result = new ArrayList<N>();
+        long pos = hash(key);
+        // iterate clockwise, deduplicate physical nodes
+        var seen = new HashSet<N>();
+        for (var entry : ring.tailMap(pos).entrySet()) {
+            if (seen.add(entry.getValue())) result.add(entry.getValue());
+            if (result.size() == count) return result;
+        }
+        // wrap around
+        for (var entry : ring.entrySet()) {
+            if (result.size() == count) break;
+            if (seen.add(entry.getValue())) result.add(entry.getValue());
+        }
+        return result;
+    }
+
+    private static long hash(String key) {
+        try {
+            var md = MessageDigest.getInstance("MD5");
+            byte[] digest = md.digest(key.getBytes());
+            // Use first 8 bytes as a long
+            long h = 0;
+            for (int i = 0; i < 8; i++) h = (h << 8) | (digest[i] & 0xFFL);
+            return h;
+        } catch (Exception e) { throw new RuntimeException(e); }
+    }
+}
+```
+
+The `addNode` / `removeNode` pair is `O(v log(nv))` where `v` is the vnode count — 150 TreeMap insertions or deletions at `O(log 15000) ≈ 14` comparisons each. Topology changes are fast even at high vnode counts. The `getReplicaNodes` method iterates the ring's `tailMap` view — a live, zero-copy submap backed by the same TreeMap — so it allocates only the result list.
+
+Note the `HashSet<N>` in `getReplicaNodes`: it deduplicates by physical node identity. This ensures that even if a physical node has three consecutive vnodes, it only appears once in the replica list. The `N` type must implement `equals` and `hashCode` correctly — if `N` is a `String` (node address), this is automatic; if it is a custom `NodeInfo` object, define those methods explicitly.
+
+### Part B — Spring Boot shard routing service
+
+```java
+@Service
+public class ShardRouter {
+    private final ConsistentHashRing<String> ring;
+    private final Map<String, JedisPool> shardPools;
+
+    public ShardRouter(@Value("${shards}") List<String> shardAddresses) {
+        this.ring = new ConsistentHashRing<>(150);
+        this.shardPools = new HashMap<>();
+        for (String addr : shardAddresses) {
+            ring.addNode(addr);
+            shardPools.put(addr, new JedisPool(addr.split(":")[0],
+                Integer.parseInt(addr.split(":")[1])));
+        }
+    }
+
+    public String get(String key) {
+        String shard = ring.getNode(key);
+        try (Jedis j = shardPools.get(shard).getResource()) {
+            return j.get(key);
+        }
+    }
+
+    public void set(String key, String value) {
+        for (String replica : ring.getReplicaNodes(key, 3)) {
+            try (Jedis j = shardPools.get(replica).getResource()) {
+                j.set(key, value);
+            }
+        }
+    }
+}
+```
+
+In production, the `set` method's sequential write to 3 replicas should be parallelized with a `CompletableFuture.allOf` and a quorum check — wait for 2-of-3 to succeed rather than blocking on all three serially. The third write completing asynchronously cuts p99 write latency significantly since the slowest replica no longer blocks the response.
+
+The `shards` property is read from application configuration (e.g., `application.yml`) and should be backed by a dynamic source: Consul, ZooKeeper, or AWS Parameter Store. When a new shard is added to the config, a `@RefreshScope` bean restart (Spring Cloud) rebuilds the ring with the new node, adding only its 150 vnode positions and moving only the affected key arc.
+
+## Sharding strategy comparison
+
+<TradeoffTable title="Sharding strategy tradeoffs">
+
+| Strategy | Key movement on resize | Load balance | Named nodes | Use case |
+|---|---|---|---|---|
+| **Modular hashing** (`key % n`) | `O(k)` — nearly all keys | Perfect (mathematical) | Yes | Never at scale — use only for static, never-changing clusters |
+| **Consistent hashing (ring)** | `O(k/n)` — only affected arc | Good with vnodes (±10%) | Yes | Cache, KV store, DB sharding — the production default |
+| **Jump hash** | `O(k/n)` — same asymptotic | Perfect (exact) | No — sequential IDs only | Stateless partitioning, Kafka topic routing, homogeneous fleets |
+| **Rendezvous hashing** | `O(k/n)` | Good | Yes | Peer-to-peer routing, CDN cache selection, no central ring needed |
+
+</TradeoffTable>
+
+Rendezvous hashing (highest random weight) deserves a note: each node scores `HRW(node, key)` and the highest scorer wins. No ring data structure required — any client with the node list can compute the same result independently. The tradeoff is `O(n)` per lookup instead of `O(log n)`, which becomes expensive at node counts above a few hundred.
+
+<Pitfall title="Too few virtual nodes causes load imbalance">
+
+Using fewer than 100 vnodes per physical node produces dangerously uneven load distribution, especially during cluster bootstrap. With 10 nodes at 10 vnodes each, a single physical node can receive 2–3× the average traffic due to arc-size variance. The arc sizes follow an exponential distribution — the largest arc is statistically expected to be `ln(n)` times the average. At 10 total positions, `ln(10) ≈ 2.3×` imbalance is the expectation, not the worst case.
+
+The fix is straightforward: use 150 vnodes as the baseline for homogeneous hardware. The ring memory cost is negligible (about 1 MB for 15,000 positions), and the load balancing improvement is dramatic. Cassandra defaults to `num_tokens: 256` for this reason.
+
+</Pitfall>
+
+<Pitfall title="Consistent hashing solves routing, not data migration">
+
+The ring tells you which node *should* own a key. It does not move the actual data. After adding a node to a distributed database (not a cache), the keys that now hash to the new node are still physically stored on the old node. Until you run a migration process — streaming those key-value pairs from the old node to the new one — reads routed to the new node return misses or errors.
+
+Production systems handle this with a two-phase approach: (1) the new node joins the ring and is marked as a secondary owner; reads try the new node first, fall back to the old node, and write the result to the new node (read-repair). (2) A background migration job streams all keys from the old node's arc to the new node. (3) Once migration completes, the old node's arc is removed and it stops serving those keys. Cassandra calls this process `nodetool repair` + streaming. DynamoDB handles it transparently via its storage layer. Rolling your own means implementing both phases explicitly — skipping step (2) means relying entirely on read-repair, which only migrates accessed keys, leaving cold keys stranded.
+
+</Pitfall>
+
+## Curveballs
+
+<Curveball question="One node is 4× more powerful than the others. How do you configure the ring to give it proportionally more load?">
+
+Assign it 4× the vnode count. If the standard allocation is 150 vnodes per node, the high-capacity node gets 600 vnodes. Its 600 ring positions collectively own 4× the arc length (in expectation), meaning it receives 4× the key requests and is responsible for 4× the storage. No changes are needed to the routing logic — the ring arithmetic handles it automatically. The only operational concern is that rebalancing this node (adding or removing it) moves 4× as many keys as a standard node, so plan maintenance windows accordingly.
+
+</Curveball>
+
+<Curveball question="A node leaves the ring unexpectedly (crash). Before it's removed from the ring, clients still route to it and get errors. How do you handle the transition?">
+
+There are three layers of defense. First, the client SDK implements a **retry with failover**: on connection timeout to the primary node, immediately retry the next clockwise node in the preference list (the first replica). This is the same list returned by `getReplicaNodes` — clients should always hold the full preference list, not just the primary. Second, the health-checking layer (a gossip protocol or a heartbeat monitor) detects the node failure and removes it from the ring within the detection timeout (typically 5–30 seconds depending on the heartbeat interval). Third, **hinted handoff**: writes that were intended for the failed node are stored temporarily by the coordinator with a hint, and replayed to the recovering node once it rejoins. DynamoDB uses all three mechanisms. The key insight for the interviewer: there is an unavoidable window between crash and ring removal where the primary route fails — the replica failover in the client SDK is what keeps availability above 99.99% during that window.
+
+</Curveball>
+
+<Curveball question="You are using consistent hashing for a database (not just a cache). A key rebalances to a new node. How do you migrate the data without downtime?">
+
+The two-phase ownership model: the new node joins with **shadow ownership** of its arc — it is in the preference list but not yet the primary. Reads still go to the old primary with the new node as a replica-in-training. A background streaming job reads every key in the arc from the old primary and writes it to the new node (this is Cassandra's streaming phase during `nodetool move`). During streaming, the new node returns misses for keys not yet migrated; the coordinator falls back to the old primary (normal replica fallback behavior). Once streaming is complete (verified by comparing key counts), the new node is promoted to primary and the old node relinquishes the arc. The old node continues to serve as a replica for the transferred arc until the next replication-factor enforcement cycle. Total downtime: zero, at the cost of temporary write amplification (keys written to both nodes during the migration window) and the streaming bandwidth.
+
+</Curveball>
+
+<RelatedQuestions items={[
+  { slug: "distributed-kv-store", title: "Design a Distributed KV Store", difficulty: "staff" },
+  { slug: "design-a-cache", title: "Design a Distributed Cache", difficulty: "senior" },
+  { slug: "distributed-rate-limiter", title: "Design a Distributed Rate Limiter", difficulty: "mid" },
+]} />
+
+## Further reading
+
+- [Dynamo: Amazon's Highly Available Key-value Store](https://dl.acm.org/doi/10.1145/1294261.1294281) — The 2007 SOSP paper that popularized consistent hashing with virtual nodes, preference lists, and sloppy quorums in production. Section 4.2 covers the partitioning algorithm in precise detail.
+- [Chord: A Scalable Peer-to-peer Lookup Service for Internet Applications](https://pdos.csail.mit.edu/papers/chord:sigcomm01/chord_sigcomm.pdf) — Stoica et al., SIGCOMM 2001. The foundational DHT paper that formalized the ring structure and `O(log n)` distributed lookup using finger tables.
+- [A Fast, Minimal Memory, Consistent Hash Algorithm](https://arxiv.org/abs/1406.2294) — Lamping and Veach, 2014. The two-page jump hash paper. Read the derivation — it is a masterclass in probabilistic reasoning from first principles.
+- [Apache Cassandra Architecture: Data Distribution](https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html) — Cassandra's implementation of Dynamo-style consistent hashing, including `num_tokens` (vnodes), `NetworkTopologyStrategy`, and how gossip propagates ring state across the cluster.

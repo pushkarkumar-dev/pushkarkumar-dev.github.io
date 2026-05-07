@@ -1,0 +1,63 @@
+---
+import { getCollection, render } from 'astro:content';
+import ArticleLayout from '../components/layout/ArticleLayout.astro';
+import Tldr from '../components/content/Tldr.astro';
+import Capacity from '../components/content/Capacity.astro';
+import TradeoffTable from '../components/content/TradeoffTable.astro';
+import Pitfall from '../components/content/Pitfall.astro';
+import Curveball from '../components/content/Curveball.astro';
+import Diagram from '../components/content/Diagram.astro';
+import Mermaid from '../components/content/Mermaid.astro';
+import Bookmark from '../components/content/Bookmark.astro';
+import RelatedQuestions from '../components/content/RelatedQuestions.astro';
+
+export async function getStaticPaths() {
+  const questions = await getCollection('system-design');
+  return questions.map(q => ({
+    params: { slug: q.id },
+    props: { question: q },
+  }));
+}
+
+const { question } = Astro.props;
+const { data } = question;
+const { Content, headings } = await render(question);
+
+const base = import.meta.env.BASE_URL;
+const ogImageUrl = new URL(`${base}/og/${question.id}.png`, Astro.site);
+
+const tocHeadings = headings.filter(h => h.depth === 2 || h.depth === 3);
+
+const mdxComponents = {
+  Tldr, Capacity, TradeoffTable, Pitfall, Curveball,
+  Diagram, Mermaid, Bookmark, RelatedQuestions,
+};
+---
+
+<ArticleLayout
+  title={data.title}
+  description={data.summary}
+  category={data.category}
+  difficulty={data.difficulty}
+  tags={data.tags}
+  estimatedReadMinutes={data.estimatedReadMinutes}
+  publishedAt={data.publishedAt}
+  updatedAt={data.updatedAt}
+  ogImage={ogImageUrl.toString()}
+>
+
+  <!-- Named slot: TOC links for sidebar -->
+  <Fragment slot="toc">
+    {tocHeadings.map(h => (
+      <a
+        href={`#${h.slug}`}
+        class:list={['toc-link', h.depth === 3 && 'toc-h3']}
+      >
+        {h.text}
+      </a>
+    ))}
+  </Fragment>
+
+  <!-- Default slot: article body -->
+  <Content components={mdxComponents} />
+</ArticleLayout>

@@ -1,0 +1,531 @@
+---
+title: "Design a Multiplayer Game Backend"
+slug: "multiplayer-game-backend"
+category: "realtime"
+difficulty: "senior"
+estimatedReadMinutes: 24
+tags: ["game-loop", "UDP", "lag-compensation", "state-sync", "redis", "matchmaking", "websocket"]
+companyFlavors: ["Riot Games", "Epic Games", "Blizzard", "Valve"]
+relatedQuestions: ["live-sports-scores", "collaborative-editor", "zoom-video-conferencing"]
+publishedAt: "2025-01-07"
+updatedAt: "2025-01-07"
+summary: "Design an authoritative game server with deterministic tick-based simulation, client-side prediction, lag compensation via history buffers, and a matchmaking service that pairs players by skill rating."
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="multiplayer-game-backend" title="Design a Multiplayer Game Backend" />
+
+<Tldr>
+- **Authoritative server model**: all game state mutations happen server-side; clients are dumb renderers that submit inputs and render what the server tells them — cheating via client modification becomes structurally impossible
+- **Fixed-rate tick loop**: 64 Hz for FPS (15.6ms per tick), 20 Hz for strategy games; every simulation step is deterministic and driven by the server clock, not wall time on any individual client
+- **Client-side prediction + server reconciliation**: clients apply their own inputs locally before receiving server confirmation, eliminating perceived input lag; the client maintains a prediction buffer and rewinds it whenever authoritative server state arrives
+- **Lag compensation via history buffer**: server stores the last 64 snapshots (1 second at 64 Hz); when processing a shoot input, the server rewinds to the snapshot matching the client's render time to validate hit registration fairly
+- **Matchmaking uses ELO/TrueSkill with timeout relaxation**: players queue with a tight skill band (±100 ELO) that expands by 50 ELO every 15 seconds of waiting, ensuring short wait times don't permanently punish outlier ratings
+</Tldr>
+
+## The latency problem at the heart of multiplayer games
+
+Multiplayer game backends operate at a level of latency sensitivity that makes financial trading systems look forgiving. A 50ms delay in a first-person shooter isn't a degraded experience — it's a miss instead of a hit. The design challenge is building an authoritative server that players can't cheat, while making that server feel instantaneous to a client on a 100ms round-trip connection.
+
+The foundational tension is this: for anti-cheat correctness, the server must be the single source of truth for all game state. No client should be trusted to report its own position, health, or hit outcomes. But for responsiveness, players cannot wait 50–150ms to see their own character move — that latency is immediately perceptible and makes the game feel broken. The solutions to these opposing forces — client-side prediction, server reconciliation, and lag compensation — are what make multiplayer game networking one of the most nuanced distributed systems domains you can work in.
+
+This design covers a 5v5 competitive FPS as the primary case (League of Legends and Valorant scale), with callouts for where Battle Royale and RTS games diverge meaningfully.
+
+## Clarifying questions
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| What game genre? | Competitive FPS (5v5 team fights); touch on RTS and Battle Royale as variants | Directly determines tick rate, AOI strategy, and state complexity |
+| Players per match? | 10 (5v5); up to 100 for Battle Royale | Drives bandwidth math, state snapshot size, and fan-out cost |
+| What tick rate is required? | 64 Hz for FPS; 20 Hz for RTS/strategy | Tick budget (ms) determines how much simulation can happen per cycle |
+| Target latency budget? | < 150ms RTT for acceptable gameplay; < 50ms for competitive | Defines history buffer depth and whether region selection in matchmaking is mandatory |
+| Platform (mobile/console/PC)? | PC primary; console secondary; mobile is a different category entirely | Affects protocol choice: mobile networks are hostile to UDP; TCP/QUIC may be preferred |
+| Cheat prevention requirements? | Authoritative server is mandatory for ranked; client-hosted listen server acceptable for casual custom games | Determines whether a dedicated server fleet is required |
+| Persistence (ranked/casual)? | Both; ranked affects ELO and is persisted; casual is ephemeral | Ranked persistence drives the stats + rating update pipeline complexity |
+| Spectator support? | Yes — delayed spectator feed at T-30 seconds to prevent stream-sniping | Spectators need their own fan-out path; delayed replay rather than live state |
+
+## Functional requirements
+
+- Real-time game state synchronization across all players in a match, delivered at 64 Hz server tick rate
+- Authoritative server model: the server owns all game state; clients submit inputs and receive state updates; no client can self-report positions, health, or hit outcomes
+- Matchmaking by skill rating (ELO/TrueSkill), including lobby creation, ready-check, and match assignment to a dedicated game server
+- Player input processing at a fixed tick rate: keyboard state, mouse direction, and action inputs are batched per tick
+- Hit registration with lag compensation: shots are validated against the server's historical snapshot matching the shooter's render time
+- Match results persistence: kills, deaths, assists, and rating changes are written to PostgreSQL at match end
+- Reconnection within 30 seconds without match penalty: a disconnecting player's entity is held in place while the reconnect window is open
+
+## Non-functional requirements
+
+- 50,000 concurrent matches (FPS, 10 players each) = 500,000 concurrent players
+- Server tick rate: 64 Hz (15.6ms per tick budget)
+- Network update rate: 20 state packets per second per player (50ms intervals) — not every tick produces a network packet
+- Latency target: p99 < 150ms RTT for acceptable play; < 50ms for competitive ranked
+- Match server uptime: 99.9% measured at the fleet level; individual game server failures cause match abandonment (crash recovery, not live migration)
+- Cheat prevention: authoritative server model with server-side hit validation; no sensitive state sent to clients beyond what they need to render their view
+
+<Capacity title="Game Server Capacity">
+
+**Concurrent load**
+
+50K concurrent matches × 10 players = 500K concurrent players
+
+**Inbound packet rate**
+
+Each player sends ~30 input packets/sec (keyboard + mouse state, sampled every ~33ms):
+
+$$500{,}000 \times 30 = 15{,}000{,}000 \text{ packets/sec inbound}$$
+
+**Outbound packet rate**
+
+Server sends 20 state update packets/sec to each player:
+
+$$500{,}000 \times 20 = 10{,}000{,}000 \text{ packets/sec outbound}$$
+
+**Bandwidth**
+
+Each state packet is approximately 1.5 KB after delta compression (entity positions, velocities, health for 10 entities):
+
+$$10{,}000{,}000 \times 1{,}500 \text{ B} = 15 \text{ GB/s egress}$$
+
+**Tick budget**
+
+$$\text{tick budget} = \frac{1000\text{ms}}{64} \approx 15.6\text{ms per tick}$$
+
+All game logic — input processing, physics simulation, collision detection, snapshot serialization — must complete within 15.6ms or the tick loop falls behind and perceived latency spikes.
+
+**Game server fleet sizing**
+
+One game server process handles 50–100 concurrent matches (CPU-bound by physics and collision; 75 matches is a safe middle estimate):
+
+$$\lceil 50{,}000 / 75 \rceil = 667 \text{ game server instances}$$
+
+With 50% headroom for traffic spikes and rolling deploys: approximately 1,000 game server instances active at peak.
+
+</Capacity>
+
+## API design
+
+```text
+Matchmaking (REST):
+POST /api/v1/matchmaking/queue
+  body: { playerId, gameMode, rankTier }
+  → { queueId, estimatedWaitSecs }
+
+GET /api/v1/matchmaking/queue/{queueId}/status
+  → { status: QUEUED|MATCHED|CANCELLED, matchId?, serverAddr? }
+
+DELETE /api/v1/matchmaking/queue/{queueId}
+  → 204 No Content (cancel queue entry)
+
+Game session (WebSocket / UDP):
+  Connection: client connects to game server at assigned IP:port after MATCHED status
+  Protocol: binary, custom framing (or Protobuf-encoded over UDP)
+
+  Client → Server:
+    InputPacket {
+      tick:     uint32,        // client's local tick number
+      sequence: uint32,        // monotonically increasing sequence
+      inputs:   bitfield,      // W=0x01, A=0x02, S=0x04, D=0x08, SHOOT=0x10, etc.
+      yaw:      float32,       // camera horizontal angle
+      pitch:    float32        // camera vertical angle
+    }
+
+  Server → Client:
+    StatePacket {
+      serverTick: uint32,
+      entities: [
+        { id, posX, posY, posZ, velX, velY, velZ, health, animState }
+      ],
+      events: [ HIT_CONFIRM, PLAYER_DIED, ... ]  // tick-level events
+    }
+
+Stats (REST, internal):
+POST /api/v1/matches/{matchId}/result
+  body: { players: [{playerId, kills, deaths, assists}], winnerTeamId }
+  → 200 OK (internal: game server → stats service)
+
+GET /api/v1/players/{playerId}/stats
+  → { eloRating, gamesPlayed, wins, kills, deaths }
+```
+
+## Data model
+
+```sql
+CREATE TABLE matches (
+    match_id        UUID PRIMARY KEY,
+    game_mode       VARCHAR(50) NOT NULL,
+    status          VARCHAR(20) NOT NULL,
+    server_ip       INET NOT NULL,
+    server_port     INT NOT NULL,
+    started_at      TIMESTAMPTZ,
+    ended_at        TIMESTAMPTZ,
+    winner_team_id  INT,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE match_players (
+    match_id        UUID REFERENCES matches(match_id),
+    player_id       UUID NOT NULL,
+    team_id         INT NOT NULL,
+    kills           INT DEFAULT 0,
+    deaths          INT DEFAULT 0,
+    assists         INT DEFAULT 0,
+    rating_before   INT NOT NULL,
+    rating_after    INT,
+    PRIMARY KEY (match_id, player_id)
+);
+
+CREATE TABLE player_ratings (
+    player_id       UUID PRIMARY KEY,
+    elo_rating      INT NOT NULL DEFAULT 1000,
+    games_played    INT NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+Redis matchmaking queue:
+
+```text
+ZSET matchmaking:{mode}:queue
+  score:  joinedAt (epoch ms, used for FIFO ordering within skill bands)
+  member: playerId
+
+HASH player:{playerId}:queue_meta
+  rating    → "1234"
+  queueId   → "queue-uuid"
+  gameMode  → "ranked_5v5"
+  joinedAt  → "1704585600000"
+
+STRING match:{matchId}:server
+  value: "10.0.1.47:7777"
+  TTL:   3600s
+```
+
+## Architecture diagram
+
+<Mermaid diagram={`flowchart TD
+    subgraph Matchmaking["Matchmaking Path"]
+        C1[Client A] -->|POST /queue| MM[Matchmaking Service]
+        C2[Client B] -->|POST /queue| MM
+        MM -->|ZADD| RQ[(Redis Queue)]
+        MM -->|poll every 500ms| RQ
+        RQ -->|enough players found| MM
+        MM -->|allocate| FM[Fleet Manager]
+        FM -->|start server| GS[Game Server]
+        MM -->|MATCHED + serverAddr| C1
+        MM -->|MATCHED + serverAddr| C2
+    end
+
+    subgraph Gameplay["Gameplay Path"]
+        C1 -->|InputPacket UDP| GS
+        C2 -->|InputPacket UDP| GS
+        GS -->|64 Hz tick loop| SIM[Simulation Engine]
+        SIM -->|snapshot| HB[(History Buffer)]
+        GS -->|StatePacket 20 pps| C1
+        GS -->|StatePacket 20 pps| C2
+        GS -->|match result event| KF[Kafka]
+        KF --> SS[Stats Service]
+        SS --> PG[(PostgreSQL)]
+    end`} />
+
+## Deep dive: the authoritative tick loop
+
+The game server's tick loop is the heartbeat of every active match. It runs as a dedicated thread pinned to a CPU core, consuming inputs and advancing the simulation at a fixed rate of 64 Hz.
+
+```text
+every 15.6ms:
+  1. Collect all input packets received since last tick
+  2. Apply inputs to simulation: move entities, apply physics
+  3. Run collision detection and damage calculation
+  4. Advance game state to tick N+1
+  5. Serialize delta-compressed state snapshot
+  6. Send state to all clients (or relevant subset for large worlds)
+  7. Store snapshot in history buffer (for lag compensation)
+```
+
+The tick loop uses a high-resolution timer (`System.nanoTime()` on the JVM) to stay frame-aligned. If a tick runs over budget — say, a complex collision frame takes 18ms instead of 15.6ms — the loop skips the sleep and catches up on the next cycle. Sustained overruns indicate under-provisioned compute for the match complexity; the fleet manager monitors this via a tick-overrun counter exported as a Prometheus metric.
+
+The history buffer retains the last 64 snapshots (1 second at 64 Hz). This is sufficient to rewind for any client with RTT under 1 second — which covers p99.9 of all players on a properly region-matched server. At 1.5 KB per snapshot, the per-match history buffer consumes $64 \times 1.5 \text{ KB} = 96 \text{ KB}$ of in-process memory — negligible.
+
+Delta compression reduces state packet size significantly. Rather than sending all 10 entity states on every packet, the server only includes entities whose state changed since the last acknowledged packet for that client. For a 10-player match where only 3 players are moving in a given tick, the packet shrinks by ~70%.
+
+## Deep dive: client-side prediction and reconciliation
+
+Without prediction, every key press triggers this sequence:
+
+1. Client presses W (move forward)
+2. Input packet travels to server (50ms for 100ms RTT)
+3. Server applies move, sends state back (50ms return)
+4. Client sees character move — 100ms after key press
+
+One hundred milliseconds of input lag is immediately perceptible and makes the game feel sluggish. Client-side prediction eliminates perceived lag:
+
+1. Client presses W and **immediately** applies the move locally (optimistic render)
+2. Input packet is sent to the server, tagged with client tick number
+3. Server processes the input at tick N (arriving ~4 ticks late at 64 Hz with 62.5ms RTT)
+4. Server sends authoritative state for tick N
+5. Client receives the server state and **reconciles**
+
+Reconciliation is the non-trivial part. The client maintains a circular buffer of its own unacknowledged inputs. When authoritative state for tick N arrives, the client:
+
+1. Discards its predicted state up through tick N
+2. Accepts the server's authoritative position as the base for tick N
+3. Replays inputs N+1 through the current local tick on top of that authoritative base
+4. If the replayed final position differs from the locally predicted position by more than a threshold (e.g., 5cm), snap or smoothly interpolate to the corrected position
+
+The threshold prevents visible snapping from tiny floating-point divergences between client and server physics. Large corrections (teleports, hits that change momentum) snap immediately; small drift corrections interpolate over 100–200ms to avoid jarring visual pops.
+
+Only physics-affecting state needs reconciliation. Cosmetic effects — particle systems, weapon animations, environmental sounds — can stay locally predicted without correction because they don't affect gameplay outcomes.
+
+## Deep dive: lag compensation for hit registration
+
+Consider the following scenario: Player A has 100ms RTT. Player A aims at Player B and pulls the trigger. On Player A's screen (rendered ~50ms behind the server clock to allow interpolation of other players), Player B is standing at position X. Player A's shoot input reaches the server 50ms later. By then, Player B has moved to X+Δ. If the server simply checks whether Player A's crosshair overlaps Player B's current position, the shot misses — even though Player A was perfectly accurate from their own perspective.
+
+Lag compensation solves this by rewinding the server's world state to the moment Player A pulled the trigger:
+
+```text
+Lag compensation algorithm:
+  1. Receive SHOOT input from player A, tagged with client_tick = 5000
+  2. Current server tick = 5008 (roughly 8 ticks = 125ms behind at 64 Hz with overhead)
+  3. Look up history_buffer[5000]
+  4. Reconstruct entity positions at tick 5000
+  5. Run hit detection against rewound positions only (not current positions)
+  6. If hit: apply damage to player B's current health (health is not rewound)
+  7. History buffer must cover max_lag = 1 second = 64 ticks
+```
+
+An important nuance: only the shooting player's aim is rewound. The hit target's health is taken from the current tick. This means a player who stepped behind cover in the intervening 125ms can still be hit — lag compensation is a shooter-favoring design choice. Valve, Riot, and Blizzard all implement shooter-favoring lag compensation because it produces the most consistent experience for the person pulling the trigger, and because defensive players can compensate by being cautious about peeking.
+
+The history buffer depth must cover the maximum expected RTT. At 64 Hz with a 1-second buffer, players up to 1000ms RTT can have their shots fairly compensated. Players above this threshold would have their shots processed without lag compensation (shots would appear to miss despite client-side hits). In practice, players with >500ms RTT have a degraded experience regardless, and most competitive games use region-locking to keep RTTs under 100ms.
+
+## Deep dive: matchmaking
+
+ELO-based matchmaking treats each player's skill as a scalar. TrueSkill (used by Halo and many Microsoft titles) models skill as a Gaussian distribution with mean μ and variance σ, allowing faster convergence on new players. Both work well for this design; we'll use ELO for simplicity.
+
+The matchmaking algorithm runs as a scheduled job every 500ms:
+
+1. Pull candidates from the Redis sorted set, ordered by join time (oldest first for fairness)
+2. For each candidate, compute their current acceptable skill band based on wait time: `band = BASE_BAND + (waitSecs / 15) * BAND_EXPAND_PER_15S`
+3. Anchor on the first candidate's rating; accept subsequent candidates within the band
+4. When 10 players are assembled, balance teams by minimizing the difference in sum-of-ratings between teams (greedy assignment works well for 10 players)
+5. Remove all matched players from the queue atomically using `ZREM`
+6. Request a game server allocation from the fleet manager
+7. Publish a `MatchFormedEvent` to Kafka for downstream notification
+
+The timeout relaxation (expanding the band every 15 seconds) prevents players at the tails of the skill distribution from waiting indefinitely. A brand-new player at 1000 ELO facing no one else near their rating will eventually match against players at 1150 ELO after 30 seconds of waiting — acceptable for casual play, but in ranked modes the band expansion can be capped at ±200 ELO to protect rating integrity.
+
+Team balance is a constraint satisfaction problem that becomes NP-hard at large player counts, but for 10 players a greedy sort-and-assign (sort players by rating, alternate assignment) finds near-optimal balance quickly.
+
+## Java integration — Part A: tick loop
+
+```java
+@Component
+@RequiredArgsConstructor
+public class GameTickLoop implements Runnable {
+
+    private final GameState state;
+    private final InputBuffer inputBuffer;
+    private final StateSerializer serializer;
+    private final NetworkGateway gateway;
+    private final HistoryBuffer historyBuffer;
+
+    private static final int TICK_RATE_HZ = 64;
+    private static final long TICK_NANOS = 1_000_000_000L / TICK_RATE_HZ;
+
+    private volatile boolean running = true;
+    private long currentTick = 0;
+
+    @Override
+    public void run() {
+        long nextTickTime = System.nanoTime();
+        while (running) {
+            long now = System.nanoTime();
+            if (now >= nextTickTime) {
+                tick();
+                nextTickTime += TICK_NANOS;
+                long drift = System.nanoTime() - nextTickTime;
+                if (drift > TICK_NANOS * 2) {
+                    nextTickTime = System.nanoTime();
+                }
+            } else {
+                LockSupport.parkNanos(nextTickTime - now - 100_000);
+            }
+        }
+    }
+
+    private void tick() {
+        currentTick++;
+        List<InputPacket> inputs = inputBuffer.drain();
+        for (InputPacket input : inputs) {
+            state.applyInput(input.getPlayerId(), input.getInputs(), currentTick);
+        }
+        state.simulate(TICK_NANOS);
+        GameSnapshot snapshot = state.takeSnapshot(currentTick);
+        historyBuffer.store(currentTick, snapshot);
+        byte[] delta = serializer.deltaEncode(snapshot,
+            historyBuffer.get(currentTick - 1));
+        gateway.broadcastToMatch(state.getMatchId(), delta, currentTick);
+    }
+
+    public HitResult evaluateHit(ShootEvent event, long clientTick) {
+        GameSnapshot rewound = historyBuffer.get(clientTick);
+        if (rewound == null) return HitResult.noData();
+        return rewound.testHit(event.getShooterId(), event.getTargetId(),
+            event.getOrigin(), event.getDirection());
+    }
+
+    public void stop() { running = false; }
+}
+```
+
+## Java integration — Part B: matchmaking service
+
+```java
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class MatchmakingService {
+
+    private final StringRedisTemplate redis;
+    private final FleetManager fleetManager;
+    private final KafkaTemplate<String, MatchFormedEvent> kafka;
+
+    private static final int PLAYERS_PER_MATCH = 10;
+    private static final int BASE_BAND = 100;
+    private static final int BAND_EXPAND_PER_15S = 50;
+
+    @Scheduled(fixedDelay = 500)
+    public void runMatchmaking() {
+        for (String mode : List.of("ranked_5v5", "unranked_5v5")) {
+            attemptMatch(mode);
+        }
+    }
+
+    private void attemptMatch(String mode) {
+        String queueKey = "matchmaking:%s:queue".formatted(mode);
+        long now = System.currentTimeMillis();
+
+        Set<ZSetOperations.TypedTuple<String>> candidates =
+            redis.opsForZSet().rangeWithScores(queueKey, 0, 99);
+        if (candidates == null || candidates.size() < PLAYERS_PER_MATCH) return;
+
+        List<String> matched = new ArrayList<>();
+        double anchorRating = -1;
+
+        for (ZSetOperations.TypedTuple<String> entry : candidates) {
+            String playerId = entry.getValue();
+            Map<Object, Object> meta = redis.opsForHash()
+                .entries("player:%s:queue_meta".formatted(playerId));
+            double rating = Double.parseDouble((String) meta.get("rating"));
+            long joinedAt = Long.parseLong((String) meta.getOrDefault("joinedAt",
+                String.valueOf(now)));
+            int waitSecs = (int) ((now - joinedAt) / 1000);
+            int band = BASE_BAND + (waitSecs / 15) * BAND_EXPAND_PER_15S;
+
+            if (anchorRating < 0 || Math.abs(rating - anchorRating) <= band) {
+                if (anchorRating < 0) anchorRating = rating;
+                matched.add(playerId);
+                if (matched.size() == PLAYERS_PER_MATCH) break;
+            }
+        }
+
+        if (matched.size() < PLAYERS_PER_MATCH) return;
+        matched.forEach(id -> redis.opsForZSet().remove(queueKey, id));
+        String gameServerAddr = fleetManager.allocateServer(mode);
+        kafka.send("match-formed", new MatchFormedEvent(matched, mode, gameServerAddr));
+        log.info("Formed match: {} players on {} for {}", matched.size(), gameServerAddr, mode);
+    }
+}
+```
+
+<TradeoffTable title="Game Server Architecture Patterns">
+
+| Architecture | Cheat Resistance | Latency | Cost | Scale | Recommended For |
+|---|---|---|---|---|---|
+| **Listen Server** (a player hosts) | Low — the host player has full access to game state and can manipulate it | Best for the host (0ms); 2× RTT for others | Free (host pays bandwidth) | Limited by host's connection and CPU | Casual co-op, LAN parties, games where cheating is socially enforced |
+| **Dedicated Server** (self-hosted) | High — players cannot access server process directly | Consistent for all players (~RTT to datacenter) | Operator pays for fleet; ~$0.01–0.05 per player-hour | Horizontal: add more instances | Competitive multiplayer, esports titles, any game with ranking |
+| **Peer-to-Peer** (full mesh or relay) | Very low — any peer can send fabricated state; lockstep P2P can help but is fragile | Variable; depends on slowest peer in lockstep mode | Low (relay optional) | Poor — scales as O(n²) connections | Turn-based games, games with small player counts, mobile casual |
+| **Cloud Game Server** (authoritative, managed fleet) | Highest — server owns all state; clients are input-only; anti-cheat runs server-side | Good; latency is purely network RTT to region | Highest; requires always-on fleet or fast auto-scaling | Best; fleet manager provisions/deprovisions per demand | Ranked FPS, MOBA, Battle Royale — any title where fairness is a product requirement |
+
+</TradeoffTable>
+
+<Pitfall title="Using TCP for game state updates">
+
+TCP's in-order delivery guarantee is the wrong abstraction for game state. When a single UDP packet carrying game state for tick 42 is dropped, TCP stalls delivery of ticks 43, 44, and 45 until 42 is retransmitted and received in order. This head-of-line blocking adds 50–300ms of jitter under even mild packet loss (1–2%), which is common on WiFi and mobile networks.
+
+Game state updates are superseded by newer updates — if tick 42 is lost, you don't want it retransmitted; you want tick 43 immediately. UDP gives you this: packets arrive out-of-order or not at all, and your application-layer sequencing simply drops stale packets. The server tracks the highest acknowledged tick per client and skips older packets. For inputs (client → server), you add reliability by retransmitting unacknowledged inputs; for state packets (server → client), you rely on the next packet carrying enough delta information to reconstruct without the missed one.
+
+QUIC is a structured alternative: it provides multiplexed streams with per-stream ordering, so game state can flow on an unreliable QUIC datagram while lobby chat uses a reliable QUIC stream. For most shipped titles, raw UDP with a thin application protocol remains the standard.
+
+</Pitfall>
+
+<Pitfall title="No history buffer means broken hit registration">
+
+If you only store the current game state and discard older snapshots, you cannot validate hit registrations from clients with nonzero RTT. A player with 100ms RTT who fires at a target will have their shoot input arrive at the server while the target has already moved. Without rewinding to the client's render time, the server checks the hit against the current position — which is not the position the player saw when they fired. Every shot from a high-latency player will appear to miss on the server even when the aim was accurate on the client.
+
+The history buffer is non-negotiable for fair competitive play. The memory cost is trivial: $64 \text{ snapshots} \times 1.5 \text{ KB} = 96 \text{ KB}$ per match. The engineering cost is modest: a ring buffer of serialized snapshots indexed by tick number. The competitive fairness cost of omitting it is severe — high-ping players are systematically punished and the game feels broken on any connection above ~20ms RTT.
+
+</Pitfall>
+
+<Curveball title="How do you handle a player disconnecting mid-match?">
+
+First, distinguish a temporary disconnect (flaky WiFi) from a permanent rage-quit. When a player's connection drops, the game server opens a 30-second reconnect window:
+
+1. The player's entity is frozen in place (or handed to a simple rule-based AI that keeps the character from being a stationary target: crouch, move to cover)
+2. The match continues for the remaining 9 players
+3. If the player reconnects within 30 seconds, the game server sends a full state snapshot to resync the client (delta encoding won't work here — the client has missed multiple seconds of state)
+4. If the window expires, the entity is removed from the match; depending on game design, an AI bot takes over or the team plays short
+
+Rating penalties for disconnects deserve careful design. A first disconnect in 30 days should carry no penalty — network issues happen. Repeated disconnects within a short window (>3 in 7 days) trigger a warning and eventually a matchmaking ban. The `match_players` table records a `disconnect_at` timestamp and `reconnected` boolean for this analysis. Never apply a rating loss for a disconnect mid-match; instead, mark the match result as `ABANDONED` for that player, which counts as a loss but without the full ELO delta.
+
+</Curveball>
+
+<Curveball title="How would you support 100-player Battle Royale instead of 10-player team fights?">
+
+The 10-player state snapshot at ~1.5 KB per packet scales linearly — 100 players would produce ~15 KB packets at 20 pps, or 300 KB/s per player, which is 3 MB/s aggregate egress per match. That is untenable on residential connections and expensive at fleet scale.
+
+The solution is area-of-interest (AOI) filtering: each player only receives state updates for entities within their visibility radius (e.g., 200m in a Battle Royale shrinking zone). Implementation:
+
+1. Partition the game world into a spatial grid of cells (e.g., 50m × 50m each)
+2. Each tick, determine which cell each entity occupies (O(n) pass)
+3. For each client, compute the set of cells within 2–3 cells of their position
+4. Include only entities in those cells in that client's state packet
+5. Send a special "entity left your AOI" event when a player moves out of range (so the client can despawn the entity)
+
+In a 100-player match spread across a 3km × 3km map, a player with a 200m visibility radius sees roughly $\frac{\pi \times 200^2}{3000^2} \approx 1.4\%$ of the map area. In the late game (circle shrunk to 200m radius), everyone is visible to everyone — fall back to full broadcast for the last 20 players. AOI filtering can reduce bandwidth by 80–90% in the early and mid game phases.
+
+For the tick loop, 100 players means more collision pairs and a larger simulation step. Consider sharding the physics simulation: split the world into spatial partitions processed in parallel, merging results at the end of the tick. This fits naturally into a thread-per-zone model within the game server process.
+
+</Curveball>
+
+<Curveball title="Your game server fleet is in us-east-1 only. Players in Southeast Asia are getting 250ms RTT. How do you fix this?">
+
+250ms RTT in a competitive FPS is unplayable — lag compensation only helps up to ~150ms, and client-side prediction cannot hide 250ms of input latency. The fix requires multi-region deployment.
+
+**Phase 1 — Add AP and EU regions**: deploy game server fleets in AP-Southeast-1 (Singapore, covering Southeast Asia and Australia) and EU-West-1 (Frankfurt, covering Europe and MENA). This alone brings RTT from 250ms to 20–60ms for most players in those regions.
+
+**Phase 2 — Region-aware matchmaking**: during matchmaking, record each player's reported region (or auto-detect from IP geolocation). The matchmaking service filters candidates to the same region first. Cross-region matches are only attempted when wait time exceeds a configurable threshold (e.g., 90 seconds), and only if the RTT between regions via a relay is below the 150ms threshold.
+
+**Phase 3 — Global matchmaking API routing**: the matchmaking REST API itself should be routed to the nearest datacenter using Anycast IPs or GeoDNS, so even the HTTP round-trips for queue management are fast. This matters for mobile games where players may issue dozens of status poll requests.
+
+**Fleet management considerations**: each region maintains its own game server fleet, Redis matchmaking queues, and Fleet Manager. A global control plane (or a simple cross-region leader) tracks fleet health and can redirect overflow traffic to adjacent regions during regional incidents.
+
+</Curveball>
+
+## Further reading
+
+Valve's Source engine networking model, documented in their 2001 Valve Developer Community article "Source Multiplayer Networking," remains the foundational reference for authoritative server design with lag compensation — nearly every shipped multiplayer FPS borrows from it. Gabriel Gambetta's four-part series "Fast-Paced Multiplayer" (gabrielgambetta.com) is the clearest written explanation of client-side prediction and reconciliation available, with interactive JavaScript demos. Riot Games' engineering blog covers League of Legends infrastructure in posts such as "Fixing 20 Years of Matchmaking" and their series on low-latency champion syncing at scale. The ELO algorithm is described in Arpad Elo's original 1978 book "The Rating of Chessplayers, Past and Present"; Microsoft Research's TrueSkill paper (Herbrich et al., 2006) extends it to team-based games with Bayesian inference. Finally, QUIC (RFC 9000) merits study as a structured alternative to raw UDP: its unreliable datagram extension (RFC 9221) provides the low-latency delivery semantics that games need, while its connection migration feature handles the IP address changes that mobile players experience when switching between WiFi and cellular mid-session.
+
+<RelatedQuestions items={[
+  { slug: "live-sports-scores", title: "Design a Live Sports Score System", difficulty: "mid" },
+  { slug: "collaborative-editor", title: "Design a Collaborative Editor", difficulty: "staff" },
+  { slug: "zoom-video-conferencing", title: "Design Zoom Video Conferencing", difficulty: "senior" },
+]} />

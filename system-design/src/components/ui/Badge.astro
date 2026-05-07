@@ -1,0 +1,87 @@
+---
+export interface Props {
+  variant: 'difficulty' | 'tag' | 'category';
+  value: string;
+  class?: string;
+}
+
+const { variant, value, class: className = '' } = Astro.props;
+
+const difficultyLabel: Record<string, string> = {
+  mid:    'Mid',
+  senior: 'Senior',
+  staff:  'Staff',
+};
+
+const categoryLabel: Record<string, string> = {
+  foundations:   'Foundations',
+  social:        'Social',
+  media:         'Media',
+  storage:       'Storage',
+  commerce:      'Commerce',
+  'search-maps': 'Search & Maps',
+  realtime:      'Real-time',
+  infra:         'Infra',
+  ai:            'AI Systems',
+};
+
+const label =
+  variant === 'difficulty' ? (difficultyLabel[value] ?? value) :
+  variant === 'category'   ? (categoryLabel[value] ?? value) :
+  value;
+---
+
+<span class:list={['badge', `badge--${variant}`, `badge--${value}`, className]}>
+  {label}
+</span>
+
+<style>
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    font-family: 'Geist', system-ui, sans-serif;
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 0.2em 0.6em;
+    border-radius: var(--r-sm);
+    white-space: nowrap;
+    line-height: 1.5;
+  }
+
+  /* Difficulty */
+  .badge--difficulty.badge--mid {
+    background: rgba(143, 176, 134, 0.15);
+    color: var(--diff-mid);
+    border: 1px solid rgba(143, 176, 134, 0.3);
+  }
+  .badge--difficulty.badge--senior {
+    background: rgba(224, 169, 109, 0.15);
+    color: var(--diff-senior);
+    border: 1px solid rgba(224, 169, 109, 0.3);
+  }
+  .badge--difficulty.badge--staff {
+    background: rgba(210, 122, 79, 0.15);
+    color: var(--diff-staff);
+    border: 1px solid rgba(210, 122, 79, 0.3);
+  }
+
+  /* Tag */
+  .badge--tag {
+    background: var(--bg-raised);
+    color: var(--ink-3);
+    border: 1px solid var(--line-2);
+    text-transform: none;
+    font-weight: 500;
+    font-size: 0.72rem;
+    letter-spacing: 0;
+  }
+
+  /* Category */
+  .badge--category {
+    background: var(--accent-soft);
+    color: var(--accent);
+    border: 1px solid var(--accent-line);
+  }
+</style>

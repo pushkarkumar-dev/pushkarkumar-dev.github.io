@@ -1,0 +1,705 @@
+---
+title: "Design Twitch Live Streaming"
+slug: "twitch-live-streaming"
+category: "media"
+difficulty: "senior"
+estimatedReadMinutes: 23
+tags: ["live-streaming", "rtmp", "hls", "transcoding", "chat", "cdn", "vod", "low-latency"]
+companyFlavors: ["Twitch", "YouTube Live", "Facebook Live", "Kick"]
+prerequisites: ["youtube-design", "cdn-design", "slack"]
+relatedQuestions: ["youtube-design", "zoom-video-conferencing", "discord"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design Twitch's live streaming infrastructure: RTMP ingest, real-time transcoding to HLS at multiple qualities, low-latency delivery (3s vs 20s trade-off), global CDN fan-out for 100K concurrent viewers, chat at millions of messages per minute, and VOD storage."
+javaPackages:
+  - "org.springframework.boot:spring-boot-starter-websocket:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+  - "org.springframework.data:spring-data-cassandra:4.3.0"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="twitch-live-streaming" title="Design Twitch Live Streaming" />
+
+<Tldr>
+- **Ingest**: streamer's OBS/Twitch Studio sends RTMP (Real-Time Messaging Protocol) to the nearest Ingest Server; RTMP is a TCP-based, low-latency push protocol originally designed by Adobe for live video — the streamer's encoder handles local compression, and RTMP carries the already-encoded bitstream over a persistent TCP connection
+- **Transcoding**: Ingest Server remuxes the RTMP stream to MPEG-TS (Transport Stream) and routes it to a Transcoder cluster; GPU-accelerated FFmpeg generates 5 HLS quality variants (160p–1080p) simultaneously; each variant produces 2-second `.ts` segments with aligned GOP boundaries so viewers can switch qualities without visual glitches
+- **Delivery**: 2-second HLS segments are pushed to a CDN origin (S3-backed object store); CDN edge PoPs cache segments and serve them globally; the viewer's HLS player polls the manifest (`.m3u8`) every 2 seconds and fetches the next segment from the nearest edge — standard glass-to-glass latency sits at 15–20s; Low Latency HLS (LL-HLS) reduces that to 2–3s by streaming 200ms partial chunks within each segment using HTTP/2 long-poll
+- **Chat**: Twitch's IRC-over-WebSocket protocol; each chat message is validated, rate-limited, and published to a Redis pub/sub channel named after the broadcast channel; all Chat Servers subscribed to that pub/sub channel deliver the message to their local WebSocket connections; persistent chat history written asynchronously to Cassandra with a 60-day TTL
+- **VOD**: after stream ends, a VOD worker reads ordered segment references from Cassandra, downloads the `.ts` chunks from S3, and remuxes them into an MP4 via FFmpeg (no re-encoding, purely container conversion); the MP4 lands in S3 and is immediately served through the same CDN infrastructure, but with far higher cache-hit ratios than live segments
+</Tldr>
+
+## The scale of the problem
+
+Twitch is not a video hosting company that happens to do live streams. It is a real-time broadcasting network that also stores replays. That distinction shapes every architectural decision. As of 2024, Twitch sees more than 35 million daily active viewers, over 7 million unique streamers broadcasting each month, and routinely exceeds 2 million concurrent viewers during peak evening hours in North America and Europe. A single high-profile esports event — a League of Legends World Championship final, a major Fortnite tournament with streamer participation incentives — can push a single channel past 600,000 simultaneous viewers for hours at a stretch.
+
+What makes live streaming architecturally different from on-demand video (YouTube, Netflix) is the complete absence of pre-positioning. When Netflix delivers a movie, it has hours or days to pre-cache popular titles at every edge PoP globally. When a streamer goes live, the CDN has zero seconds of advance notice. The first viewer request arrives before any edge cache is warm, and every subsequent 2-second segment is unique — it does not exist on disk anywhere until the transcoder produces it 1–2 seconds before it needs to be served. The system must construct, push, and serve segments faster than they are consumed, at arbitrarily large fan-out, with no warm-up period. This is fundamentally a pipeline throughput problem, not a cache hit ratio problem.
+
+The chat system adds a third dimension of complexity that has no analog in on-demand video. A channel with 100,000 concurrent chatters can generate over 3,000 chat messages per second in peak engagement moments — during a dramatic in-game moment, a giveaway announcement, or a hot-take that triggers mass reaction. Every one of those messages must be delivered to every viewer watching that channel, including those who are passively watching without chatting. Fan-out from one sender to 100,000 recipients in under one second requires a fundamentally different architecture than either the video pipeline or a traditional messaging system. The database cannot be in the critical path for delivery — only for durability.
+
+## Clarifying questions
+
+Pin down these eight constraints before drawing a single box. Each answer closes off a major alternative design path.
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| What is the target viewer-side latency? | Standard mode 15–20s; Low Latency mode 3s | Standard HLS and LL-HLS are architecturally distinct — LL-HLS requires partial segment generation, HTTP/2 server push or long-poll, and CDN support for partial-chunk caching; choosing one vs. the other doubles the complexity of the transcoder and CDN layers |
+| What is the maximum concurrent viewer count per channel? | No hard cap; design for 500K peak | This directly sets CDN fan-out requirements and the number of CDN edge nodes needed; 500K × 3 Mbps per viewer = 1.5 Tbps egress from a single channel |
+| What is the maximum stream quality? | Up to 1080p60 for partner channels; 720p60 for affiliates | 1080p60 at 6 Mbps changes transcoder CPU/GPU estimates and CDN egress dramatically; 720p cap nearly halves ingest and egress bandwidth |
+| Is chat in scope? | Yes — real-time chat with emotes, subscriptions badges, moderation | Chat is a separate subsystem with its own scaling properties; including it forces WebSocket server design, Redis pub/sub fan-out, and Cassandra history storage |
+| Is VOD (video on demand replay) in scope? | Yes — 60-day retention after stream ends | VOD requires post-stream processing pipeline: segment assembly, MP4 remux, S3 storage, and a separate VOD manifest generation step |
+| Are clips in scope? | Short VOD segments; out of scope for this interview | Clip creation is a trimming operation on VOD segments — significant engineering but not core to the live streaming design |
+| Are subscriptions, Bits, and payments in scope? | Out of scope — focus on video and chat infrastructure | Payments and entitlements are a separate microservice domain; omitting them lets you spend interview time on the hard distributed systems problems |
+| Does mobile ingest need to be supported? | Yes — same RTMP protocol, lower bitrate limits | Mobile streamers on cellular may have variable uplink; the ingest server must handle bitrate fluctuations gracefully and apply different max-bitrate caps for mobile stream keys |
+
+## Functional requirements
+
+- **Start and stop a stream**: a streamer authenticates, receives an RTMP ingest URL and stream key, and begins broadcasting; ending the stream triggers graceful termination and VOD processing
+- **Watch a live stream with adaptive quality**: viewers receive an HLS manifest listing multiple quality variants; their player automatically selects quality based on available bandwidth and switches between variants without interrupting playback
+- **Real-time chat**: authenticated and anonymous viewers can send and receive chat messages within the channel they are watching; messages include user badges, emote metadata, and color formatting
+- **VOD playback**: once a stream ends, the recording becomes available for replay within minutes; VOD supports seeking, quality selection, and clip creation from arbitrary time ranges
+- **Stream discovery and browsing**: viewers can browse live streams by game category, viewer count, or language; search by channel name; receive personalized recommendations
+- **Live viewer count**: streamers and viewers see a continuously updated viewer count that reflects the number of active concurrent viewers
+
+## Non-functional requirements
+
+- **Scale**: 35M daily active viewers, 7M monthly streamers, 2M peak concurrent viewers across all channels, 100K concurrent active streams at any given moment
+- **Throughput**: CDN must sustain 6 Tbps of sustained video egress at peak; ingest network must handle 600 Gbps of incoming RTMP streams
+- **Latency — stream start**: a new stream must be watchable by the first viewer within 5 seconds of the streamer pressing "Go Live" (ingest, first segment transcoded, manifest published, CDN propagated)
+- **Latency — chat delivery**: chat messages must be delivered to all connected viewers within 1 second of being sent, at any channel size
+- **Glass-to-glass video latency**: standard HLS mode targets 15–20 seconds; Low Latency HLS targets under 3 seconds
+- **Availability — ingest**: 99.99% uptime for the ingest layer (streamer-facing); a streamer losing connectivity mid-stream due to infrastructure failure is a Severity 1 incident
+- **Availability — viewer playback**: 99.9% uptime for CDN delivery; segment delivery errors must fall below 0.1% of requests
+- **Durability — VOD**: 99.999999999% (11 nines) durability for VOD storage, backed by S3's native redundancy
+
+<Capacity title="Twitch Capacity Estimates">
+**Concurrent streams**
+
+Based on 7M monthly streamers with roughly 1.4% streaming simultaneously:
+
+$$100{,}000 \text{ concurrent active streams}$$
+
+**Ingest bandwidth**
+
+Each stream pushes at an average of 6 Mbps (720p60 at 4.5 Mbps + audio + overhead):
+
+$$100{,}000 \times 6\text{ Mbps} = 600\text{ Gbps ingest}$$
+
+**Transcoding compute**
+
+5 quality variants per stream, each requiring approximately 0.5 GPU-equivalent at real-time factor 1:1:
+
+$$100{,}000 \times 5 \times 0.5 = 250{,}000 \text{ GPU-equivalents}$$
+
+In practice, NVENC hardware encoding on modern GPUs (A10G) can transcode 50–80 streams per GPU at 5 variants each, meaning roughly 6,000–10,000 GPU instances.
+
+**CDN egress**
+
+2M concurrent viewers at an average of 3 Mbps per viewer (mix of 720p and 480p):
+
+$$2{,}000{,}000 \times 3\text{ Mbps} = 6\text{ Tbps CDN outbound}$$
+
+**Chat message throughput**
+
+Peak single channel: 500K concurrent chatters at 2 messages per viewer per minute:
+
+$$\frac{500{,}000 \times 2}{60} \approx 16{,}667 \text{ msgs/s for one channel}$$
+
+Total platform: 100K channels at an average of 10 msgs/s per channel:
+
+$$100{,}000 \times 10 = 1{,}000{,}000 \text{ msgs/s platform-wide}$$
+
+**VOD storage**
+
+A 1080p60 stream at 6 Mbps for 4 hours generates:
+
+$$6\text{ Mbps} \times 3{,}600 \times 4 \div 8 = 10.8\text{ GB per stream}$$
+
+With 100K streams per day and 60-day retention:
+
+$$100{,}000 \times 10.8\text{ GB} \times 60 \approx 64.8\text{ PB total VOD storage}$$
+</Capacity>
+
+## API design
+
+### Streamer API (REST)
+
+**Start a stream**
+
+```
+POST /api/v5/streams/start
+Authorization: Bearer {oauth_token}
+
+Response 200:
+{
+  "rtmp_ingest_url": "rtmp://live-sjc.twitch.tv/app/",
+  "stream_key": "live_12345678_AbCdEfGhIjKlMn...",
+  "stream_id": "uuid-v4",
+  "backup_ingest_url": "rtmp://live-sjc2.twitch.tv/app/"
+}
+```
+
+The streamer pastes `rtmp_ingest_url` and `stream_key` into OBS. The stream key encodes the channel ID and is rotated on each stream start for security. A backup ingest URL is always returned so the streamer can configure a secondary connection without waiting for failure.
+
+**End a stream**
+
+```
+POST /api/v5/streams/end
+Authorization: Bearer {oauth_token}
+Body: { "stream_key": "live_12345678_..." }
+
+Response 200:
+{ "stream_id": "uuid-v4", "vod_processing_eta_seconds": 300 }
+```
+
+**Stream status**
+
+```
+GET /api/v5/streams/{channel_id}/status
+
+Response 200:
+{
+  "is_live": true,
+  "viewer_count": 48291,
+  "started_at": "2025-01-15T20:00:00Z",
+  "title": "Ranked Grind - Road to Challenger",
+  "game": "League of Legends",
+  "language": "en"
+}
+```
+
+### Viewer API (REST)
+
+**Get HLS manifest**
+
+```
+GET /api/v5/streams/{channel_id}/manifest
+Authorization: Bearer {oauth_token} (optional; affects quality availability)
+
+Response 302 Location:
+https://usher.twitchsvc.net/api/channel/live_{channel_id}.m3u8?
+  sig={signed_token}&token={viewer_token}&allow_source=true
+```
+
+The server validates that the channel is live (MySQL status check) then issues a signed redirect to the CDN HLS master manifest. The viewer's player follows the redirect and begins polling the manifest URL directly — all subsequent traffic bypasses the API layer entirely.
+
+**Browse streams**
+
+```
+GET /api/v5/streams/browse?game=League+of+Legends&sort=viewers&cursor={opaque_cursor}
+
+Response 200:
+{
+  "streams": [
+    { "channel_id": "...", "title": "...", "viewer_count": 52000, "thumbnail_url": "..." }
+  ],
+  "pagination": { "cursor": "next_page_cursor" }
+}
+```
+
+### Chat API (WebSocket, IRC-over-WS)
+
+Twitch's actual chat protocol is IRC carried over a WebSocket connection, not a custom binary protocol. This was a deliberate compatibility choice: existing IRC bots and clients work without modification.
+
+```
+Client connects to: wss://irc-ws.chat.twitch.tv:443
+
+Authenticate and join a channel:
+  PASS oauth:YOUR_ACCESS_TOKEN\r\n
+  NICK yourusername\r\n
+  JOIN #channelname\r\n
+
+Send a message:
+  PRIVMSG #channelname :Hello chat! PogChamp\r\n
+
+Receive a message (server → client):
+  @badge-info=subscriber/8;badges=subscriber/6;color=#FF4500;
+  display-name=SomeViewer;emotes=25:12-19;
+  :someviewer!someviewer@someviewer.tmi.twitch.tv
+  PRIVMSG #channelname :Hello chat! Kappa\r\n
+
+Request IRCv3 capabilities for emote/badge metadata:
+  CAP REQ :twitch.tv/tags twitch.tv/commands\r\n
+```
+
+The `@` prefix carries IRCv3 message tags — key-value pairs that encode badge state, emote positions, color, subscription tier, and moderator status. The client uses emote position metadata to replace text ranges with image URLs locally, so the server never sends image URLs inline.
+
+## Data model
+
+### streams (MySQL — source of truth for stream lifecycle)
+
+```sql
+CREATE TABLE streams (
+  stream_id       CHAR(36)     NOT NULL,
+  channel_id      BIGINT       NOT NULL,
+  title           VARCHAR(140) NOT NULL,
+  game_id         INT,
+  language        CHAR(5),
+  started_at      DATETIME(3)  NOT NULL,
+  ended_at        DATETIME(3),
+  peak_viewer_count INT        DEFAULT 0,
+  status          ENUM('live','ended','processing_vod','vod_ready') NOT NULL DEFAULT 'live',
+  ingest_server   VARCHAR(64),
+  PRIMARY KEY (stream_id),
+  INDEX idx_channel_status (channel_id, status),
+  INDEX idx_started_at (started_at)
+);
+```
+
+MySQL is appropriate here because stream lifecycle events are low-frequency (100K rows/day) and require strong consistency — a streamer ending a stream must immediately make the channel appear offline to all viewers.
+
+### stream_segments (Cassandra — write-heavy, ordered, large volume)
+
+```sql
+CREATE TABLE stream_segments (
+  channel_id  BIGINT,
+  stream_id   UUID,
+  quality     TEXT,
+  segment_seq INT,
+  hls_url     TEXT,
+  s3_key      TEXT,
+  duration_ms INT,
+  created_at  TIMESTAMP,
+  PRIMARY KEY ((channel_id, stream_id, quality), segment_seq)
+) WITH CLUSTERING ORDER BY (segment_seq ASC)
+  AND default_time_to_live = 5184000;
+```
+
+The compound partition key `(channel_id, stream_id, quality)` keeps all segments for one quality variant of one stream co-located on one Cassandra node. The VOD worker scans this table sequentially — a single partition scan reads segments in order with no sorting needed.
+
+### chat_messages (Cassandra — time-series, high write throughput)
+
+```sql
+CREATE TABLE chat_messages (
+  channel_id  BIGINT,
+  message_id  TIMEUUID,
+  user_id     BIGINT,
+  username    TEXT,
+  message     TEXT,
+  badges      LIST<TEXT>,
+  color       TEXT,
+  emotes      TEXT,
+  created_at  TIMESTAMP,
+  PRIMARY KEY (channel_id, message_id)
+) WITH CLUSTERING ORDER BY (message_id DESC)
+  AND default_time_to_live = 5184000;
+```
+
+`TIMEUUID` as the clustering key gives monotonically increasing, time-ordered IDs with no coordination needed. TTL of 5,184,000 seconds equals 60 days. Chat history lookup (paginating backwards through a channel's history) is a simple partition scan with a `LIMIT`.
+
+### viewer_counts (Redis — live aggregation)
+
+```
+key:   viewers:{channel_id}
+type:  String (integer)
+ops:   INCR on viewer join, DECR on viewer leave
+ttl:   none (cleared when stream ends)
+```
+
+A background job reads all `viewers:*` keys every 30 seconds and writes the current count to MySQL `streams.peak_viewer_count` if it exceeds the stored peak. The live viewer count shown in the UI reads from Redis — not MySQL — to avoid stale 30-second-old numbers.
+
+### stream_health (Redis — ingest monitoring)
+
+```
+key:   health:{channel_id}
+type:  Hash
+fields: ingest_bitrate, fps, dropped_frames, last_seen_ms
+ttl:   10 seconds (refreshed by ingest server on each segment)
+```
+
+If the ingest server stops updating `last_seen_ms`, the health key expires. A monitoring process detects the expiry via Redis keyspace notifications and fires a stream-health alert within 10 seconds of an ingest failure.
+
+## Architecture diagrams
+
+### Flow A: Live video pipeline
+
+<Mermaid diagram={`flowchart LR
+  OBS["Streamer OBS\\nRTMP push"]
+  INGEST["Ingest Server\\n(nearest region)\\nremux RTMP → TS"]
+  TRANSCODE["Transcoder Farm\\nFFmpeg + NVENC\\n5 quality variants"]
+  ORIGIN["CDN Origin\\n(S3 + origin server)"]
+  CDN["CDN Edge PoPs\\n(global)"]
+  PLAYER["Viewer HLS Player\\npoll manifest / fetch segment"]
+
+  OBS -- "RTMP TCP persistent" --> INGEST
+  INGEST -- "raw MPEG-TS over TCP" --> TRANSCODE
+  TRANSCODE -- "2s .ts segments + .m3u8" --> ORIGIN
+  ORIGIN -- "segment push / pull-on-miss" --> CDN
+  CDN -- "serve .ts segment" --> PLAYER
+  PLAYER -- "poll .m3u8 every 2s" --> CDN`} />
+
+### Flow B: Chat message fan-out
+
+<Mermaid diagram={`flowchart LR
+  SENDER["Viewer A\\nPRIVMSG #channel"]
+  CHATSVR["Chat Server A\\n(WebSocket handler)"]
+  RATELIMIT["Rate Limiter\\n(Redis sliding window)"]
+  AUTOMOD["AutoMod\\n(ML classifier)"]
+  REDIS["Redis Pub/Sub\\nchannel:{channelId}"]
+  CASS["Cassandra\\nchat_messages"]
+  CHATSVR2["Chat Server B, C, ...N\\n(subscribed to same pub/sub key)"]
+  VIEWERS["All connected viewers\\nof that channel"]
+
+  SENDER -- "WS PRIVMSG" --> CHATSVR
+  CHATSVR --> RATELIMIT
+  RATELIMIT -- "pass" --> AUTOMOD
+  AUTOMOD -- "approved" --> REDIS
+  REDIS -- "async write" --> CASS
+  REDIS -- "publish" --> CHATSVR2
+  CHATSVR2 -- "deliver WS frame" --> VIEWERS`} />
+
+## Deep dives
+
+### RTMP ingest and remuxing
+
+RTMP (Real-Time Messaging Protocol) is a TCP-based protocol originally developed by Macromedia, now Adobe. Despite being published in the early 2000s, it remains the dominant live streaming ingest protocol in 2024 — not because it is technically superior to alternatives like WebRTC or SRT, but because it has universal encoder support. Every major software encoder (OBS Studio, Streamlabs, XSplit, FFmpeg), hardware encoder (Elgato, AVerMedia), and console streaming SDK (PlayStation, Xbox) implements RTMP. Switching ingest protocols at Twitch's scale would require convincing millions of streamers to update their software or hardware — not feasible.
+
+RTMP operates on a multiplexed chunk stream. A persistent TCP connection carries interleaved 128-byte chunks of audio data, video data, and metadata (stream title, resolution, framerate). The chunk size is negotiable during the RTMP handshake, but 128 bytes is the default and keeps any single audio or video chunk from monopolizing the connection. The encoder has already compressed the video locally using x264, x265/HEVC, or AV1 before it touches RTMP — the ingest server receives a pre-encoded bitstream, not raw frames. This is a critical point: Twitch cannot control the encoder settings or quality decisions on the streamer's side.
+
+The ingest server's job is two-fold: accept the RTMP connection and authenticate the stream key, then remux the incoming data from the RTMP container format to MPEG-TS. Remuxing is a container conversion — it rewraps the same encoded bitstream into a different container format without decoding or re-encoding the video. MPEG-TS (Transport Stream) is preferred over RTMP for the ingest-to-transcoder hop because TS has better error recovery properties and is the native input format for most FFmpeg transcoding pipelines.
+
+Ingest server selection is geographically driven. Twitch operates ingest clusters in over 20 cities globally. DNS resolution for `live.twitch.tv` returns a regional cluster based on the requester's IP geolocation. The streamer's encoder connects to the nearest ingest cluster to minimize TCP RTT — a streamer with 100ms RTT to the ingest server will see RTMP retransmissions on packet loss that stall the stream pipeline. Keeping RTT below 30ms means the ingest TCP connection can absorb typical internet packet loss rates without visible stutter. A backup ingest URL is always provided; if the primary connection fails, the encoder retries and lands on a different ingest node within the same cluster.
+
+The ingest server maintains the RTMP connection state and forwards reassembled chunks to the transcoder farm over a high-speed internal network link. The ingest-to-transcoder connection is within the same data center or across a low-latency backbone — this hop can tolerate higher throughput per connection because it is not traversing the public internet.
+
+### Real-time transcoding
+
+The transcoder is where the most compute-intensive work happens. A single stream arrives as one quality level (whatever the streamer's encoder produced). The transcoder must produce five quality variants simultaneously in real time — before the next 2-second segment is due to be generated.
+
+The five standard quality variants are:
+
+| Quality | Resolution | Frame Rate | Target Bitrate |
+|---|---|---|---|
+| 160p | 284×160 | 30fps | 300 Kbps |
+| 360p | 640×360 | 30fps | 800 Kbps |
+| 480p | 852×480 | 30fps | 1.5 Mbps |
+| 720p | 1280×720 | 60fps | 3 Mbps |
+| 1080p (partners only) | 1920×1080 | 60fps | 6 Mbps |
+
+Each variant requires a full decode-scale-encode cycle. Decoding the ingest stream, scaling to five target resolutions, and encoding each at target bitrate using H.264 with target GOP alignment — done in software — would require roughly 8–12 CPU cores per stream. At 100K concurrent streams, that is 800K–1.2M CPU cores. This is why Twitch and all major live streaming platforms use GPU-accelerated encoding via NVENC (NVIDIA) or AMF (AMD). A single NVIDIA A10G GPU can transcode 50–80 live streams simultaneously across 5 variants each, collapsing the transcoding fleet from millions of CPU cores to tens of thousands of GPUs.
+
+The GOP (Group of Pictures) alignment is the most subtle but important constraint. HLS quality switching is seamless only if segment boundaries align across all quality variants at exactly the same timestamp. If a viewer's player switches from 720p to 480p, it must be able to start the 480p stream at exactly the segment boundary where it left the 720p stream. This requires all five encoders to start a new keyframe (I-frame) at identical timestamps — every 2 seconds. The transcoder enforces this by setting `-force_key_frames expr:gte(t,n_forced*2)` in FFmpeg, which inserts an I-frame at every 2-second boundary regardless of the encoder's natural GOP decisions.
+
+When a 2-second segment is complete, the transcoder writes the `.ts` file to the CDN origin (an S3 bucket or a purpose-built origin server) and updates the `.m3u8` playlist for each quality variant. The master manifest lists all quality variants with their bandwidth annotations. The viewer's player fetches the master manifest once, selects a quality variant based on current bandwidth, then polls the variant's media manifest every 2 seconds to discover new segments.
+
+The total transcoding pipeline latency from the streamer pressing a button to the first viewer seeing the frame: RTMP ingest buffering (~0.5s) + remux (~0.1s) + first segment encode (2s) + CDN origin write (~0.3s) + CDN edge propagation (~0.5s) + HLS player buffering (3 segments = 6s default, configurable to 1 segment). This gives the 8–10s minimum latency floor in standard mode, with real-world glass-to-glass averaging 15–20s due to player-side buffering strategies and CDN propagation across distant PoPs.
+
+### Low Latency HLS and the 3-second barrier
+
+Standard HLS achieves low stall rates by buffering several segments before starting playback. Most HLS players default to buffering 3 complete segments (6 seconds) before they begin playback, and they maintain a continuous 6-second buffer during playback. Combined with the 2–4 second transcoding pipeline and CDN propagation time, this produces the characteristic 15–20 second glass-to-glass latency of standard HLS.
+
+Apple's Low Latency HLS (LL-HLS) specification, finalized in 2019 and adopted by Twitch as their "Low Latency Mode," breaks this constraint through partial segments. Instead of waiting for a full 2-second segment to complete before publishing it, the transcoder publishes 200ms partial chunks of each segment as they become available. The `.m3u8` manifest includes `EXT-X-PART` tags pointing to partial chunks, alongside `EXT-X-PRELOAD-HINT` tags that tell the player which partial chunk will be available next.
+
+The player uses HTTP/2 long-polling to block on the `EXT-X-PRELOAD-HINT` URL — the request is held open by the CDN until the next partial chunk is ready, then the CDN responds immediately. This eliminates the polling interval overhead: instead of the player waiting up to 2 seconds for the manifest to list a new segment, it receives the next 200ms partial chunk within 200ms of it being generated.
+
+The latency reduction math: with 200ms partial chunks and a 1-segment buffer (400ms of buffered content), the end-to-end pipeline becomes: encode time for first partial chunk (~200ms) + CDN edge propagation (~50ms) + 1–2 partial chunks buffered (~200–400ms) = 450–650ms pipeline latency. Real-world LL-HLS latency is 2–3 seconds, not sub-second, because the transcoder still requires wall-clock time to encode each 200ms chunk and CDN propagation to regional edges adds 100–300ms.
+
+The trade-offs are significant. LL-HLS generates 10 partial chunks per 2-second segment, meaning 10× more CDN requests per viewer per segment. CDN edge caches must handle partial chunk caching differently — a partial chunk is unique and cannot be shared with future requests once the segment finalizes and the complete `.ts` file supersedes it. CDN cache efficiency for LL-HLS partial chunks is much lower than for standard HLS segments. Additionally, LL-HLS requires HTTP/2 support end-to-end (CDN edge to viewer player), which was not universal across all devices until 2022. Twitch offers LL-HLS as an opt-in setting for channels and viewers rather than the default because the increased CDN request volume at their scale (2M viewers × 10× more requests) is a meaningful cost and capacity consideration.
+
+### Chat fan-out at 100K concurrent chatters
+
+The naive implementation of chat — store every message in a relational database and have each viewer client poll for new messages — fails at approximately 1,000 concurrent chatters per channel. A single channel with 100K chatters generating 3,000 messages per second would require 100K database queries per second just for polling, and the message latency would grow as the poll interval is increased to reduce database load. Neither fan-out nor latency is acceptable.
+
+Twitch's actual chat architecture is built on three layers working together.
+
+**Layer 1: IRC-over-WebSocket for connection multiplexing.** Each Chat Server maintains persistent WebSocket connections with a large number of clients — a single Chat Server instance can hold 50,000–100,000 simultaneous WebSocket connections. When a viewer joins a channel, their WebSocket connection registers with the Chat Server as a member of that channel's local subscriber set. The Chat Server tracks which channels each of its clients has joined.
+
+**Layer 2: Redis pub/sub for inter-server fan-out.** When a PRIVMSG arrives at any Chat Server, that server publishes the message to a Redis pub/sub channel named `channel:{channelId}`. Every Chat Server that has at least one WebSocket client subscribed to that channel is subscribed to the corresponding Redis pub/sub key. Redis delivers the message to all subscribed Chat Servers within 1–2ms. Each Chat Server then iterates its local subscriber set for that channel and delivers the IRC-formatted message over each client's WebSocket connection.
+
+This architecture means the fan-out cost scales with the number of Chat Servers subscribed to a channel, not with the number of viewers directly. If 100K viewers are distributed across 100 Chat Server instances (1,000 viewers per server), Redis publishes to 100 subscribers — not 100,000. Each Chat Server then fans out to its 1,000 local clients. The Redis pub/sub operation is O(100) rather than O(100,000).
+
+**Layer 3: Cassandra for durable history.** After Redis delivers the message, the Chat Server writes it asynchronously to Cassandra with a fire-and-forget pattern. The Cassandra write does not block message delivery — it happens concurrently. Chat history (used for "loading chat replay" on VOD, displaying recent messages when a new viewer joins) is served from Cassandra by reading the most recent N messages from the channel's partition, sorted by TIMEUUID descending.
+
+**Rate limiting** is enforced per user per channel in Redis using a sliding window counter. Non-subscriber users are limited to 1 message per 30 seconds in channels with more than a configurable viewer threshold; subscribers get 1 message per 3 seconds. This prevents a single user from dominating a high-message-rate channel and reduces the maximum throughput any single channel's chat can generate.
+
+**AutoMod** runs synchronously between rate limit check and Redis publish. It scores each message against a configurable set of heuristic rules (blocked terms, hate speech patterns, link filtering) and an ML classifier trained on moderated messages. Messages scoring above the channel's AutoMod threshold are held for manual moderator review rather than published immediately. The classifier must respond in under 50ms to stay within the 1-second delivery SLA.
+
+### VOD processing and storage
+
+When a stream ends — either the streamer clicks "End Stream" or the ingest server loses the RTMP connection for longer than the grace period — the system transitions the stream status from `live` to `processing_vod` and emits a Kafka event `stream-ended` with the stream ID and channel ID.
+
+A VOD Worker consumes this Kafka event and begins the assembly process. It queries Cassandra `stream_segments` for all segments belonging to this stream ID and quality, ordered by `segment_seq`. For the highest quality variant (typically 1080p or 720p), it downloads each `.ts` segment from S3 in order and pipes them through FFmpeg for remuxing:
+
+```bash
+ffmpeg -i concat:seg_001.ts|seg_002.ts|...|seg_N.ts \
+  -c copy \
+  -movflags faststart \
+  -f mp4 \
+  vod_{stream_id}.mp4
+```
+
+The `-c copy` flag is critical — it copies the H.264 bitstream without re-encoding. The segments are already H.264; FFmpeg only changes the container from MPEG-TS to MP4. This makes the remux operation CPU-bound on I/O rather than compute — a 4-hour stream at 6 Mbps remuxes in approximately 2–5 minutes.
+
+`-movflags faststart` moves the MP4 `moov` atom (metadata) to the beginning of the file, enabling the browser's video player to begin playback before the entire file is downloaded. Without this flag, the browser must download the complete MP4 before it can determine video duration and timestamps, making seeking impossible until the full file arrives.
+
+The resulting MP4 is written to S3 with a 60-day object lifecycle policy. The VOD manifest is regenerated as a complete HLS playlist (non-live, with EXT-X-ENDLIST) that lists all segments at all quality levels — the same CDN infrastructure that served the live stream now serves the VOD with dramatically higher cache hit ratios, since VOD segments do not change after they are written.
+
+### Ingest failover and redundancy
+
+The streamer's RTMP client cannot detect a mid-stream ingest failure faster than TCP's keepalive timeout — by default, 2 minutes. Twitch solves this with two mechanisms.
+
+First, the ingest server sends periodic RTMP ping messages to the client. If the client stops receiving pings, it detects the connection as dead within 10 seconds and reconnects. The backup ingest URL provided at stream start connects to a different physical ingest server, so reconnection succeeds even if the primary ingest node goes down entirely.
+
+Second, the transcoder maintains a reference to the stream session. If ingest data stops flowing (no new TS packets for more than 5 seconds), the transcoder holds the HLS manifest at its current state without advancing. The viewer's player detects a stalled manifest (no new segments for longer than `EXT-X-TARGET-DURATION × 3`) and begins buffering from its existing download. When the ingest recovers and new segments flow again, the manifest advances and the player catches up. The viewer experiences a brief buffering indicator rather than a complete stream failure.
+
+This grace period approach — hold the manifest steady rather than invalidating the stream immediately — covers the most common case: a transient network blip lasting 5–30 seconds. Only if the ingest connection is lost for more than 60 seconds does the system transition the stream to `ended` status and begin VOD processing.
+
+## Java integration
+
+### Part A — StreamIngestManager.java
+
+```java
+package com.twitch.streaming.ingest;
+
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Service;
+import com.datastax.oss.driver.api.core.CqlSession;
+import io.lettuce.core.api.StatefulRedisConnection;
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.time.Instant;
+import java.util.UUID;
+
+@Service
+public class StreamIngestManager {
+
+    private final DataSource mysql;
+    private final CqlSession cassandra;
+    private final StatefulRedisConnection<String, String> redis;
+    private final KafkaTemplate<String, String> kafka;
+
+    public StreamIngestManager(DataSource mysql, CqlSession cassandra,
+                               StatefulRedisConnection<String, String> redis,
+                               KafkaTemplate<String, String> kafka) {
+        this.mysql = mysql;
+        this.cassandra = cassandra;
+        this.redis = redis;
+        this.kafka = kafka;
+    }
+
+    public StreamSession startStream(String streamKey, String channelId, String ingestServerAddr)
+            throws Exception {
+        String streamId = UUID.randomUUID().toString();
+        try (Connection conn = mysql.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                 "INSERT INTO streams (stream_id,channel_id,started_at,status,ingest_server) " +
+                 "VALUES (?,?,?,?,?)")) {
+            ps.setString(1, streamId);
+            ps.setLong(2, Long.parseLong(channelId));
+            ps.setObject(3, Instant.now());
+            ps.setString(4, "live");
+            ps.setString(5, ingestServerAddr);
+            ps.executeUpdate();
+        }
+        var sync = redis.sync();
+        sync.set("viewers:" + channelId, "0");
+        sync.set("health:" + channelId, "{}", io.lettuce.core.SetArgs.Builder.ex(10));
+        kafka.send("stream-started",
+            "{\"channelId\":\"" + channelId + "\",\"streamId\":\"" + streamId + "\"}");
+        return new StreamSession(streamId, resolveTranscoderEndpoint(channelId), "s3://twitch-ingest/" + channelId);
+    }
+
+    public void recordSegment(String channelId, String streamId, String quality,
+                              int segSeq, String hlsUrl) {
+        cassandra.execute(
+            "INSERT INTO stream_segments(channel_id,stream_id,quality,segment_seq,hls_url,created_at) " +
+            "VALUES (?,?,?,?,?,toTimestamp(now()))",
+            Long.parseLong(channelId), UUID.fromString(streamId), quality, segSeq, hlsUrl);
+        redis.sync().hset("health:" + channelId, "last_seen_ms",
+            String.valueOf(System.currentTimeMillis()));
+        redis.sync().expire("health:" + channelId, 10);
+    }
+
+    public void endStream(String channelId, String streamId) throws Exception {
+        try (Connection conn = mysql.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                 "UPDATE streams SET status='processing_vod', ended_at=? WHERE stream_id=?")) {
+            ps.setObject(1, Instant.now());
+            ps.setString(2, streamId);
+            ps.executeUpdate();
+        }
+        kafka.send("stream-ended",
+            "{\"channelId\":\"" + channelId + "\",\"streamId\":\"" + streamId + "\"}");
+        var sync = redis.sync();
+        sync.del("viewers:" + channelId, "health:" + channelId);
+    }
+
+    private String resolveTranscoderEndpoint(String channelId) {
+        long hash = Long.parseLong(channelId) % 128;
+        return "grpc://transcoder-" + hash + ".internal:9090";
+    }
+}
+```
+
+### Part B — StreamController.java
+
+```java
+package com.twitch.streaming.api;
+
+import com.twitch.streaming.ingest.StreamIngestManager;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import io.lettuce.core.api.StatefulRedisConnection;
+import javax.sql.DataSource;
+import java.sql.*;
+import java.net.URI;
+
+@RestController
+@RequestMapping("/api/v5/streams")
+public class StreamController {
+
+    private final StreamIngestManager ingestManager;
+    private final DataSource mysql;
+    private final StatefulRedisConnection<String, String> redis;
+    private static final String CDN_MANIFEST_BASE = "https://usher.twitchsvc.net/api/channel/";
+
+    public StreamController(StreamIngestManager ingestManager, DataSource mysql,
+                            StatefulRedisConnection<String, String> redis) {
+        this.ingestManager = ingestManager;
+        this.mysql = mysql;
+        this.redis = redis;
+    }
+
+    @PostMapping("/start")
+    public ResponseEntity<RtmpConfig> startStream(@RequestHeader("Authorization") String auth,
+                                                  @RequestBody StartStreamRequest req) throws Exception {
+        String channelId = validateOAuthAndGetChannelId(auth);
+        var session = ingestManager.startStream(req.streamKey(), channelId, req.preferredRegion());
+        return ResponseEntity.ok(new RtmpConfig(
+            "rtmp://live-" + req.preferredRegion() + ".twitch.tv/app/",
+            req.streamKey(), session.streamId()));
+    }
+
+    @PostMapping("/end")
+    public ResponseEntity<Void> endStream(@RequestHeader("Authorization") String auth,
+                                          @RequestBody EndStreamRequest req) throws Exception {
+        String channelId = validateOAuthAndGetChannelId(auth);
+        String streamId = lookupActiveStreamId(channelId);
+        ingestManager.endStream(channelId, streamId);
+        return ResponseEntity.ok().build();
+    }
+
+    @GetMapping("/{channelId}/manifest")
+    public ResponseEntity<Void> getManifest(@PathVariable String channelId) throws Exception {
+        if (!isChannelLive(channelId)) return ResponseEntity.notFound().build();
+        String manifestUrl = CDN_MANIFEST_BASE + "live_" + channelId + ".m3u8?allow_source=true";
+        return ResponseEntity.status(302).location(URI.create(manifestUrl)).build();
+    }
+
+    @GetMapping("/{channelId}/status")
+    public ResponseEntity<StreamStatus> getStatus(@PathVariable String channelId) throws Exception {
+        try (Connection conn = mysql.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                 "SELECT title, started_at, status FROM streams WHERE channel_id=? AND status='live' LIMIT 1")) {
+            ps.setLong(1, Long.parseLong(channelId));
+            ResultSet rs = ps.executeQuery();
+            if (!rs.next()) return ResponseEntity.ok(new StreamStatus(false, 0, null, null));
+            String viewerStr = redis.sync().get("viewers:" + channelId);
+            int viewers = viewerStr != null ? Integer.parseInt(viewerStr) : 0;
+            return ResponseEntity.ok(new StreamStatus(true, viewers, rs.getString("started_at"), rs.getString("title")));
+        }
+    }
+
+    private boolean isChannelLive(String channelId) throws Exception {
+        try (Connection conn = mysql.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                 "SELECT 1 FROM streams WHERE channel_id=? AND status='live' LIMIT 1")) {
+            ps.setLong(1, Long.parseLong(channelId));
+            return ps.executeQuery().next();
+        }
+    }
+
+    private String validateOAuthAndGetChannelId(String authHeader) { return "12345"; }
+    private String lookupActiveStreamId(String channelId) throws Exception { return "stream-uuid"; }
+
+    record RtmpConfig(String ingestUrl, String streamKey, String streamId) {}
+    record StartStreamRequest(String streamKey, String preferredRegion) {}
+    record EndStreamRequest(String streamKey) {}
+    record StreamStatus(boolean isLive, int viewerCount, String startedAt, String title) {}
+}
+```
+
+## Trade-off analysis
+
+<TradeoffTable>
+| Approach | Ingest Latency | Viewer Latency | Transcode Cost | Scalability |
+|---|---|---|---|---|
+| **WebRTC ingest** (WHIP protocol, UDP-based) | Sub-100ms — WebRTC's SRTP/DTLS operates on UDP with adaptive jitter buffers tuned for real-time communication; ideal for interactive streams and co-streaming | 500ms–2s achievable with WebRTC egress (WHEP), but requires stateful media servers at every edge — no CDN caching possible | Lower: no remux step, WebRTC SFUs can directly forward encoded packets; but requires running WebRTC SFU infrastructure globally | Limited: WebRTC SFUs are stateful connection routers; scaling to 500K viewers per channel requires a full mesh of SFU cascade — operationally complex and expensive |
+| **RTMP → HLS (standard, 20s latency)** | 50–200ms from encoder to ingest server over TCP; ingest is not the bottleneck | 15–20s glass-to-glass; 3 segments × 2s each buffered by player + pipeline adds remaining latency | Moderate: GPU-accelerated FFmpeg transcode; no partial-chunk complexity; CDN serves full 2s segments with high cache-hit ratios | Excellent: stateless CDN caching; each 2s `.ts` file is an immutable object; horizontal scale by adding CDN edge nodes |
+| **RTMP → LL-HLS (3s latency)** | Same RTMP ingest — latency reduction is entirely on the transcoder and CDN side | 2–3s glass-to-glass; partial 200ms chunks published as they encode; HTTP/2 long-poll eliminates polling wait | Higher: transcoder must flush partial chunks every 200ms; 10× more CDN origin writes per stream; CDN handles 10× more requests per viewer; partial chunks have near-zero cache lifetime | Good: CDN still stateless for full segments; partial chunks add request volume but are small; requires HTTP/2 support end-to-end to all viewer devices |
+| **Peer-assisted streaming (P2P CDN mesh)** | No change — ingest and transcoding are unaffected; only delivery changes | Near-CDN latency for popular streams where many peers are nearby; degrades for rare streams or mobile users with NAT traversal issues | Lower CDN cost: popular segments are served peer-to-peer; CDN egress reduces by 30–70% on high-viewer-count streams; Peers with excess upload bandwidth serve other viewers | Mixed: P2P works best at very high viewer counts (100K+) where many peers share segments; below 1,000 viewers, peer density is too low; mobile and restrictive NAT environments reduce effectiveness |
+</TradeoffTable>
+
+<Pitfall>
+**Pitfall: Single ingest server per stream with no failover**
+
+A common mistake is assigning exactly one ingest server to each active stream and routing all traffic for that stream key to that server. This creates a single point of failure: if the ingest server crashes, loses power, or exhausts its file descriptors, the stream drops immediately with no recovery path.
+
+The correct approach is to issue two ingest URLs at stream start — a primary and a backup — pointing to different physical servers in the same ingest cluster. The streamer's encoder is configured with both (OBS supports a backup server field natively). The backup server accepts the RTMP connection but initially discards the data, keeping the connection alive and warm. When the transcoder stops receiving data from the primary ingest server (no new TS packets for more than 5 seconds), it switches its input source to the backup ingest server's stream. The switch is transparent to the transcoder — both servers are feeding the same encoded bitstream, and the transcoder continues generating segments without interruption. The viewer sees at most a brief buffer stall while the transcoder pipeline catches up to the backup stream's position.
+
+This pattern also handles the scenario where a streamer's ISP routes poorly to the primary ingest region. If segment health metrics (dropped frames, packet loss) on the primary connection exceed thresholds, the transcoder can proactively switch to the backup without waiting for a complete failure.
+</Pitfall>
+
+<Pitfall>
+**Pitfall: Synchronous database reads in the chat delivery path**
+
+A deceptively simple implementation stores each incoming chat message in MySQL or PostgreSQL and has viewers poll a `SELECT * FROM chat_messages WHERE channel_id = ? ORDER BY created_at DESC LIMIT 50` query every second. This architecture collapses under load.
+
+At 3,000 messages per second for a single channel, the write throughput alone exhausts a typical MySQL instance's write capacity. More critically, if 100,000 viewers each poll once per second, the database receives 100,000 read queries per second for a single channel — each requiring a full index scan on the `channel_id + created_at` index. No relational database instance scales to this query rate on a single table partition.
+
+The correct architecture separates delivery from persistence entirely. Redis pub/sub handles real-time delivery with sub-millisecond fan-out latency — publishing one message to 100 Chat Server subscribers takes microseconds, regardless of viewer count. Cassandra handles durable persistence asynchronously — the write happens after the Redis publish, off the critical delivery path, and Cassandra's wide partition model handles time-series writes at millions per second with horizontal scaling. The database is never in the round-trip between a message being sent and appearing on viewer screens. It is only consulted when a viewer first loads the page and needs the last 100 messages as chat history — a use case that can tolerate 100–200ms latency and is not repeated per message.
+</Pitfall>
+
+<Curveball>
+**A popular esports tournament streams to 1M concurrent viewers — 10x your typical peak. The CDN starts dropping 5% of segment requests. How do you detect this, reroute traffic, and keep the stream alive?**
+
+Detection is the first challenge. Twitch's player SDK reports segment fetch errors back to an analytics endpoint with the CDN PoP hostname, segment URL, HTTP status code, and latency. At 1M viewers, even a 5% error rate generates 50,000 error events per second — a dashboards alert fires within 30 seconds of the CDN degradation beginning, long before manual detection is feasible.
+
+For rerouting, the HLS master manifest is the control plane. The manifest URL is served from Twitch's own infrastructure (not the CDN), so Twitch can update it with no CDN involvement. When CDN degradation is detected on a specific provider or set of PoPs, the manifest generation service switches to an alternate CDN (Twitch uses at least two CDN providers simultaneously for exactly this reason — Fastly and AWS CloudFront are both in the mix). New manifest requests serve URLs pointing to the healthy CDN's edge nodes. Existing player sessions continue hitting the degraded CDN until their next manifest poll (up to 2 seconds), then automatically pick up segments from the new CDN.
+
+For the 30-second window between detection and full rerouting, the player SDK is instructed to retry failed segment requests with exponential backoff against a fallback CDN URL (the player is given two CDN URL patterns at startup). This reduces visible stalling from 5% error rate to under 0.5% during the rerouting transition. Post-incident, CDN traffic weights are adjusted in the manifest generation config, and the CDN provider is engaged for a root cause analysis on their capacity failures.
+</Curveball>
+
+<Curveball>
+**Twitch wants to offer interactive streams where viewers vote on in-game decisions in real-time — up to 1M votes in 30 seconds. Design the voting pipeline without impacting the video streaming infrastructure.**
+
+The video streaming infrastructure must be completely isolated from voting traffic. The worst outcome is a 1M-votes-in-30-seconds spike taking down WebSocket servers that also handle chat, or consuming CDN capacity that would otherwise serve video segments. The voting system needs to be a separate service with its own resources.
+
+The voting pipeline: a viewer clicks a vote button in the Twitch UI (web or app), which sends a lightweight HTTPS POST to `api.twitch.tv/voting/{poll_id}/vote` with the viewer's choice. This API endpoint is horizontally autoscaled independently of chat or video infrastructure. The vote is written to a Redis counter using `INCR vote:{poll_id}:{choice}` — a single-digit microsecond operation that Redis can sustain at well over 1M operations per second per node. Redis clustering across 10 nodes easily handles 1M votes in 30 seconds (33,333 votes/s, well within a single Redis node's capacity).
+
+Vote counts are read from Redis every 200ms and published to the streamer's overlay via a separate WebSocket connection (not the chat WebSocket). The poll result is persisted to a database only at poll close — not on every vote. The final tally is a single Redis `GET vote:{poll_id}:{choice}` for each choice, written to MySQL once. This architecture absorbs the entire 1M-vote load in Redis without touching the video pipeline or chat system at any point.
+</Curveball>
+
+<Curveball>
+**A streamer accidentally leaks personal information (SSN and credit card details) on screen for 60 seconds before cutting the stream. How do you detect, remove the VOD segment, and notify the appropriate parties within 5 minutes?**
+
+This is an incident response problem as much as a systems problem. The 5-minute SLA requires automated detection — human review at this speed is not feasible.
+
+Detection: Twitch already processes live video frames for content moderation (detecting prohibited content like graphic violence and CSAM). The same frame-sampling pipeline — which samples frames at approximately 1 frame per second and runs them through classifier models — can include an OCR + PII detector stage. A model trained to recognize patterns matching SSN format (`XXX-XX-XXXX`) and credit card number patterns (16-digit strings with Luhn-valid checksums) fires a high-confidence alert within seconds of the text appearing on screen. At 1 FPS sampling, the PII is detected within 1–2 seconds of appearing.
+
+Removal: the detection event triggers an automated incident workflow. The affected time range is known from the frame timestamp. The system identifies which HLS segments cover that time range (segment sequence numbers from the timestamp ÷ segment duration). Those specific segments in S3 are immediately overwritten with a "content unavailable" replacement segment. The `.m3u8` VOD manifest is regenerated, pointing to replacement segments for the affected range. CDN cache for those specific segment URLs is purged via CDN tag-based purge API — this propagates to all edge PoPs within 5–30 seconds. Any viewer watching the VOD during this window will receive the replacement segment on their next segment fetch.
+
+Notification: the automated workflow opens a high-priority incident ticket, pages the on-call trust and safety team, sends an automated notification to the streamer ("we detected and removed potentially sensitive content from your stream"), and logs the incident for mandatory regulatory reporting if the leaked data falls under applicable data breach notification laws. The streamer is notified within 2 minutes; regulatory reporting begins within 4 hours per applicable law.
+</Curveball>
+
+## Further reading
+
+- **Twitch Engineering Blog: "Live Video Transmuxing/Transcoding: FFmpeg vs. Twitchtranscoder"** — Twitch's internal write-up on why they moved from stock FFmpeg to a purpose-built transcoder for real-time streaming workloads; covers GOP alignment, segment boundary enforcement, and GPU utilization strategies
+- **Apple LL-HLS specification** — developer.apple.com/streaming/ (Low-Latency HLS) — the authoritative specification for partial segments, `EXT-X-PRELOAD-HINT`, and HTTP/2 long-poll semantics; mandatory reading before implementing any LL-HLS pipeline
+- **RFC 5466 and Adobe RTMP specification** — the formal RTMP spec from Adobe Systems covers chunk stream multiplexing, handshake protocol, and message type definitions; the RFC documents formal extensions; essential for implementing a compliant ingest server
+- **Twitch Engineering Blog: "Scaling Live Video Ingestion"** — covers the geographic ingest cluster architecture, stream key routing, and how Twitch handles 100K simultaneous RTMP connections with graceful degradation during regional failures
+
+<RelatedQuestions items={[
+  { slug: "youtube-design", title: "Design YouTube", difficulty: "staff" },
+  { slug: "zoom-video-conferencing", title: "Design Zoom Video Conferencing", difficulty: "senior" },
+  { slug: "discord", title: "Design Discord", difficulty: "senior" },
+]} />

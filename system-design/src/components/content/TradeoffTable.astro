@@ -1,0 +1,83 @@
+---
+export interface Props {
+  title?: string;
+}
+const { title } = Astro.props;
+---
+
+<div class="tradeoff-table">
+  {title && <p class="tradeoff-table__title">{title}</p>}
+  <div class="tradeoff-table__body">
+    <slot />
+  </div>
+</div>
+
+<style>
+  .tradeoff-table {
+    margin: 2rem 0;
+    border: 1px solid var(--line-2);
+    border-radius: var(--r-md);
+    overflow: hidden;
+  }
+  .tradeoff-table__title {
+    margin: 0;
+    padding: 0.55rem 1.125rem;
+    font-family: 'Geist', system-ui, sans-serif;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    background: var(--bg-raised);
+    border-bottom: 1px solid var(--line-2);
+  }
+  .tradeoff-table__body {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  /* Style the markdown table rendered inside the slot */
+  .tradeoff-table__body :global(table) {
+    width: 100%;
+    min-width: 500px;
+    border-collapse: collapse;
+    font-size: 0.875rem;
+    line-height: 1.5;
+  }
+  .tradeoff-table__body :global(th) {
+    padding: 0.6rem 1rem;
+    text-align: left;
+    font-family: 'Geist', system-ui, sans-serif;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    background: var(--bg-card);
+    border-bottom: 1px solid var(--line-2);
+    white-space: nowrap;
+  }
+  .tradeoff-table__body :global(td) {
+    padding: 0.65rem 1rem;
+    color: var(--ink-2);
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  .tradeoff-table__body :global(tr:last-child td) {
+    border-bottom: none;
+  }
+  .tradeoff-table__body :global(tr:hover td) {
+    background: var(--bg-raised);
+  }
+  .tradeoff-table__body :global(code) {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.82em;
+    background: var(--bg-raised);
+    padding: 0.1em 0.35em;
+    border-radius: 4px;
+    color: var(--ink-2);
+  }
+  .tradeoff-table__body :global(strong) {
+    color: var(--ink);
+    font-weight: 600;
+  }
+</style>

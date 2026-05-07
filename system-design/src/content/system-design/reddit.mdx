@@ -1,0 +1,621 @@
+---
+title: "Design Reddit"
+slug: "reddit"
+category: "social"
+difficulty: "senior"
+estimatedReadMinutes: 22
+tags: ["voting", "feed", "hot-ranking", "comments", "subreddits", "cdn", "caching"]
+companyFlavors: ["Reddit", "Hacker News", "Digg", "ProductHunt"]
+prerequisites: ["twitter-timeline", "design-a-cache", "distributed-unique-id-generator"]
+relatedQuestions: ["twitter-timeline", "facebook-news-feed", "linkedin-connections"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design Reddit: the voting system, hot/top/new feed ranking, nested comment trees at depth, subreddit fan-out, and the caching strategy that keeps 1.5 B monthly visitors from melting the database."
+javaPackages:
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+  - "org.springframework.boot:spring-boot-starter-data-redis:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "org.springframework.data:spring-data-jpa:3.3.0"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="reddit" title="Design Reddit" />
+
+<Tldr>
+- **Posts and votes** stored in PostgreSQL sharded by `subreddit_id`; vote counts are denormalized into the `posts` table and mirrored as atomic Redis counters so hot-ranking never requires a `COUNT(*)` query against the votes table.
+- **Hot ranking formula** is Reddit's open-sourced time-decay algorithm: `score = log10(|ups - downs| + 1) + sign(ups - downs) × (created_at − epoch) / 45000` — every 45,000 seconds (12.5 hours) a post ages one log-unit, so viral volume and recency are traded off on the same curve.
+- **Comment trees** are stored as a flat table with `parent_comment_id` and a materialized path string; a recursive CTE retrieves the full tree from PostgreSQL, sorted by score within each parent; render depth is capped at 8 in the API layer.
+- **Feed generation** reads a Redis ZSET per subreddit per sort mode — post IDs sorted by hot score, created_at, or aggregate score — rebuilt every 5 minutes for hot/rising, appended in real-time for new; the front page merges top-N posts from each subscribed subreddit in the application layer.
+- **CDN and caching**: logged-out subreddit pages are served from CDN edge with a 5-minute TTL; post objects are cached in Redis Hashes with a 30-minute TTL shared across all users; per-user vote state is fetched separately in a batch query on feed load rather than invalidating the shared cache.
+</Tldr>
+
+## The scale of the problem
+
+Reddit describes itself as "the front page of the internet," and the numbers behind that claim make it one of the more instructive systems to design. The platform serves roughly 1.5 billion monthly visitors across more than 100,000 active subreddits, each with its own community, moderation rules, and content velocity. On any given weekday the platform ingests around 10 million new posts and an estimated 500 million individual vote events. That vote volume is not spread evenly: a breaking-news post on r/worldnews or a meme that catches on r/funny can accumulate 50,000 upvotes in the first hour alone. The central systems challenge is not storing those votes — they fit comfortably in a few hundred gigabytes of PostgreSQL — it is reflecting them in the ranked feed quickly enough that the front page feels alive without hammering the database with aggregation queries on every page load.
+
+The voting system is deceptively hard to get right. An upvote or downvote is a single-bit signal per user per post, but the derived quantity — the ranking score — must be computed from the full vote distribution and a time component that changes even if no new votes arrive. This means the "score" of a post is never truly at rest: a post submitted 48 hours ago is measurably less hot than the same post submitted 2 hours ago, even with identical vote counts. If you recompute scores on read, you pay an aggregation cost on every feed request. If you cache scores, you need a strategy to invalidate or refresh them as both votes and wall-clock time evolve. Reddit's real-world solution — denormalized counters in the database, atomic Redis counters for hot posts, and periodic ZSET rebuilds — is the reference architecture this article explains in detail.
+
+The third dimension of complexity is the comment tree. Reddit's nested comment system allows unlimited theoretical depth, but the data volume in popular threads is staggering: r/AMA threads routinely accumulate 30,000 comments, and the sorting requirement (top-scored comments at every level, not just top-level) means a naive ORDER BY on a flat table produces the wrong result. The storage and retrieval design for comment trees is its own interview deep dive, and the choices — flat table with recursive CTE, nested sets, adjacency list with materialized path — have meaningfully different performance profiles at Reddit's scale.
+
+## Clarifying questions
+
+Lock down these eight questions before drawing any boxes. Each answer closes off an entire class of design decisions.
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| What sort modes must be supported? | Hot, New, Top (all-time / year / month / week / day), Rising, Controversial | Each sort mode needs a different scoring strategy and a different caching approach; "Top" requires scanning historical votes, "Hot" needs time-decay, "Rising" needs velocity |
+| What is the maximum comment nesting depth? | Unlimited in storage, capped at depth 8 in the render/API layer | Unlimited storage rules out nested-set encoding (expensive inserts); depth cap avoids recursive CTE runaway on deeply-nested threads |
+| Is the vote system upvote-only or upvote + downvote? | Both — users can upvote, downvote, or retract a vote | Means every vote event might be an insert, an update (direction flip), or a delete (retraction); idempotency and atomicity are harder than upvote-only |
+| Are awards / Reddit coins in scope? | Out of scope — treat as a separate premium feature | Awards have their own transaction ledger and don't affect ranking; excluding them simplifies the vote and post data models significantly |
+| Is cross-posting in scope? | Yes — a post can appear in multiple subreddits with independent vote counts | Each cross-post is a separate `posts` row linked by `original_post_id`; vote counts are per-post-row, not aggregated across cross-posts |
+| Should the front page aggregate multiple subreddits (multi-reddit)? | Yes — logged-in users see a merged feed from all subscribed subreddits | Makes the front page feed non-cacheable at the CDN layer; requires per-user merge in the application layer |
+| Is NSFW content gating in scope? | Yes — NSFW posts must be hidden unless the user has explicitly enabled NSFW content in their preferences | Adds a filter predicate to every feed query; affects CDN caching (NSFW content cannot be served from shared CDN edge cache) |
+| Is search in scope? | Out of scope — assume Elasticsearch or OpenSearch handles full-text post/comment search as a separate service | Search indexing is a separate write path from the ranking feed; excluding it keeps the design focused on the core feed and vote systems |
+
+## Functional requirements
+
+- Users can submit link posts or self-text posts to a subreddit; posts are assigned a snowflake ID and immediately appear on the subreddit's "new" feed.
+- Logged-in users can upvote or downvote any post or comment exactly once; they can retract or flip their vote at any time; the net vote count updates within 5 minutes on the hot feed.
+- Users can comment on posts or reply to existing comments at arbitrary nesting depth; top-level comments and nested replies are independently sorted by score within their parent.
+- Users can subscribe and unsubscribe from subreddits; the front page shows a merged, ranked feed from all subscribed subreddits.
+- Subreddit feeds are available in at minimum four sort modes: Hot (time-decay score), New (chronological), Top (all-time or scoped to a time window), and Rising (vote velocity).
+- Logged-out users can browse all public subreddits and post pages without authentication, with slightly stale data acceptable (5-minute cache TTL).
+
+## Non-functional requirements
+
+- **Scale**: 1.5 billion monthly visitors; 50 million DAU; peak feed reads at approximately 580,000 requests per second.
+- **Vote processing latency**: p99 < 100ms from vote submission to acknowledgment; vote reflected in hot feed within 5 minutes, in the "new" feed within 30 seconds.
+- **Feed read latency**: p99 < 200ms end-to-end for a subreddit hot feed (Redis cache hit path); p99 < 1 second for cache miss (cold rebuild from PostgreSQL).
+- **Comment read latency**: p99 < 300ms for a comment thread with up to 500 comments; p99 < 1 second for threads with 10,000+ comments (paginated).
+- **Availability**: 99.9% for the read path (feed, posts, comments); voting can tolerate 99.5% availability — losing a vote for a few minutes during a partial outage is more acceptable than a full read outage.
+- **Consistency**: eventual consistency is acceptable for vote counts and hot scores; a newly submitted post must appear on the submitter's "new" feed within 5 seconds (read-after-write for the author); cross-region replication lag < 30 seconds.
+- **Durability**: posts and votes must survive any single node or AZ failure; Redis is used only as a write-through cache and is re-buildable from PostgreSQL at any time.
+
+<Capacity title="Reddit Capacity Estimates">
+**Post submission rate:**
+
+$$\frac{10{,}000{,}000 \text{ posts/day}}{86{,}400 \text{ s/day}} \approx 116 \text{ posts/s sustained}$$
+
+With a 10× peak spike factor, the submission path must handle $\approx 1{,}160$ posts/s at peak without queue buildup.
+
+**Vote throughput:**
+
+$$\frac{500{,}000{,}000 \text{ votes/day}}{86{,}400 \text{ s/day}} \approx 5{,}787 \text{ votes/s sustained}$$
+
+Peak vote rate on viral posts reaches $\approx 17{,}000$ votes/s. Each vote is a Redis `INCR`/`DECR` (sub-millisecond) followed by an async DB upsert — the Redis layer absorbs the spike.
+
+**Comment read throughput:**
+
+$$50{,}000{,}000 \text{ DAU} \times 10 \text{ sessions/day} \times 50 \text{ comments/session} = 25 \times 10^9 \text{ comment reads/day}$$
+
+$$\frac{25 \times 10^9}{86{,}400} \approx 289{,}000 \text{ comment reads/s}$$
+
+Comment threads for popular posts are cached in Redis as serialized JSON with a 60-second TTL; PostgreSQL only serves cache misses.
+
+**Vote counter cache size:**
+
+$$10{,}000{,}000 \text{ active posts} \times 3 \text{ counters (up, down, score)} \times 8 \text{ B} = 240 \text{ MB}$$
+
+This is trivial — a single Redis node with 4 GB RAM holds all active vote counters with $16\times$ headroom.
+
+**Subreddit feed cache size:**
+
+$$100{,}000 \text{ subreddits} \times 3 \text{ sort modes} \times 100 \text{ post IDs} \times 8 \text{ B} = 240 \text{ MB}$$
+
+Again trivial. Feed ZSETs for all subreddits fit on a single Redis node; in practice, a Redis cluster is used for availability, not capacity.
+</Capacity>
+
+## API design
+
+The API surface maps cleanly onto the five core operations: read a subreddit feed, read a personalized front page, submit a post, vote on a post or comment, and read or write a comment thread.
+
+**Feed and post APIs:**
+
+```
+GET  /api/v1/r/{subreddit}/posts
+     ?sort={hot|new|top|rising|controversial}
+     &t={hour|day|week|month|year|all}   (only for sort=top)
+     &cursor={opaque_cursor}
+     &limit={25}
+
+GET  /api/v1/front
+     ?sort={hot|best}
+     &cursor={opaque_cursor}
+
+POST /api/v1/r/{subreddit}/submit
+     Body: { "kind": "link"|"self", "title": "...", "url": "...", "text": "..." }
+
+POST /api/v1/posts/{post_id}/vote
+     Body: { "direction": 1 | -1 | 0 }
+```
+
+**Comment APIs:**
+
+```
+GET  /api/v1/posts/{post_id}/comments
+     ?sort={top|new|controversial}
+     &depth={1..8}
+     &cursor={opaque_cursor}
+
+POST /api/v1/posts/{post_id}/comments
+     Body: { "text": "...", "parent_comment_id": "optional" }
+
+POST /api/v1/comments/{comment_id}/vote
+     Body: { "direction": 1 | -1 | 0 }
+```
+
+The cursor for the hot and top feeds is an opaque base64-encoded struct containing the last-seen post's `hot_score` and `post_id` (for tie-breaking). For the new feed the cursor is simply the `created_at` timestamp. This avoids the OFFSET anti-pattern — scanning N rows on every paginated request — by instead using a WHERE clause like `WHERE hot_score < :cursor_score OR (hot_score = :cursor_score AND post_id < :cursor_id)`.
+
+The `direction: 0` case on the vote endpoint represents "remove vote" (un-voting). The API accepts all three values uniformly and lets the VoteService handle the state transition from whatever the user's current vote direction is.
+
+## Data model
+
+**PostgreSQL — posts table (sharded by subreddit_id):**
+
+```sql
+CREATE TABLE posts (
+    post_id       BIGINT PRIMARY KEY,
+    subreddit_id  BIGINT NOT NULL,
+    author_id     BIGINT NOT NULL,
+    title         VARCHAR(300) NOT NULL,
+    url           TEXT,
+    text          TEXT,
+    upvotes       INT NOT NULL DEFAULT 0,
+    downvotes     INT NOT NULL DEFAULT 0,
+    score         INT GENERATED ALWAYS AS (upvotes - downvotes) STORED,
+    hot_score     DOUBLE PRECISION NOT NULL DEFAULT 0,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at    TIMESTAMPTZ,
+    is_nsfw       BOOLEAN NOT NULL DEFAULT FALSE,
+    original_post_id BIGINT
+);
+
+CREATE INDEX idx_posts_subreddit_hot
+    ON posts (subreddit_id, hot_score DESC)
+    WHERE deleted_at IS NULL;
+
+CREATE INDEX idx_posts_subreddit_new
+    ON posts (subreddit_id, created_at DESC)
+    WHERE deleted_at IS NULL;
+```
+
+**PostgreSQL — comments table (sharded by post_id):**
+
+```sql
+CREATE TABLE comments (
+    comment_id        BIGINT PRIMARY KEY,
+    post_id           BIGINT NOT NULL,
+    parent_comment_id BIGINT,
+    author_id         BIGINT NOT NULL,
+    path              TEXT NOT NULL,
+    depth             SMALLINT NOT NULL DEFAULT 0,
+    text              TEXT NOT NULL,
+    upvotes           INT NOT NULL DEFAULT 0,
+    downvotes         INT NOT NULL DEFAULT 0,
+    score             INT GENERATED ALWAYS AS (upvotes - downvotes) STORED,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at        TIMESTAMPTZ
+);
+
+CREATE INDEX idx_comments_post_path
+    ON comments (post_id, path);
+```
+
+The `path` column stores a materialized path like `"00001/00003/00009"` — each segment is the comment_id zero-padded to 5 characters. An ORDER BY path groups all comments by tree structure; prefix-search (`path LIKE '00001/%'`) fetches an entire subtree without recursion.
+
+**PostgreSQL — votes table (unsharded, hot shard by user_id):**
+
+```sql
+CREATE TABLE votes (
+    user_id     BIGINT NOT NULL,
+    target_id   BIGINT NOT NULL,
+    target_type VARCHAR(10) NOT NULL CHECK (target_type IN ('post', 'comment')),
+    direction   SMALLINT NOT NULL CHECK (direction IN (-1, 0, 1)),
+    voted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, target_id, target_type)
+);
+```
+
+The unique primary key on `(user_id, target_id, target_type)` makes upserts idempotent at the database level: `INSERT ... ON CONFLICT (user_id, target_id, target_type) DO UPDATE SET direction = EXCLUDED.direction, voted_at = now()`.
+
+**Redis — subreddit feed ZSETs:**
+
+```
+feed:{subreddit_id}:hot        ZSET  member=post_id, score=hot_score
+feed:{subreddit_id}:new        ZSET  member=post_id, score=created_at_unix
+feed:{subreddit_id}:top:day    ZSET  member=post_id, score=net_score
+feed:{subreddit_id}:top:week   ZSET  member=post_id, score=net_score
+```
+
+**Redis — vote counters (per active post):**
+
+```
+votes:up:{post_id}    STRING (INCR/DECR)
+votes:down:{post_id}  STRING (INCR/DECR)
+```
+
+**Redis — user subscriptions:**
+
+```
+subs:{user_id}    SET  members=subreddit_ids
+```
+
+Synced from PostgreSQL on login and on subscribe/unsubscribe events.
+
+**Redis — post detail cache:**
+
+```
+post:{post_id}    HASH  fields: title, author, subreddit, upvotes, downvotes, hot_score, created_at, ...
+```
+
+TTL: 30 minutes. Shared across all users — vote state is not included here.
+
+## Architecture flows
+
+<Mermaid diagram={`flowchart TD
+    subgraph VoteFlow["Vote Processing Flow"]
+        U1[User] -->|POST /posts/:id/vote| VS[Vote Service]
+        VS -->|1 upsert direction| VDB[(votes table\nPostgreSQL)]
+        VS -->|2 INCR/DECR atomic| RC[(Redis\nCounters)]
+        RC -->|pipeline: votes:up / votes:down| RC
+        VS -->|3 publish| KF[Kafka\nvote-submitted]
+        KF -->|consume| HRW[HotRankWorker]
+        HRW -->|recompute hot_score| HRW
+        HRW -->|ZADD feed:sub:hot| RZ[(Redis ZSET\nfeed cache)]
+        HRW -->|UPDATE posts.hot_score async| PDB[(posts table\nPostgreSQL)]
+    end
+
+    subgraph FeedFlow["Feed Read Flow"]
+        U2[User] -->|GET /r/:sub/posts?sort=hot| FeedAPI[Feed API]
+        FeedAPI -->|ZREVRANGE 0 24| RZ2[(Redis ZSET\nfeed:sub:hot)]
+        RZ2 -->|post_id list| FeedAPI
+        FeedAPI -->|HGETALL post:id for each| PC[(Redis\nPost Cache)]
+        PC -->|cache miss| FeedAPI
+        FeedAPI -->|SELECT * FROM posts WHERE post_id IN| PDB2[(posts table\nPostgreSQL)]
+        FeedAPI -->|batch fetch vote state for user| VDB2[(votes table\nPostgreSQL)]
+        FeedAPI -->|response: posts + user vote state| U2
+    end`} />
+
+The two flows are deliberately decoupled. A vote event never blocks a feed read: the vote is accepted by VoteService, atomically reflected in Redis counters (sub-millisecond), and propagated to the feed ZSET asynchronously by HotRankWorker. The feed read path only ever touches Redis ZSETs and Redis Post Cache on the hot path; PostgreSQL is only consulted on cache misses.
+
+## Deep dive: the hot ranking formula
+
+Reddit open-sourced its ranking algorithm in the original Python monolith. The hot score function is:
+
+```python
+import math
+
+EPOCH = 1134028003
+
+def hot(ups: int, downs: int, created_at_unix: float) -> float:
+    score = ups - downs
+    order = math.log10(max(abs(score), 1))
+    sign = 1 if score > 0 else (-1 if score < 0 else 0)
+    seconds = created_at_unix - EPOCH
+    return round(sign * order + seconds / 45000, 7)
+```
+
+The epoch `1134028003` is December 8, 2005 — the day Reddit launched voting. Every post score is measured relative to that anchor.
+
+The key insight is in the relationship between the logarithmic vote term and the linear time term. Each 45,000-second window (12.5 hours) the time term increases by 1.0. The logarithmic vote term increases by 1.0 for every order-of-magnitude increase in net votes. This means:
+
+- A post with **10 net votes** submitted **now** has: `log10(10) + seconds_now / 45000 = 1.0 + T`
+- A post with **100 net votes** submitted **12.5 hours ago** has: `log10(100) + (seconds_now - 45000) / 45000 = 2.0 + T - 1.0 = 1.0 + T`
+
+They rank identically. To outrank a post that is 12.5 hours older, you need 10× more net votes. To outrank one that is 25 hours older, you need 100× more votes. This curve naturally surfaces fresh content while still letting genuinely viral posts stay visible for longer.
+
+The `sign` component handles negative net scores (more downvotes than upvotes). A post with -100 net votes gets `sign = -1`, making its hot score negative regardless of age. Controversial posts — high upvotes and high downvotes — are handled by a separate "controversial" ranking, which uses the Wilson score lower bound.
+
+**The Wilson score for comment ranking** is the lower bound of the 95% confidence interval for the true upvote rate, given the observed votes:
+
+```python
+import math
+
+def wilson_lower_bound(ups: int, downs: int, z: float = 1.96) -> float:
+    n = ups + downs
+    if n == 0:
+        return 0.0
+    p_hat = ups / n
+    return (
+        p_hat + z*z / (2*n) - z * math.sqrt((p_hat*(1-p_hat) + z*z/(4*n)) / n)
+    ) / (1 + z*z/n)
+```
+
+The Wilson score handles the low-vote problem that naive upvote-rate ranking fails: a comment with 1 up and 0 down has a 100% upvote rate, but the Wilson lower bound at 95% confidence is only 0.205 — rightly below a comment with 100 up and 10 down (Wilson lower bound ≈ 0.836). Comments within the same parent are ranked by Wilson score, not by raw upvotes.
+
+**Hot score recomputation strategy:** HotRankWorker consumes from the `vote-submitted` Kafka topic. For each vote event it fetches the current Redis counters for that post, computes the new hot score, and issues a `ZADD feed:{subreddit_id}:hot {new_score} {post_id}`. It also issues a low-priority asynchronous `UPDATE posts SET hot_score = ?, upvotes = ?, downvotes = ? WHERE post_id = ?` to PostgreSQL so that the database remains consistent if Redis is flushed or rebuilt. The ZSET is the source of truth for the read path; PostgreSQL is the source of truth for recovery.
+
+A separate `HotScoreDecayJob` runs every 15 minutes and recomputes the hot scores for all posts in the ZSET that were submitted in the last 48 hours, using only wall-clock time (no new votes). This ensures that posts age correctly even during low-traffic periods when no vote events are flowing through Kafka. Posts older than 48 hours are evicted from the hot ZSET — they are effectively dead to the hot algorithm.
+
+## Deep dive: voting with race condition prevention
+
+The naive `UPDATE posts SET upvotes = upvotes + 1 WHERE post_id = ?` approach works at low scale but fails catastrophically at Reddit's vote rates. A post receiving 10,000 votes per second creates lock contention on that row in PostgreSQL — each transaction acquires a row lock, the queue depth grows, and latency collapses.
+
+The solution is a two-layer architecture:
+
+**Layer 1 — Redis atomic counters (synchronous):** Every vote immediately calls `INCR votes:up:{post_id}` or `INCR votes:down:{post_id}` via a Redis pipeline. Redis single-threaded command processing makes these atomic without locking. At 17,000 votes/second for a hot post, Redis handles this in under 5 ms latency.
+
+**Layer 2 — PostgreSQL batch write (asynchronous):** A background worker reads the Redis counters every 10 seconds and issues a single `UPDATE posts SET upvotes = ?, downvotes = ? WHERE post_id = ?` per dirty post. This collapses 100,000 vote events into a single DB write per 10-second window per post.
+
+**Handling vote direction changes atomically:** When a user changes from upvote to downvote, two counters must move atomically: `upvotes - 1` and `downvotes + 1`. In Redis, a Lua script ensures atomicity:
+
+```lua
+local prev = redis.call('GET', KEYS[1])
+if prev == ARGV[1] then
+  return 0
+end
+redis.call('INCRBY', KEYS[2], -1)
+redis.call('INCRBY', KEYS[3], 1)
+redis.call('SET', KEYS[1], ARGV[2])
+return 1
+```
+
+Where KEYS[1] is the user's current vote direction cache, KEYS[2] is `votes:up:{post_id}`, KEYS[3] is `votes:down:{post_id}`, ARGV[1] is the expected old direction, ARGV[2] is the new direction. The Lua script executes atomically on the Redis server — no MULTI/EXEC overhead, no optimistic retry loop.
+
+**Idempotency:** The votes table primary key `(user_id, target_id, target_type)` ensures database-level idempotency. The application additionally stores a `voted_at` timestamp so that duplicate Kafka retries can be detected and discarded: if a VoteEvent arrives with `voted_at < current voted_at` for the same `(user_id, target_id)`, it is a stale retry and is dropped.
+
+## Deep dive: comment trees — storage and retrieval
+
+Reddit's comment trees are among the most demanding read workloads on the platform. A popular r/AMA thread can accumulate 30,000 comments in a few hours, and the requirement is not just to retrieve them but to sort them correctly at every level of nesting: within each parent node, children are ordered by their individual score, not by insertion order.
+
+Three storage strategies are relevant:
+
+**Option 1 — Adjacency list with recursive CTE:** Store only `parent_comment_id`. Retrieve with:
+
+```sql
+WITH RECURSIVE comment_tree AS (
+    SELECT comment_id, parent_comment_id, path, depth, text, score, author_id, created_at
+    FROM comments
+    WHERE post_id = :post_id AND parent_comment_id IS NULL
+    UNION ALL
+    SELECT c.comment_id, c.parent_comment_id, c.path, c.depth, c.text, c.score, c.author_id, c.created_at
+    FROM comments c
+    JOIN comment_tree t ON c.parent_comment_id = t.comment_id
+    WHERE c.depth <= 8
+)
+SELECT * FROM comment_tree ORDER BY path;
+```
+
+PostgreSQL handles this well for threads under ~5,000 comments. Above that, the recursive scan becomes expensive.
+
+**Option 2 — Materialized path (Reddit's actual approach):** Store a `path` column like `"00001/00003/00009"`. Retrieval is a simple range scan:
+
+```sql
+SELECT * FROM comments
+WHERE post_id = :post_id
+  AND path LIKE :parent_path || '/%'
+  AND depth <= 8
+ORDER BY path, score DESC;
+```
+
+The `ORDER BY path` groups comments into tree order. The `score DESC` within each path prefix sorts siblings. This is O(N log N) with a B-tree index on `(post_id, path)` and requires no recursion. Inserting a new comment requires computing its path as `parent.path + '/' + zero_padded(comment_id)` — a single read of the parent row followed by an insert.
+
+**Option 3 — Nested sets (left/right values):** Enables O(1) subtree queries but O(N) inserts (every sibling's right value must be updated). Completely impractical for active comment threads.
+
+**Render cap and "load more":** The API returns at most 200 top-level comments per request, with a `more_comments` token for pagination. Within each top-level comment, up to 10 nested replies are returned; deeper nesting is collapsed with a `load more replies` token. This bounds the response payload regardless of actual thread depth, and allows the client to lazy-load sub-trees on user interaction.
+
+**Comment cache:** For posts with fewer than 1,000 comments, the full serialized comment tree is cached in Redis as a single JSON blob with a 60-second TTL. For larger threads, only the top 200 comments are cached; deeper pages are served directly from PostgreSQL (they are less latency-sensitive — users have to scroll significantly to reach them).
+
+## Deep dive: subreddit feed caching
+
+Each subreddit feed is a Redis ZSET maintained per sort mode:
+
+**Hot feed ZSET:** Maintained by HotRankWorker in near-real-time for vote events, and refreshed in bulk every 5 minutes by HotScoreDecayJob. The ZSET holds at most 1,000 post IDs — the API only ever needs the top-N for any reasonable pagination depth. Posts that age out of the top 1,000 are evicted via `ZREMRANGEBYRANK feed:{id}:hot 0 -1001` after each bulk rebuild.
+
+**New feed ZSET:** Appended in real-time on post submission. `ZADD feed:{subreddit_id}:new {created_at_unix} {post_id}`. No periodic rebuild needed. Trimmed to 10,000 entries to bound memory: `ZREMRANGEBYRANK feed:{id}:new 0 -10001` after each append.
+
+**Top feed (daily/weekly/monthly):** Built by a scheduled job that runs PostgreSQL aggregations off-hours. The daily top is rebuilt every hour, the weekly every 6 hours, the monthly every 24 hours. These are low-traffic compared to hot and new.
+
+**Rising feed:** Uses a velocity metric — votes per hour in the last 2 hours. A separate `RisingScoreJob` runs every 2 minutes, computes velocity from Redis counter deltas (stored as a sliding window of 1-minute snapshots), and updates `feed:{subreddit_id}:rising`. Posts that were submitted more than 24 hours ago are excluded from rising.
+
+**Front page (multi-subreddit merge):** The user's front page cannot be shared across users because subscription sets differ. The application fetches the user's subscribed subreddit list from `subs:{user_id}` Redis SET, then issues parallel `ZREVRANGE feed:{subreddit_id}:hot 0 24` calls for the top 25 subreddits by subscriber count (or all subreddits if fewer), collects the post ID lists, deduplicates, fetches post details from the post cache, re-sorts by hot_score, and returns the merged top-N. The merge runs in-process — it is a CPU-cheap operation on at most a few hundred post IDs.
+
+**CDN and logged-out users:** Any public subreddit page (logged-out) is served from CDN with a `Cache-Control: public, max-age=300` header (5-minute TTL). The cache key is `{subreddit_slug}/{sort_mode}/{page}`. NSFW subreddits use a `private` cache directive and are never served from shared CDN edge. Post content pages for individual posts use a longer TTL — `max-age=1800` (30 minutes) — since individual post content changes slowly after the initial burst of activity.
+
+## Java integration
+
+### Part A — VoteService.java
+
+```java
+package com.reddit.vote;
+
+import io.lettuce.core.api.sync.RedisCommands;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class VoteService {
+
+    private final RedisCommands<String, String> redis;
+    private final VoteRepository voteRepository;
+    private final KafkaProducer<String, VoteEvent> producer;
+
+    public VoteService(RedisCommands<String, String> redis,
+                       VoteRepository voteRepository,
+                       KafkaProducer<String, VoteEvent> producer) {
+        this.redis = redis;
+        this.voteRepository = voteRepository;
+        this.producer = producer;
+    }
+
+    @Transactional
+    public VoteResult castVote(long userId, long targetId, String targetType, int newDirection) {
+        Vote existing = voteRepository
+            .findById(new VoteId(userId, targetId, targetType))
+            .orElse(new Vote(userId, targetId, targetType, 0));
+        int prevDirection = existing.getDirection();
+
+        int upDelta   = directionDelta(prevDirection, newDirection, 1);
+        int downDelta = directionDelta(prevDirection, newDirection, -1);
+
+        String upKey   = "votes:up:"   + targetId;
+        String downKey = "votes:down:" + targetId;
+
+        redis.incrby(upKey,   upDelta);
+        redis.incrby(downKey, downDelta);
+
+        existing.setDirection(newDirection);
+        voteRepository.save(existing);
+
+        long newUpvotes   = Long.parseLong(redis.get(upKey));
+        long newDownvotes = Long.parseLong(redis.get(downKey));
+
+        VoteEvent event = new VoteEvent(targetId, targetType, newUpvotes, newDownvotes, System.currentTimeMillis());
+        producer.send(new ProducerRecord<>("vote-submitted", String.valueOf(targetId), event));
+
+        return new VoteResult(newUpvotes, newDownvotes, newDirection);
+    }
+
+    private int directionDelta(int prev, int next, int side) {
+        int prevContrib = (prev == side) ? 1 : 0;
+        int nextContrib = (next == side) ? 1 : 0;
+        return nextContrib - prevContrib;
+    }
+
+    public record VoteResult(long upvotes, long downvotes, int userVoteDirection) {}
+    public record VoteEvent(long targetId, String targetType, long upvotes, long downvotes, long timestamp) {}
+}
+```
+
+### Part B — PostController.java
+
+```java
+package com.reddit.post;
+
+import io.lettuce.core.api.sync.RedisCommands;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/v1")
+public class PostController {
+
+    private final RedisCommands<String, String> redis;
+    private final PostRepository postRepository;
+    private final CommentRepository commentRepository;
+    private final VoteService voteService;
+    private final SnowflakeIdGenerator idGenerator;
+
+    public PostController(RedisCommands<String, String> redis,
+                          PostRepository postRepository,
+                          CommentRepository commentRepository,
+                          VoteService voteService,
+                          SnowflakeIdGenerator idGenerator) {
+        this.redis = redis;
+        this.postRepository = postRepository;
+        this.commentRepository = commentRepository;
+        this.voteService = voteService;
+        this.idGenerator = idGenerator;
+    }
+
+    @GetMapping("/r/{subreddit}/posts")
+    public ResponseEntity<PostListResponse> getSubredditFeed(
+            @PathVariable String subreddit,
+            @RequestParam(defaultValue = "hot") String sort,
+            @RequestParam(required = false) String cursor) {
+
+        long subredditId = postRepository.findSubredditId(subreddit);
+        String zsetKey = "feed:" + subredditId + ":" + sort;
+        List<String> postIds = redis.zrevrange(zsetKey, 0, 24);
+
+        List<Post> posts = postIds.isEmpty()
+            ? postRepository.findBySubredditOrderByHotScoreDesc(subredditId)
+            : postRepository.findAllById(postIds.stream().map(Long::parseLong).toList());
+
+        String nextCursor = posts.isEmpty() ? null : String.valueOf(posts.get(posts.size() - 1).getPostId());
+        return ResponseEntity.ok(new PostListResponse(posts, nextCursor));
+    }
+
+    @PostMapping("/r/{subreddit}/submit")
+    public ResponseEntity<Post> submitPost(@PathVariable String subreddit, @RequestBody SubmitRequest req) {
+        long postId = idGenerator.nextId();
+        long subredditId = postRepository.findSubredditId(subreddit);
+        Post post = postRepository.save(new Post(postId, subredditId, req.title(), req.url(), req.text()));
+        redis.zadd("feed:" + subredditId + ":new", System.currentTimeMillis() / 1000.0, String.valueOf(postId));
+        return ResponseEntity.ok(post);
+    }
+
+    @PostMapping("/posts/{postId}/vote")
+    public ResponseEntity<VoteService.VoteResult> voteOnPost(
+            @PathVariable long postId,
+            @RequestBody Map<String, Integer> body,
+            @RequestAttribute long userId) {
+        return ResponseEntity.ok(voteService.castVote(userId, postId, "post", body.get("direction")));
+    }
+
+    @GetMapping("/posts/{postId}/comments")
+    public ResponseEntity<List<Comment>> getComments(
+            @PathVariable long postId,
+            @RequestParam(defaultValue = "top") String sort,
+            @RequestParam(defaultValue = "8") int depth) {
+        List<Comment> flat = commentRepository.findByPostIdAndDepthLessThanEqual(postId, Math.min(depth, 8));
+        flat.sort((a, b) -> a.getPath().compareTo(b.getPath()));
+        return ResponseEntity.ok(flat);
+    }
+
+    record SubmitRequest(String title, String url, String text) {}
+    record PostListResponse(List<Post> posts, String nextCursor) {}
+}
+```
+
+<TradeoffTable
+  columns={["Approach", "Vote Consistency", "Ranking Freshness", "DB Load", "Complexity"]}
+  rows={[
+    ["Synchronous DB vote + COUNT(*) for rank", "Strong — DB is always accurate", "Stale on heavy read — aggregation is slow", "Critical — COUNT(*) at query time with no index kills the DB above 1M votes", "Low — simple SELECT/UPDATE, no external dependencies"],
+    ["Redis-only vote counter + periodic DB sync", "Eventual — DB lags by up to 10s", "Near-real-time — Redis counters reflect within milliseconds", "Low — only one batch write per dirty post per 10s window, regardless of vote rate", "Medium — requires Redis persistence strategy and a sync worker; Redis is not the source of truth"],
+    ["Event-driven (Kafka vote events + stream processor)", "Eventual — stream lag adds seconds to minutes", "Depends on stream lag — low under normal load, degrades under backpressure", "Low — stream processor batches DB writes; DB is only updated on batch commit", "High — Kafka cluster, stream processing job (Flink/Spark), exactly-once semantics, consumer group management"],
+    ["Reddit's actual approach (Redis atomic counters + async DB + ZSET feed)", "Eventual for counters (10s sync), strong for vote deduplication (DB primary key check)", "Near-real-time — hot ZSET updated by HotRankWorker on each vote event; decay job runs every 15 min", "Low for votes (batch sync), medium for decay job (scheduled bulk UPDATE)", "High — multiple moving parts: Redis counters, Kafka, HotRankWorker, HotScoreDecayJob, ZSET maintenance"],
+  ]}
+/>
+
+<Pitfall>
+**Using COUNT(*) at query time to compute ranking scores.** A feed query like `SELECT post_id, COUNT(*) as score FROM votes WHERE target_type = 'post' GROUP BY post_id ORDER BY score DESC` does full-table work on the votes table — which at Reddit's scale contains billions of rows — on every feed page load. Even with partial indexes the aggregation cannot serve 580K feed reads/second without an extremely large and expensive database cluster. The fix is to denormalize: maintain `upvotes` and `downvotes` columns on the `posts` table (updated asynchronously) and keep live atomic counters in Redis for hot posts. Ranking reads only those pre-computed values, never the raw votes table.
+</Pitfall>
+
+<Pitfall>
+**Unlimited recursive CTE depth on comment trees.** A recursive CTE without a depth termination condition (`WHERE c.depth <= 8`) will traverse every level of a deeply-nested thread. In an adversarial scenario — a bot tree with 50 levels of nesting — PostgreSQL allocates memory for every recursion step, potentially causing an OOM on the database node. Enforce a `depth` column in the comments table, populated at insert time as `parent.depth + 1`, and always include `WHERE depth <= 10` in both the write path (reject comments beyond depth 10) and the read path (cap recursive CTEs at depth 10, render cap at depth 8). Defense in depth: enforce the depth limit at the API layer, the application layer, and the database constraint.
+</Pitfall>
+
+<Curveball>
+**"r/wallstreetbets gets a post about a hot stock — it goes from 0 to 50,000 upvotes in 10 minutes. How does your hot ranking system reflect this in real-time without database meltdown?"**
+
+The Redis atomic counter layer absorbs the spike. Each of the 50,000 votes issues an `INCR votes:up:{post_id}` against Redis — at ~200K ops/second throughput per Redis node, 50K votes in 10 minutes (83 votes/second) is trivial. HotRankWorker consumes the `vote-submitted` Kafka topic events and recomputes the hot score after each batch of events (de-duped within a 1-second window using a Kafka consumer group with manual offset commits). The ZSET `ZADD feed:{subreddit_id}:hot` is updated on each recomputation. PostgreSQL only sees one batch `UPDATE posts SET upvotes = ?, hot_score = ?` per 10-second flush cycle — a single row write regardless of vote volume. The front page ZSET for all subscribed users is populated on read from the subreddit ZSET, so the burst is reflected on the front page within the next feed refresh (at most 5 minutes, typically under 30 seconds for cached feeds with short TTL). To defend against Redis overload on a true viral event, the counter keys for ultra-hot posts can be spread across multiple Redis nodes using a slot-per-post sharding scheme, with the HotRankWorker summing across shards before computing the hot score.
+</Curveball>
+
+<Curveball>
+**"A coordinated vote-manipulation campaign upvotes a post 100,000 times from bot accounts. Your trust and safety team flags it after 2 hours. How do you retroactively remove those votes and recalculate the ranking without re-scanning the full votes table?"**
+
+The bot `user_id` list is known after the trust and safety investigation. The retroactive removal process is: (1) Mark flagged accounts as `is_bot = true` in the users table — this is a metadata-only update, no vote data changes yet. (2) Issue a `DELETE FROM votes WHERE user_id IN (:bot_ids) AND target_id = :post_id` — the votes table has an index on `(target_id, user_id)` so this is a bounded index scan, not a full table scan. (3) Count removed votes: `SELECT COUNT(*) FROM votes WHERE user_id IN (:bot_ids) AND target_id = :post_id AND direction = 1` (you can also derive this from the deleted row count). (4) Atomically `DECRBY votes:up:{post_id} {removed_count}` in Redis. (5) Publish a `vote-recount` Kafka event for the post, triggering HotRankWorker to recompute the hot score and update the ZSET. The key insight is that because vote counts are denormalized and the votes table has a unique primary key per `(user_id, target_id)`, the retroactive removal is a targeted delete — not a full re-aggregation. The Redis counter adjustment is a single atomic `DECRBY` and the ZSET update follows automatically from HotRankWorker. For future prevention, a shadow-score system can track the "raw score" (all votes) versus the "trust-adjusted score" (only non-flagged votes), so the trust-adjusted score can be computed without deleting rows from the votes table at all.
+</Curveball>
+
+<Curveball>
+**"Reddit wants to add Karma Decay — posts older than 6 months can no longer receive upvotes, but historical counts are preserved. How does this change your vote schema and ranking pipeline?"**
+
+Schema change: Add a `voting_closed_at TIMESTAMPTZ` column to the `posts` table, populated as `created_at + INTERVAL '6 months'` at insert time (or via a backfill migration for existing posts). The vote API endpoint checks `SELECT voting_closed_at FROM posts WHERE post_id = ?` and returns HTTP 409 Conflict if `NOW() > voting_closed_at`. This check can be cached in the post detail Redis Hash (the `voting_closed_at` field) to avoid a DB hit on every vote attempt — the vast majority of posts over 6 months old will have `voting_closed_at` in the past, so the cache hit rate is high and the value is immutable once in the past. Ranking pipeline: Karma Decay does not change the hot ranking algorithm — posts older than 48 hours are already evicted from the hot ZSET regardless. The `top:all` ZSET is affected: historical scores are frozen at the point `voting_closed_at` is reached. The HotScoreDecayJob already skips posts older than 48 hours, so no change there. The main work is the vote gate at the API layer and a one-time backfill to set `voting_closed_at` on all existing posts. For the backfill: run `UPDATE posts SET voting_closed_at = created_at + INTERVAL '6 months' WHERE voting_closed_at IS NULL` in batches of 10,000 rows during off-peak hours to avoid table lock contention.
+</Curveball>
+
+## Further reading
+
+- **Reddit source code (Python)**: github.com/reddit-archive/reddit — the original Python monolith where the hot ranking and Wilson score implementations live; the `r2/lib/db/tdb_cassandra.py` and `r2/models/vote.py` files are particularly illuminating.
+- **Wilson, E.B. (1927)**: "Probable Inference, the Law of Succession, and Statistical Inference" — Journal of the American Statistical Association, Vol. 22, No. 158, pp. 209–212. The mathematical foundation for comment ranking; the key result is Equation 5, the lower bound of the Bayesian credible interval for a Bernoulli proportion.
+- **"How Reddit Ranking Algorithms Work"** — Official Reddit Engineering blog, 2009. Explains the motivation for the time-decay formula, the choice of the 45,000-second half-life, and why log10 was chosen over natural log (the original Reddit vote scale made log10 more intuitive for the human-readable score values).
+- **"Lessons Learned from Reddit's Architecture"** — High Scalability, 2013. Documents Reddit's migration from a PostgreSQL monolith to a service-oriented architecture and the role of Cassandra for vote storage at scale.
+
+<RelatedQuestions items={[
+  { slug: "twitter-timeline", title: "Design Twitter's Home Timeline", difficulty: "senior" },
+  { slug: "facebook-news-feed", title: "Design Facebook News Feed", difficulty: "staff" },
+  { slug: "linkedin-connections", title: "Design LinkedIn's People You May Know", difficulty: "senior" },
+]} />

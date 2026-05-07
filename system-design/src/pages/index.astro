@@ -1,0 +1,606 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Header from '../components/layout/Header.astro';
+import Footer from '../components/layout/Footer.astro';
+import Badge from '../components/ui/Badge.astro';
+import QuestionCard from '../components/ui/QuestionCard.astro';
+import { getCollection } from 'astro:content';
+
+const questions = await getCollection('system-design');
+questions.sort((a, b) => a.data.publishedAt.localeCompare(b.data.publishedAt));
+
+const totalCount = questions.length;
+
+const categories = [
+  { slug: 'all',         label: 'All' },
+  { slug: 'foundations', label: 'Foundations' },
+  { slug: 'social',      label: 'Social' },
+  { slug: 'media',       label: 'Media' },
+  { slug: 'storage',     label: 'Storage' },
+  { slug: 'commerce',    label: 'Commerce' },
+  { slug: 'search-maps', label: 'Search & Maps' },
+  { slug: 'realtime',    label: 'Real-time' },
+  { slug: 'infra',       label: 'Infra' },
+  { slug: 'ai',          label: 'AI Systems' },
+];
+
+const difficulties = [
+  { slug: 'all',    label: 'All levels' },
+  { slug: 'mid',    label: 'Mid' },
+  { slug: 'senior', label: 'Senior' },
+  { slug: 'staff',  label: 'Staff' },
+];
+---
+
+<BaseLayout title="System Design Interview Prep — pushkar.dev">
+  <Header />
+
+  <main id="main-content" class="sd-main">
+
+    <!-- ─── Hero ──────────────────────────────────── -->
+    <section class="hero" aria-label="Introduction">
+
+      <!-- Decorative background network -->
+      <svg class="hero-net" viewBox="0 0 1200 280" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+        <g class="net-edges" stroke="currentColor" stroke-width="1" fill="none" stroke-dasharray="400" stroke-dashoffset="400">
+          <line x1="80"  y1="140" x2="200" y2="70"  class="e e1"/>
+          <line x1="80"  y1="140" x2="200" y2="210" class="e e2"/>
+          <line x1="200" y1="70"  x2="340" y2="100" class="e e3"/>
+          <line x1="200" y1="210" x2="340" y2="180" class="e e4"/>
+          <line x1="340" y1="100" x2="480" y2="60"  class="e e5"/>
+          <line x1="340" y1="180" x2="480" y2="220" class="e e6"/>
+          <line x1="340" y1="100" x2="620" y2="130" class="e e7"/>
+          <line x1="340" y1="180" x2="620" y2="130" class="e e8"/>
+          <line x1="480" y1="60"  x2="620" y2="130" class="e e9"/>
+          <line x1="480" y1="220" x2="620" y2="130" class="e e10"/>
+          <line x1="620" y1="130" x2="760" y2="70"  class="e e11"/>
+          <line x1="620" y1="130" x2="760" y2="200" class="e e12"/>
+          <line x1="760" y1="70"  x2="900" y2="100" class="e e13"/>
+          <line x1="760" y1="200" x2="900" y2="180" class="e e14"/>
+          <line x1="900" y1="100" x2="1040" y2="70"  class="e e15"/>
+          <line x1="900" y1="180" x2="1040" y2="210" class="e e16"/>
+          <line x1="1040" y1="70"  x2="1150" y2="140" class="e e17"/>
+          <line x1="1040" y1="210" x2="1150" y2="140" class="e e18"/>
+          <line x1="760" y1="70"  x2="760" y2="200" class="e e19"/>
+          <line x1="900" y1="100" x2="900" y2="180" class="e e20"/>
+        </g>
+        <g class="net-nodes" fill="currentColor">
+          <circle cx="80"  cy="140" r="4" class="n n1"/>
+          <circle cx="200" cy="70"  r="3" class="n n2"/>
+          <circle cx="200" cy="210" r="3" class="n n3"/>
+          <circle cx="340" cy="100" r="4" class="n n4"/>
+          <circle cx="340" cy="180" r="3" class="n n5"/>
+          <circle cx="480" cy="60"  r="3" class="n n6"/>
+          <circle cx="480" cy="220" r="3" class="n n7"/>
+          <circle cx="620" cy="130" r="5" class="n n8"/>
+          <circle cx="760" cy="70"  r="3" class="n n9"/>
+          <circle cx="760" cy="200" r="3" class="n n10"/>
+          <circle cx="900" cy="100" r="4" class="n n11"/>
+          <circle cx="900" cy="180" r="3" class="n n12"/>
+          <circle cx="1040" cy="70"  r="3" class="n n13"/>
+          <circle cx="1040" cy="210" r="3" class="n n14"/>
+          <circle cx="1150" cy="140" r="4" class="n n15"/>
+        </g>
+      </svg>
+
+      <div class="hero__inner">
+        <div class="hero__text" id="hero-text">
+          <div class="hero__eyebrow" id="hero-eyebrow">
+            <Badge variant="difficulty" value="mid" />
+            <Badge variant="difficulty" value="senior" />
+            <Badge variant="difficulty" value="staff" />
+          </div>
+
+          <h1 class="hero__title" id="hero-title">
+            <span class="hw">System</span><span class="hw"> Design</span><br/>
+            <span class="hw hero__title-accent">Interview Prep</span>
+          </h1>
+
+          <p class="hero__sub" id="hero-sub">
+            60 questions with staff-level depth — capacity math, tradeoff tables,
+            and the non-obvious insights that separate a senior answer from a principal one.
+          </p>
+
+          <div class="hero__stats" id="hero-stats">
+            <div class="hero__stat">
+              <span class="hero__stat-num">60</span>
+              <span class="hero__stat-label">questions</span>
+            </div>
+            <span class="hero__stat-divider" aria-hidden="true">·</span>
+            <div class="hero__stat">
+              <span class="hero__stat-num">3</span>
+              <span class="hero__stat-label">difficulty tiers</span>
+            </div>
+            <span class="hero__stat-divider" aria-hidden="true">·</span>
+            <div class="hero__stat">
+              <span class="hero__stat-num">9</span>
+              <span class="hero__stat-label">categories</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── Filters ───────────────────────────────── -->
+    <section class="filters" aria-label="Filter questions">
+      <div class="filters__inner">
+
+        <div class="filters__row">
+          <!-- Category chips -->
+          <div class="filter-group" role="group" aria-label="Filter by category">
+            {categories.map(cat => (
+              <button
+                class="fchip"
+                data-filter-cat={cat.slug}
+                aria-pressed={cat.slug === 'all' ? 'true' : 'false'}
+              >
+                {cat.label}
+              </button>
+            ))}
+          </div>
+
+          <!-- Difficulty chips -->
+          <div class="filter-group filter-group--diff" role="group" aria-label="Filter by difficulty">
+            {difficulties.map(d => (
+              <button
+                class="fchip fchip--diff"
+                data-filter-diff={d.slug}
+                aria-pressed={d.slug === 'all' ? 'true' : 'false'}
+              >
+                {d.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <!-- Search + count -->
+        <div class="filters__bottom">
+          <div class="search-wrap">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+              <circle cx="6" cy="6" r="4.5" stroke="currentColor" stroke-width="1.4"/>
+              <path d="M9.5 9.5L12 12" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+            </svg>
+            <input
+              id="search-input"
+              type="search"
+              class="search-input"
+              placeholder="Search questions…"
+              aria-label="Search questions"
+              autocomplete="off"
+            />
+          </div>
+          <p id="question-count" class="q-count" aria-live="polite">
+            Showing <strong id="q-num">{totalCount}</strong> of {totalCount} questions
+          </p>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ─── Question grid ────────────────────────── -->
+    <section class="grid-section" aria-label="Questions">
+      <div class="grid-section__inner">
+
+        <div id="question-grid" class="q-grid">
+          {questions.map(q => (
+            <QuestionCard
+              title={q.data.title}
+              slug={q.id}
+              category={q.data.category}
+              difficulty={q.data.difficulty}
+              summary={q.data.summary}
+              tags={q.data.tags}
+              estimatedReadMinutes={q.data.estimatedReadMinutes}
+            />
+          ))}
+        </div>
+
+        <p id="no-results" class="no-results" hidden>
+          No questions match your filters.
+          <button id="clear-filters" class="clear-btn">Clear filters</button>
+        </p>
+
+        <!-- Pagefind search results (populated at runtime after build) -->
+        <div id="pagefind-search" class="pagefind-wrap" hidden></div>
+
+      </div>
+    </section>
+
+  </main>
+
+  <Footer />
+</BaseLayout>
+
+<!-- ─── Styles ──────────────────────────────────── -->
+<style>
+  .sd-main {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Hero */
+  .hero {
+    position: relative;
+    overflow: hidden;
+    padding: clamp(3.5rem, 10vw, 6rem) 0 clamp(2.5rem, 6vw, 4rem);
+    border-bottom: 1px solid var(--line);
+  }
+  .hero__inner {
+    position: relative;
+    z-index: 1;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 clamp(1rem, 3vw, 2rem);
+  }
+  .hero__text { max-width: 620px; }
+
+  /* Background network SVG */
+  .hero-net {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    color: var(--accent);
+    opacity: 0.07;
+    pointer-events: none;
+  }
+  /* Edge draw-in animation */
+  @keyframes edge-draw { to { stroke-dashoffset: 0; } }
+  @keyframes node-pop  { from { opacity: 0; transform: scale(0); } to { opacity: 1; transform: scale(1); } }
+
+  .net-edges .e {
+    animation: edge-draw 0.6s ease-out forwards;
+  }
+  .net-nodes .n {
+    opacity: 0;
+    transform-origin: center;
+    animation: node-pop 0.3s ease-out forwards;
+  }
+  /* Stagger via nth-child */
+  .e1  { animation-delay: 0.05s; } .e2  { animation-delay: 0.10s; }
+  .e3  { animation-delay: 0.15s; } .e4  { animation-delay: 0.20s; }
+  .e5  { animation-delay: 0.25s; } .e6  { animation-delay: 0.28s; }
+  .e7  { animation-delay: 0.32s; } .e8  { animation-delay: 0.35s; }
+  .e9  { animation-delay: 0.38s; } .e10 { animation-delay: 0.40s; }
+  .e11 { animation-delay: 0.44s; } .e12 { animation-delay: 0.48s; }
+  .e13 { animation-delay: 0.52s; } .e14 { animation-delay: 0.56s; }
+  .e15 { animation-delay: 0.60s; } .e16 { animation-delay: 0.63s; }
+  .e17 { animation-delay: 0.67s; } .e18 { animation-delay: 0.70s; }
+  .e19 { animation-delay: 0.74s; } .e20 { animation-delay: 0.77s; }
+
+  .n1  { animation-delay: 0.08s; } .n2  { animation-delay: 0.13s; }
+  .n3  { animation-delay: 0.18s; } .n4  { animation-delay: 0.23s; }
+  .n5  { animation-delay: 0.28s; } .n6  { animation-delay: 0.33s; }
+  .n7  { animation-delay: 0.38s; } .n8  { animation-delay: 0.43s; }
+  .n9  { animation-delay: 0.48s; } .n10 { animation-delay: 0.52s; }
+  .n11 { animation-delay: 0.57s; } .n12 { animation-delay: 0.61s; }
+  .n13 { animation-delay: 0.65s; } .n14 { animation-delay: 0.68s; }
+  .n15 { animation-delay: 0.72s; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .e { animation: none; stroke-dashoffset: 0; }
+    .n { animation: none; opacity: 1; transform: none; }
+  }
+
+  /* Hero text */
+  .hero__eyebrow {
+    display: flex;
+    gap: 0.375rem;
+    flex-wrap: wrap;
+    margin-bottom: 1.25rem;
+    opacity: 0;
+    animation: fade-up 0.5s ease-out 0.2s forwards;
+  }
+  .hero__title {
+    font-family: 'Geist', system-ui, sans-serif;
+    font-size: clamp(2.5rem, 7vw, 4.5rem);
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    line-height: 1.08;
+    color: var(--ink);
+    margin: 0 0 1.25rem;
+  }
+  .hw {
+    display: inline-block;
+    opacity: 0;
+    animation: fade-up 0.55s ease-out forwards;
+  }
+  .hw:nth-child(1) { animation-delay: 0.35s; }
+  .hw:nth-child(2) { animation-delay: 0.48s; }
+  .hw:nth-child(3) { animation-delay: 0.58s; }
+  .hero__title-accent { color: var(--accent); }
+
+  .hero__sub {
+    font-size: clamp(1rem, 2vw, 1.125rem);
+    color: var(--ink-2);
+    line-height: 1.72;
+    max-width: 52ch;
+    margin: 0 0 1.75rem;
+    opacity: 0;
+    animation: fade-up 0.5s ease-out 0.75s forwards;
+  }
+
+  .hero__stats {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    opacity: 0;
+    animation: fade-up 0.5s ease-out 0.9s forwards;
+  }
+  .hero__stat { display: flex; align-items: baseline; gap: 0.3rem; }
+  .hero__stat-num {
+    font-family: 'Geist', system-ui, sans-serif;
+    font-size: 1.375rem;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: -0.02em;
+  }
+  .hero__stat-label { font-size: 0.82rem; color: var(--ink-4); }
+  .hero__stat-divider { color: var(--ink-4); font-size: 0.75rem; }
+
+  @keyframes fade-up {
+    from { opacity: 0; transform: translateY(18px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .hero__eyebrow, .hw, .hero__sub, .hero__stats {
+      animation: none;
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  /* Filters */
+  .filters {
+    border-bottom: 1px solid var(--line);
+    background: var(--bg-card);
+    position: sticky;
+    top: 56px; /* header height */
+    z-index: 30;
+  }
+  .filters__inner {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0.875rem clamp(1rem, 3vw, 2rem);
+    display: flex;
+    flex-direction: column;
+    gap: 0.625rem;
+  }
+  .filters__row {
+    display: flex;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .filter-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+  }
+  .filter-group--diff { padding-left: 0.5rem; border-left: 1px solid var(--line-2); }
+  @media (max-width: 640px) { .filter-group--diff { padding-left: 0; border-left: none; } }
+
+  .fchip {
+    font-family: 'Geist', system-ui, sans-serif;
+    font-size: 0.775rem;
+    font-weight: 500;
+    padding: 0.3em 0.7em;
+    border-radius: var(--r-sm);
+    border: 1px solid var(--line-2);
+    background: transparent;
+    color: var(--ink-3);
+    cursor: pointer;
+    transition: color var(--dur-fast), border-color var(--dur-fast), background var(--dur-fast);
+    white-space: nowrap;
+  }
+  .fchip:hover { color: var(--ink); background: var(--bg-raised); }
+  .fchip[aria-pressed="true"] {
+    color: var(--accent);
+    border-color: var(--accent-line);
+    background: var(--accent-soft);
+    font-weight: 600;
+  }
+  .fchip--diff[aria-pressed="true"][data-filter-diff="mid"]    { color: var(--diff-mid);    border-color: rgba(143,176,134,0.4); background: rgba(143,176,134,0.1); }
+  .fchip--diff[aria-pressed="true"][data-filter-diff="senior"] { color: var(--diff-senior); border-color: rgba(224,169,109,0.4); background: rgba(224,169,109,0.1); }
+  .fchip--diff[aria-pressed="true"][data-filter-diff="staff"]  { color: var(--diff-staff);  border-color: rgba(210,122,79,0.4);  background: rgba(210,122,79,0.1); }
+
+  .filters__bottom {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    flex-wrap: wrap;
+  }
+  .search-wrap {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: var(--bg);
+    border: 1px solid var(--line-2);
+    border-radius: var(--r-md);
+    padding: 0.35em 0.75em;
+    color: var(--ink-4);
+    flex: 1;
+    max-width: 320px;
+    transition: border-color var(--dur-fast);
+  }
+  .search-wrap:focus-within { border-color: var(--accent-line); color: var(--accent); }
+  .search-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    font-size: 0.84rem;
+    color: var(--ink);
+    font-family: inherit;
+  }
+  .search-input::placeholder { color: var(--ink-4); }
+  /* Hide native clear button in search inputs */
+  .search-input::-webkit-search-cancel-button { display: none; }
+
+  .q-count {
+    font-size: 0.78rem;
+    color: var(--ink-4);
+    margin: 0;
+    white-space: nowrap;
+  }
+  .q-count strong { color: var(--ink-2); font-weight: 600; }
+
+  /* Grid */
+  .grid-section {
+    flex: 1;
+    padding: clamp(1.5rem, 4vw, 2.5rem) 0 clamp(3rem, 8vw, 5rem);
+  }
+  .grid-section__inner {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 clamp(1rem, 3vw, 2rem);
+  }
+  .q-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 1rem;
+  }
+  @media (max-width: 640px) { .q-grid { grid-template-columns: 1fr; } }
+
+  .no-results {
+    text-align: center;
+    color: var(--ink-4);
+    font-size: 0.9rem;
+    padding: 3rem 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+  }
+  .clear-btn {
+    font-size: 0.82rem;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border: 1px solid var(--accent-line);
+    border-radius: var(--r-sm);
+    padding: 0.25em 0.65em;
+    cursor: pointer;
+    transition: background var(--dur-fast);
+  }
+  .clear-btn:hover { background: rgba(232,184,122,0.2); }
+
+  .pagefind-wrap { margin-top: 2rem; }
+</style>
+
+<!-- ─── Client-side filter logic ─────────────────── -->
+<script>
+  function initFilters() {
+    const params = new URLSearchParams(location.search);
+    let activeCat  = params.get('category')   || 'all';
+    let activeDiff = params.get('difficulty')  || 'all';
+    let query      = params.get('q')           || '';
+
+    const cards    = Array.from(document.querySelectorAll<HTMLElement>('.q-card'));
+    const countEl  = document.getElementById('q-num');
+    const noRes    = document.getElementById('no-results') as HTMLElement | null;
+    const searchEl = document.getElementById('search-input') as HTMLInputElement | null;
+
+    // Only run on the index page (cards must exist)
+    if (!cards.length) return;
+
+    function applyFilters() {
+      let visible = 0;
+      const lq = query.toLowerCase();
+
+      cards.forEach(card => {
+        const catOk  = activeCat  === 'all' || card.dataset.category  === activeCat;
+        const diffOk = activeDiff === 'all' || card.dataset.difficulty === activeDiff;
+        const textOk = !lq ||
+          (card.dataset.title ?? '').includes(lq) ||
+          (card.dataset.tags  ?? '').includes(lq);
+
+        const show = catOk && diffOk && textOk;
+        card.hidden = !show;
+        if (show) visible++;
+      });
+
+      if (countEl) countEl.textContent = String(visible);
+      if (noRes) noRes.hidden = visible > 0;
+
+      // Sync URL (replace state so back button works correctly)
+      const np = new URLSearchParams();
+      if (activeCat  !== 'all') np.set('category',   activeCat);
+      if (activeDiff !== 'all') np.set('difficulty',  activeDiff);
+      if (query)                np.set('q',           query);
+      history.replaceState({}, '', np.toString() ? `?${np}` : location.pathname);
+
+      // Sync chip states
+      document.querySelectorAll<HTMLElement>('[data-filter-cat]').forEach(b => {
+        b.setAttribute('aria-pressed', String(b.dataset.filterCat === activeCat));
+      });
+      document.querySelectorAll<HTMLElement>('[data-filter-diff]').forEach(b => {
+        b.setAttribute('aria-pressed', String(b.dataset.filterDiff === activeDiff));
+      });
+    }
+
+    // Category chips — fresh listeners on every page-load
+    document.querySelectorAll<HTMLElement>('[data-filter-cat]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        activeCat = btn.dataset.filterCat!;
+        applyFilters();
+      });
+    });
+
+    // Difficulty chips
+    document.querySelectorAll<HTMLElement>('[data-filter-diff]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        activeDiff = btn.dataset.filterDiff!;
+        applyFilters();
+      });
+    });
+
+    // Search
+    if (searchEl) {
+      searchEl.value = query;
+      searchEl.addEventListener('input', () => {
+        query = searchEl.value;
+        applyFilters();
+      });
+    }
+
+    // Clear filters button
+    document.getElementById('clear-filters')?.addEventListener('click', () => {
+      activeCat = 'all'; activeDiff = 'all'; query = '';
+      if (searchEl) searchEl.value = '';
+      applyFilters();
+    });
+
+    // Apply immediately (reads current URL params)
+    applyFilters();
+  }
+
+  // astro:page-load fires after every navigation (including the initial load),
+  // so event listeners and URL params are always re-initialized on fresh DOM.
+  document.addEventListener('astro:page-load', initFilters);
+</script>
+
+<!-- ─── GSAP card entrance animation ─────────────── -->
+<script>
+  document.addEventListener('astro:page-load', () => {
+    const cards = document.querySelectorAll('.q-card');
+    if (!cards.length) return;
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+    import('https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.mjs').then(({ gsap }) => {
+      if (!gsap) return;
+      gsap.from('.q-card:not([hidden])', {
+        opacity: 0,
+        y: 20,
+        duration: 0.45,
+        stagger: 0.05,
+        delay: 0.1,
+        ease: 'power2.out',
+        clearProps: 'all',
+      });
+    }).catch(() => {});
+  });
+</script>

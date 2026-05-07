@@ -1,0 +1,499 @@
+---
+title: "Design an Online Auction System"
+slug: "online-auction"
+category: "commerce"
+difficulty: "senior"
+estimatedReadMinutes: 22
+tags: ["redis", "kafka", "optimistic-locking", "state-machine", "anti-sniping", "websocket"]
+companyFlavors: ["eBay", "Sotheby's", "Christie's", "Google Shopping"]
+relatedQuestions: ["ticketmaster", "live-sports-scores", "stock-trading-exchange"]
+publishedAt: "2025-01-07"
+updatedAt: "2025-01-07"
+summary: "Model an auction as a state machine, prevent double-bidding and sniping, handle concurrent bids under high contention, and fan-out real-time bid updates to all watchers."
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+
+<Bookmark slug="online-auction" title="Design an Online Auction System" />
+
+<Tldr>
+- Model the auction as an explicit state machine — DRAFT → SCHEDULED → ACTIVE → ENDING → CLOSED — and enforce all state transitions through a single guard layer to prevent invalid bids on closed or unstarted auctions.
+- Use a Redis Lua script for atomic bid acceptance: Lua scripts execute single-threaded inside Redis, making them the lowest-latency serializable transaction primitive available without database row locks.
+- Implement anti-sniping by extending the auction end time by N minutes whenever a bid arrives within the final window; apply the extension atomically inside the same Lua script that accepts the bid.
+- Fan-out real-time bid updates via Kafka to a fleet of WebSocket servers using Redis Pub/Sub as the local delivery channel, decoupling the bid acceptance critical path from the fan-out latency.
+- Implement reserve price and proxy (autobid) logic in the bid acceptance layer: store the user's max amount encrypted, and autobid on their behalf via a Kafka consumer that runs the same Lua serialization path.
+</Tldr>
+
+An auction system looks deceptively simple — highest bid wins — but under concurrent load it becomes one of the trickiest correctness problems in commerce systems. You need serializable bid acceptance, consistent state transitions, anti-sniping fairness, and real-time fan-out, all under the constraint that users expect sub-second confirmation of their bid. The naive approach — a simple `UPDATE auctions SET current_price = ? WHERE current_price < ?` — produces phantom wins, race-condition double-accepts, and silent bid drops under even modest contention. Getting this right requires the same precision of thought demanded by a stock trading exchange, applied to an experience where users are emotionally invested in the outcome.
+
+## Clarifying questions
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| What auction types must be supported? | English (ascending price, highest bid wins at close) as the primary type; Dutch (descending price, first bid wins) and sealed-bid as stretch goals | The core bid acceptance logic, anti-sniping, and proxy bidding are all English-auction specific; Dutch and sealed-bid require substantially different flows |
+| Are there minimum bid increment rules? | Yes — a configurable minimum increment (e.g., $1, $5, $50) that each bid must exceed the current high bid by; sellers set this at auction creation | Minimum increments are validated in the atomic Lua script; without them a bidder can win by $0.01 and every proxy autobid cascade gets stuck in a tight loop |
+| What is the anti-sniping policy? | Extend the auction by N minutes (configurable per auction, default 5) when a bid arrives in the last N minutes | Determines whether `endsAt` is mutable after auction start; it is, and the mutable end time must live in Redis alongside current price, not only in PostgreSQL |
+| Is proxy (autobid) supported? | Yes — users submit a secret max amount; the system autobids on their behalf up to that max | Proxy bidding requires an asynchronous Kafka consumer that re-enters the bid acceptance path; you need idempotency on proxy-generated bids to avoid double-bidding |
+| Is payment pre-authorization required? | Yes — winners are charged at close; optionally, bidders may be pre-authorized to validate payment method | Pre-auth affects bid eligibility; a bidder whose pre-auth fails should be blocked from high bids above their validated limit |
+| How many concurrent auctions and bidders? | 10M active auctions, 1M concurrent bidders at peak; some "hot" auctions (sneaker drops, collectibles) see 1K bids/sec in the final 60 seconds | Hot auctions drive the Redis sharding and Lua serialization design; you cannot put all hot auctions on a single Redis node |
+| Is the bid history publicly visible? | Yes — after each accepted bid, the new price and anonymous or named bidder appear in the live feed | Bid history drives the real-time WebSocket fan-out and the persistent `bids` table; rejected bids may be logged privately |
+| Are there seller reserve prices? | Yes — the seller sets a secret minimum price; if the final bid does not meet reserve, the auction closes with no winner | Reserve price is a secret field; it must not be visible to bidders but must be checked atomically at auction close against the final high bid |
+
+## Functional requirements
+
+- **Auction creation**: sellers create auctions with title, starting price, reserve price, minimum increment, start time, end time, and anti-snipe configuration.
+- **Bid placement**: authenticated bidders place bids that must exceed `currentPrice + minIncrement`; the system returns acceptance or rejection with reason within 200ms p99.
+- **Proxy bidding**: a bidder submits a secret `maxAmount`; the system autobids on their behalf up to that maximum whenever they are outbid.
+- **Anti-sniping**: if a bid arrives within the final `antiSnipeMins` window, the auction end time extends by `antiSnipeMins`; a hard cap prevents indefinite extension.
+- **Real-time feed**: all watchers of an auction receive bid events (new price, new end time, bid count) over WebSocket within one second of bid acceptance.
+- **Auction close**: at expiry, the system determines the winner, checks reserve price, triggers payment capture or pre-auth release, and notifies seller and winner.
+- **Outbid notifications**: when a bidder is outbid, they receive an in-app, email, or push notification so they can counter-bid.
+- **Bid history**: public paginated history of accepted bids per auction (amount, timestamp, optionally anonymized bidder).
+
+## Non-functional requirements
+
+- **Scale**: 10M active auctions, 1M concurrent bidders at peak; up to 50K accepted bids/sec across all auctions system-wide.
+- **Latency**: bid acceptance p99 < 200ms; WebSocket fan-out p99 < 1 second after acceptance.
+- **Correctness**: bid ordering is strictly serializable — no two bids can both be accepted as the new high bid simultaneously; exactly one winner per auction.
+- **Durability**: every accepted bid is durably written to PostgreSQL before the response is returned to the bidder (or via Kafka as an audit trail with at-least-once delivery).
+- **Availability**: 99.99% uptime; hot-standby Redis with sentinel or cluster mode; multi-AZ PostgreSQL with read replicas.
+- **Idempotency**: re-submitted bids with the same idempotency key return the same result without double-processing.
+
+<Capacity title="Auction System Capacity">
+
+**Active auctions and bid rate**
+
+- Active auctions at peak: $10\text{M}$
+- Peak bid write rate across all auctions: $50{,}000 \text{ bids/sec}$
+- Current price read rate: $10\times$ the write rate $= 500{,}000 \text{ reads/sec}$ (served from Redis cache, sub-millisecond)
+
+**Hot auction contention**
+
+A "hot" auction (sneaker drop, rare collectible, government contract closing time) concentrates bids in the final 60 seconds:
+
+$$\text{bids/sec per hot auction} = \frac{1{,}000 \text{ bids}}{60\text{s}} \approx 17 \text{ bids/sec}$$
+
+Individually modest, but the atomic serialization bottleneck is per-auction. A single Redis key for that auction serializes all 17 bids/sec through a Lua script — well within Redis single-threaded throughput of $\sim$100K ops/sec per core.
+
+**Fan-out amplification**
+
+Average watchers per auction: $500$.
+
+$$\text{fan-out messages/sec} = 500 \text{ watchers} \times 50{,}000 \text{ bids/sec} = 25{,}000{,}000 \text{ msg/sec}$$
+
+This $25\text{M}$ msg/sec is the dominant scaling concern — not bid write throughput. WebSocket servers must be horizontally scalable; Redis Pub/Sub or Kafka consumer groups per-auction distribute the fan-out load.
+
+**Storage**
+
+- Bids per day (at 50K/sec for 8 peak hours): $50{,}000 \times 28{,}800 \approx 1.44\text{B}$ rows/day
+- At $\sim$200 bytes/row: $\approx 288\text{GB/day}$ of raw bid data
+- Partitioned by `auction_id` and `placed_at`; cold-tier archival after auction closes
+
+**Redis memory for live auction state**
+
+One HASH per active auction with 6 fields at $\sim$150 bytes each:
+
+$$10{,}000{,}000 \times 150 \text{ bytes} = 1.5\text{GB}$$
+
+Fits comfortably in a single Redis node's memory; but hot-auction sharding across a Redis Cluster is still required for throughput isolation.
+
+</Capacity>
+
+## API design
+
+```text
+POST /api/v1/auctions
+  Body: { title, startPrice, reservePrice, minIncrement,
+          startsAt, endsAt, antiSnipeMins }
+  → Auction { auctionId, status: "DRAFT" }
+
+GET /api/v1/auctions/{auctionId}
+  → AuctionDetail { auctionId, status, currentPrice, bidCount,
+                    endsAt, startsAt, minIncrement }
+
+POST /api/v1/auctions/{auctionId}/bids
+  Body: { amount, maxAmount (proxy, optional), idempotencyKey }
+  → BidResult { accepted, currentPrice, yourRank, newEndTime, reason }
+
+GET /api/v1/auctions/{auctionId}/bids
+  Query: ?page=&limit=
+  → BidPage { bids: [{ bidId, amount, placedAt, bidderId }], nextCursor }
+
+WebSocket: wss://auctions.example.com/ws/auction/{auctionId}
+  Server → Client events:
+    BidEvent   { type: "BID",    currentPrice, bidCount, newEndsAt, ts }
+    CloseEvent { type: "CLOSED", winnerId, finalPrice, metReserve }
+    ExtendEvent{ type: "EXTEND", newEndsAt, reason: "ANTI_SNIPE" }
+```
+
+## Data model
+
+```sql
+CREATE TABLE auctions (
+    auction_id      UUID PRIMARY KEY,
+    seller_id       UUID NOT NULL,
+    title           VARCHAR(500) NOT NULL,
+    status          VARCHAR(20) NOT NULL,
+    start_price     NUMERIC(12,2) NOT NULL,
+    reserve_price   NUMERIC(12,2),
+    min_increment   NUMERIC(12,2) NOT NULL DEFAULT 1.00,
+    starts_at       TIMESTAMPTZ NOT NULL,
+    ends_at         TIMESTAMPTZ NOT NULL,
+    current_price   NUMERIC(12,2),
+    winner_id       UUID,
+    anti_snipe_mins INT NOT NULL DEFAULT 5,
+    max_extension_mins INT NOT NULL DEFAULT 30,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE bids (
+    bid_id          UUID PRIMARY KEY,
+    auction_id      UUID NOT NULL REFERENCES auctions(auction_id),
+    bidder_id       UUID NOT NULL,
+    amount          NUMERIC(12,2) NOT NULL,
+    max_amount      NUMERIC(12,2),
+    placed_at       TIMESTAMPTZ NOT NULL,
+    idempotency_key VARCHAR(64) UNIQUE NOT NULL,
+    status          VARCHAR(20) NOT NULL,
+    is_proxy        BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX idx_bids_auction_placed ON bids(auction_id, placed_at DESC);
+CREATE INDEX idx_auctions_status_ends ON auctions(status, ends_at)
+    WHERE status IN ('ACTIVE', 'ENDING');
+```
+
+Redis hot auction state — one HASH per live auction, keyed by `auction:{auctionId}:live`:
+
+```text
+HASH auction:{auctionId}:live
+  currentPrice   → "1050.00"
+  highBidderId   → "user-456"
+  highBidId      → "bid-uuid-789"
+  endsAt         → "1704153600000"   (epoch ms)
+  originalEndsAt → "1704153000000"   (for extension cap enforcement)
+  version        → "42"
+```
+
+The Redis HASH is the canonical live state during an auction's ACTIVE/ENDING phases. PostgreSQL is the durable system of record. Discrepancies between them are resolved at close time by the scheduler service, which always trusts Redis for `endsAt` and `currentPrice`.
+
+## Architecture
+
+<Mermaid diagram={`flowchart TD
+    C[Browser / Mobile Client] -->|HTTPS REST| AG[API Gateway]
+    C -->|WebSocket| WS[WebSocket Server Pool]
+
+    AG --> BS[Bid Service]
+    AG --> AS[Auction CRUD Service]
+
+    BS -->|Redis EVALSHA Lua script| RC[(Redis Cluster\nauction live state)]
+    BS -->|async publish| KA[Kafka\nbid-events topic]
+    BS -->|durable write| PG[(PostgreSQL\nauctions + bids)]
+
+    KA --> FO[Fan-out Service\nKafka consumer group]
+    FO -->|Redis PUBLISH| RP[Redis Pub/Sub\nchannel per auction]
+    RP --> WS
+
+    KA --> PX[Proxy Bid Engine\nKafka consumer group]
+    PX -->|re-enters bid path| BS
+
+    KA --> NF[Notification Service\nemail + push]
+
+    SCH[Auction Scheduler\ncron every 5s] -->|reads Redis endsAt| RC
+    SCH -->|transitions ACTIVE to CLOSED| PG
+    SCH -->|publishes close event| KAE[Kafka\nauction-events topic]
+    KAE --> PAY[Payment Service\ncapture or release]
+    KAE --> NF
+`} />
+
+**Key data flows:**
+
+1. Bidder POSTs a bid → API Gateway → Bid Service executes Lua script on Redis → on success, publishes to Kafka `bid-events` and writes to PostgreSQL, then returns `BidResult` to client.
+2. Kafka `bid-events` → Fan-out Service → Redis Pub/Sub channel for that auction → all WebSocket Server instances subscribed to that channel → push `BidEvent` to all connected clients.
+3. Kafka `bid-events` → Proxy Bid Engine: if the outbid bidder has a proxy with remaining headroom, the engine places a counter-bid through the Bid Service (same Lua path, idempotency key derived from the triggering bid).
+4. Auction Scheduler polls PostgreSQL for auctions whose DB `ends_at` is past, checks Redis for the true (potentially extended) `endsAt`, and closes only those whose Redis `endsAt` is also past.
+
+## Deep dive: atomic bid acceptance with Lua
+
+The core invariant is that exactly one bid can be the new high bid at any moment. Under concurrent load — two bidders clicking "Place Bid" within milliseconds — you must guarantee that at most one of them succeeds, and both receive a definitive answer.
+
+A database `SELECT FOR UPDATE` on the auction row achieves this but adds round-trip latency and lock wait contention under high throughput. An optimistic lock (check-then-update with a version field) requires retry loops and still goes to the database. Redis Lua scripts offer a better trade-off: they execute atomically in Redis's single-threaded event loop, with sub-millisecond round trips, no lock waits, and deterministic ordering.
+
+The Lua script receives the auction key, the proposed bid amount, the bidder ID, the current timestamp, and the bid UUID. It atomically reads the current hash, validates all constraints, and writes the new state — or rejects with a specific reason code. No other Redis command can interleave with a running Lua script.
+
+```text
+Lua script logic (pseudocode):
+
+  inputs: auctionKey, bidAmount, bidderId, nowMs, bidId
+
+  1. currentPrice, highBidderId, endsAt, originalEndsAt, version
+       = HGET auctionKey currentPrice highBidderId endsAt originalEndsAt version
+
+  2. If endsAt == nil: return {"AUCTION_NOT_FOUND"}
+
+  3. If nowMs >= endsAt: return {"AUCTION_ENDED"}
+
+  4. If bidAmount <= (currentPrice + minIncrement): return {"BID_TOO_LOW", currentPrice}
+
+  5. newEndsAt = endsAt
+     If nowMs > (endsAt - antiSnipeMins * 60000):
+       maxAllowedEndsAt = originalEndsAt + maxExtensionMins * 60000
+       newEndsAt = MIN(nowMs + antiSnipeMins * 60000, maxAllowedEndsAt)
+
+  6. HSET auctionKey
+         currentPrice bidAmount
+         highBidderId bidderId
+         highBidId    bidId
+         endsAt       newEndsAt
+         version      (version + 1)
+
+  7. return {"ACCEPTED", bidAmount, newEndsAt, version + 1}
+```
+
+After the Lua script returns `ACCEPTED`, the Bid Service:
+1. Publishes a `BidEvent` to Kafka `bid-events` (the fan-out source of truth and audit log).
+2. Writes the bid record to PostgreSQL asynchronously. The Kafka event is the durable record; the PostgreSQL write completes the audit trail.
+3. Returns the `BidResult` to the caller.
+
+On rejection, the Bid Service deletes the idempotency key from Redis (if it was just set) so the caller can retry with a corrected amount.
+
+**Why Lua over a Kafka-based queue per auction?** A single-partition Kafka topic per auction would also serialize bids, but at ~5–10ms latency per bid vs. ~0.5ms for a Redis Lua call. For high-contention auctions in the final seconds, that 10× latency difference is significant. The Lua approach keeps the critical path fast; Kafka handles the durable fan-out asynchronously.
+
+## Deep dive: proxy (autobid) logic
+
+When a user places a proxy bid with `maxAmount = $500`, the system does not simply accept their bid at $500 — that would reveal their maximum willingness to pay. Instead:
+
+1. The Bid Service accepts the bid at `currentPrice + minIncrement` (the minimum valid bid amount).
+2. The `maxAmount` is stored encrypted in the `bids` table, invisible to all other users.
+3. The bid is published to Kafka `bid-events` with the true accepted amount (not the max).
+
+The Proxy Bid Engine is a Kafka consumer group on `bid-events`. When it sees a `BidEvent` where the new `highBidderId` is not the outbid user but the outbid user has a stored proxy with `maxAmount > newCurrentPrice + minIncrement`, the engine immediately places a counter-bid:
+
+- It constructs a new `PlaceBidRequest` with `amount = newCurrentPrice + minIncrement` and an idempotency key derived deterministically from the triggering bid ID plus the proxy holder's user ID.
+- This request enters the same Bid Service → Lua script path. The engine does not bypass any validation.
+
+**Two-proxy collision:** If User A has max $500 and User B has max $600, and both place proxy bids simultaneously:
+
+1. The Lua script accepts one of them first (say A at `startPrice + increment`).
+2. Kafka delivers the event; the Proxy Engine sees B was outbid and autobids B at `A's bid + increment`.
+3. Kafka delivers B's autobid event; the Proxy Engine sees A was outbid and autobids A — this continues until A's max is exhausted.
+4. Resolution: B wins at $501 (A's max + 1 increment), completing in O(max / increment) autobid cycles, all serialized through the Lua script.
+
+The idempotency key on each proxy-generated bid ensures that if the Kafka consumer retries (at-least-once delivery), no duplicate bids are placed.
+
+## Deep dive: anti-sniping
+
+Classic auction sniping is placing a bid 2–3 seconds before close, winning by denying other bidders the chance to respond. It is technically valid but widely considered unfair, and it depresses the final sale price by eliminating competitive bidding in the final moments.
+
+eBay's real-world response is a 10-minute extension rule on some auction formats. The design here implements this as a configurable per-auction parameter.
+
+**How it works in the Lua script (Step 5 above):**
+
+When the accepted bid arrives and `nowMs > (endsAt - antiSnipeMins * 60000)`, the script extends `endsAt` to `nowMs + antiSnipeMins * 60000`. This new `endsAt` is returned in the `ACCEPTED` response, published in the `BidEvent` to Kafka, and delivered via WebSocket to all watchers. Their countdown timers update automatically.
+
+**Extension cap:** Without a cap, a sufficiently active auction could extend indefinitely — each new bid in the final 5 minutes adds another 5 minutes. The cap is enforced in the Lua script: `newEndsAt = MIN(nowMs + antiSnipeMins * 60000, originalEndsAt + maxExtensionMins * 60000)`. Once the cap is reached, no further extensions occur, and the auction closes at the capped time regardless of late bids.
+
+**Client-side countdown:** Clients receiving a `BidEvent` or `ExtendEvent` with a new `endsAt` must update their local countdown. WebSocket-connected clients get this immediately. Clients who reconnect mid-auction fetch the current state from `GET /api/v1/auctions/{auctionId}`, which reads `endsAt` from Redis.
+
+**Auction state machine transitions:**
+
+```text
+DRAFT
+  → SCHEDULED  (seller publishes, start time is in the future)
+  → ACTIVE     (start time reached, scheduler transitions)
+  → ENDING     (within anti-snipe window, optional visual state)
+  → CLOSED     (end time reached, scheduler closes)
+  → CANCELLED  (seller or admin cancels, with restrictions)
+```
+
+The Auction Scheduler transitions SCHEDULED → ACTIVE and ACTIVE → CLOSED on a polling loop (every 5 seconds). The ENDING visual state is a client-side concern only — it does not change bid acceptance logic; that is governed by `endsAt` in Redis.
+
+## Java integration — Part A: AuctionBidService
+
+```java
+@Service
+@RequiredArgsConstructor
+public class AuctionBidService {
+
+    private final StringRedisTemplate redis;
+    private final KafkaTemplate<String, BidEvent> kafka;
+    private final BidRepository bidRepo;
+    private final DefaultRedisScript<List> bidLuaScript;
+
+    public BidResult placeBid(PlaceBidRequest req) {
+        String auctionKey = "auction:%s:live".formatted(req.getAuctionId());
+        String dedupKey = "bid:dedup:" + req.getIdempotencyKey();
+
+        Boolean fresh = redis.opsForValue()
+            .setIfAbsent(dedupKey, "1", Duration.ofHours(24));
+        if (Boolean.FALSE.equals(fresh)) {
+            return BidResult.duplicate();
+        }
+
+        long nowMs = Instant.now().toEpochMilli();
+        List<Object> result = redis.execute(bidLuaScript,
+            List.of(auctionKey),
+            req.getAmount().toPlainString(),
+            req.getBidderId(),
+            String.valueOf(nowMs),
+            req.getBidId()
+        );
+
+        String status = (String) result.get(0);
+        if (!"ACCEPTED".equals(status)) {
+            redis.delete(dedupKey);
+            return BidResult.rejected(status);
+        }
+
+        BigDecimal newPrice = new BigDecimal((String) result.get(1));
+        long newEndsAt = Long.parseLong((String) result.get(2));
+
+        Bid bid = Bid.builder()
+            .bidId(req.getBidId())
+            .auctionId(req.getAuctionId())
+            .bidderId(req.getBidderId())
+            .amount(req.getAmount())
+            .maxAmount(req.getMaxAmount())
+            .placedAt(Instant.ofEpochMilli(nowMs))
+            .idempotencyKey(req.getIdempotencyKey())
+            .status(BidStatus.ACCEPTED)
+            .build();
+
+        kafka.send("bid-events", req.getAuctionId(),
+            BidEvent.from(bid, newPrice, newEndsAt));
+
+        bidRepo.save(bid);
+        return BidResult.accepted(newPrice, newEndsAt);
+    }
+}
+```
+
+**Design notes:** The idempotency check uses Redis `SET NX EX` (via `setIfAbsent`) as a 24-hour deduplication window. The Lua script is pre-loaded with `SCRIPT LOAD` and invoked via `EVALSHA` for efficiency — `DefaultRedisScript` handles the caching. PostgreSQL write happens after Kafka publish; if the DB write fails, the Kafka event is the durable record and an async reconciler can replay it.
+
+## Java integration — Part B: AuctionSchedulerService
+
+```java
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class AuctionSchedulerService {
+
+    private final AuctionRepository auctionRepo;
+    private final KafkaTemplate<String, AuctionEvent> kafka;
+    private final StringRedisTemplate redis;
+
+    @Scheduled(fixedDelay = 5000)
+    public void closeExpiredAuctions() {
+        List<Auction> expiring = auctionRepo.findByStatusAndEndsAtBefore(
+            AuctionStatus.ACTIVE, Instant.now());
+
+        for (Auction auction : expiring) {
+            String liveKey = "auction:%s:live".formatted(auction.getAuctionId());
+            Object endsAtObj = redis.opsForHash().get(liveKey, "endsAt");
+            if (endsAtObj == null) continue;
+
+            long redisEndsAt = Long.parseLong(endsAtObj.toString());
+            if (Instant.ofEpochMilli(redisEndsAt).isAfter(Instant.now())) {
+                auction.setEndsAt(Instant.ofEpochMilli(redisEndsAt));
+                auctionRepo.save(auction);
+                continue;
+            }
+
+            String winnerId = (String) redis.opsForHash().get(liveKey, "highBidderId");
+            String winPrice = (String) redis.opsForHash().get(liveKey, "currentPrice");
+
+            auction.setStatus(AuctionStatus.CLOSED);
+            auction.setWinnerId(winnerId != null ? UUID.fromString(winnerId) : null);
+            auction.setCurrentPrice(winPrice != null ? new BigDecimal(winPrice) : null);
+            auctionRepo.save(auction);
+
+            kafka.send("auction-events", auction.getAuctionId().toString(),
+                AuctionEvent.closed(auction));
+            log.info("Closed auction {} winner={} price={}",
+                auction.getAuctionId(), winnerId, winPrice);
+        }
+    }
+}
+```
+
+**Design notes:** The scheduler does not trust `ends_at` in PostgreSQL for close decisions — it always fetches the Redis `endsAt` first. If Redis `endsAt` is still in the future (due to an anti-snipe extension not yet synced to the DB), it updates PostgreSQL and skips closing. This prevents premature close on auctions that received last-minute bids. The scheduler is designed to be idempotent: running it twice on the same auction is safe because the `CLOSED` status guard in `findByStatusAndEndsAtBefore` prevents double-processing.
+
+<TradeoffTable title="Bid Acceptance Serialization Strategies">
+
+| Strategy | Throughput | Consistency | Failure Modes | Recommendation |
+|---|---|---|---|---|
+| DB row lock (`SELECT FOR UPDATE`) | Low — lock contention at ~500 concurrent bids/sec per auction; high p99 latency under load | Strong serializable — PostgreSQL guarantees ordering | Lock wait timeout under sustained contention; single DB node is throughput ceiling | Acceptable for low-traffic auctions; do not use for hot auctions |
+| Redis Lua script | High — Redis single-threaded event loop at ~100K ops/sec; sub-millisecond per operation | Serializable within a single Redis node; cluster sharding preserves per-key serialization | Redis node failure loses in-flight state; mitigated by Redis Sentinel / persistence; not multi-key atomic | Recommended for hot auctions — best latency, sufficient consistency |
+| Optimistic locking (version field) | Medium — throughput degrades under contention as retry storms increase; ~70% retry rate at 100 concurrent bids | Eventual — a bid can transiently observe stale state before retrying | Retry storms under high contention; starvation of slow clients; complex retry backoff logic | Use only for low-contention auctions where occasional retry is acceptable |
+| Single-threaded per-auction actor | High for low actor count — each actor serializes one auction's bids at ~10K/sec with no lock contention | Strong — single actor provides total ordering with no distributed coordination | Actor failure requires failover and state recovery; actor placement in a distributed system adds routing complexity | Viable for very high-value auctions needing auditable total order; operational overhead is high |
+
+</TradeoffTable>
+
+<Pitfall title="Determining auction close time from PostgreSQL instead of Redis">
+
+When anti-sniping extends an auction, the new `endsAt` is written to Redis atomically inside the Lua script. The asynchronous write-back to PostgreSQL happens seconds later (or only at close time). If the Auction Scheduler reads `ends_at` from PostgreSQL to decide whether to close, it will see the pre-extension time and prematurely close an auction that still has active bidding.
+
+**Fix:** The scheduler must always read `endsAt` from the Redis HASH first (see `AuctionSchedulerService` above). Only if the Redis key is expired or missing (indicating a truly dead or already-closed auction) should it fall back to PostgreSQL. Treat Redis as the authoritative live-state store and PostgreSQL as the durable archive that lags by design.
+
+</Pitfall>
+
+<Pitfall title="Proxy bid cascades without idempotency keys cause double-bids">
+
+The Proxy Bid Engine consumes `bid-events` from Kafka with at-least-once delivery. If a Kafka consumer restarts mid-processing, it may reprocess a `BidEvent` and generate a second autobid on behalf of the same user for the same triggering event. Without idempotency keys on proxy-generated bids, the user gets charged for two bids they intended to be one.
+
+**Fix:** Proxy-generated bids must derive their idempotency key deterministically: `idempotency_key = SHA256(triggeringBidId + proxyUserId + "PROXY")`. Because the key is deterministic, a reprocessed Kafka message generates the same idempotency key, which hits the Redis dedup check and returns the cached result rather than placing a duplicate bid. The proxy engine must also use the same `BidService.placeBid` code path — not a backdoor write — so all idempotency and validation logic applies uniformly.
+
+</Pitfall>
+
+<Curveball title="The seller wants to cancel an auction after bids have been placed. How do you handle this?">
+
+Cancellation is straightforward before any bids exist — transition to CANCELLED, no financial impact. Once bids have been placed, cancellation is a legally and contractually complex operation that the system must handle carefully.
+
+**State machine guard:** Cancellation transitions are gated in the auction service: DRAFT and SCHEDULED can be cancelled freely. ACTIVE with zero bids can be cancelled by the seller. ACTIVE with one or more bids requires either an admin override or the seller paying a cancellation fee per platform policy.
+
+**When cancellation is approved with existing bids:** The system must atomically transition status to CANCELLED in PostgreSQL (using an optimistic lock on version to prevent a race with the scheduler closing the auction simultaneously), publish a `CANCELLED` event to `auction-events`, trigger payment pre-auth release for all bidders who had holds, and send outbid-style notifications to all bidders explaining the cancellation. The proxy engine must also drain any pending autobid events for this auction.
+
+**Guard in the Lua script:** Once the CANCELLED status is propagated to Redis (by setting a `status` field in the live HASH), the Lua script can check it and immediately return `AUCTION_CANCELLED` for any incoming bids, cutting off new bids at the Redis layer with zero DB round trips.
+
+</Curveball>
+
+<Curveball title="How would you implement Dutch (descending price) auctions?">
+
+Dutch auctions invert the entire bidding model: the auctioneer starts at a high price and decreases it on a schedule; the first bidder to accept the current price wins immediately. There is no concept of competing bids, outbidding, or proxy logic — the race is simply to click before the price drops to a level someone else accepts.
+
+**Design changes:**
+
+The live Redis HASH now stores `currentPrice` and a `priceDropIntervalMs` and `priceDropAmount`. A scheduled job (or a server-side timer) decrements `currentPrice` on the schedule — this can be done with a Lua script invoked by a background thread or a Redis keyspace notification triggered by a TTL key. The Lua bid-acceptance script is inverted: instead of checking `bidAmount > currentPrice + minIncrement`, it checks that the bidder is accepting the current price and the auction is still ACTIVE. The first `ACCEPT` atomically sets `status = CLOSED` and records the winner.
+
+Anti-sniping does not apply — there is no time window to extend because the first acceptance wins. Proxy bidding also does not apply. Fan-out to watchers shows the current descending price, not competing bids. The primary real-time concern is that all watchers see the same price at the same time, which the WebSocket fan-out satisfies.
+
+</Curveball>
+
+<Curveball title="Your auction system is used for government contract bidding (sealed-bid). How does the design change?">
+
+Sealed-bid auctions require that no bidder can see any other bidder's amount until the reveal time. This is architecturally closer to a vote-collection problem than a live auction, and it invalidates almost every real-time component of the English auction design.
+
+**Bid submission:** Each bid is encrypted client-side using the auction's public key (or envelope-encrypted server-side with a key that is time-locked until close). The `bids` table stores only the encrypted payload and a commitment hash. No real-time fan-out of amounts occurs; the WebSocket feed delivers only bid count and "a new sealed bid was received," not amounts or bidder identities.
+
+**Reveal:** At close time, the decryption key is released (either by a trusted third party or by expiry of a time-locked secret). The auction close service decrypts all bids simultaneously, ranks them, and determines the winner. This decryption-and-rank step is a batch job, not a streaming operation — it can take minutes for large bid pools.
+
+**Trust model changes:** The system must prove to all bidders that their sealed bid was not modified before reveal. Storing a commitment hash (SHA-256 of the plaintext bid + a bidder-chosen nonce) at submission time, and requiring bidders to verify their hash matches after reveal, is the standard cryptographic commitment scheme for sealed auctions. The database schema gains `commitment_hash` and `decrypted_amount` fields; the `max_amount` proxy field is irrelevant and removed.
+
+</Curveball>
+
+## Further reading
+
+eBay's engineering blog has documented their bid system evolution over two decades, including their adoption of a 10-minute anti-sniping extension and the challenges of running millions of concurrent auctions on commodity hardware. Redis's documentation on Lua scripting covers the atomicity guarantees in detail — specifically, why a Lua script is guaranteed to execute without interruption even in a multi-threaded Redis environment (Redis's single-threaded command processing model is the foundation). Stripe's engineering blog on idempotency key design is the definitive reference for implementing safe retry semantics in payment and bid flows — the deduplication pattern in `AuctionBidService` is a direct application of Stripe's approach. For the broader tradeoffs between optimistic and pessimistic locking under high contention in commerce systems, Martin Kleppmann's "Designing Data-Intensive Applications" (Chapter 7 on transactions) provides the theoretical grounding, while the Google Spanner and CockroachDB papers show how serializable transactions are achieved at global scale without the single-node bottleneck that makes `SELECT FOR UPDATE` impractical for hot auctions.
+
+<RelatedQuestions items={[
+  { slug: "ticketmaster", title: "Design Ticketmaster", difficulty: "senior" },
+  { slug: "live-sports-scores", title: "Design a Live Sports Score System", difficulty: "mid" },
+  { slug: "stock-trading-exchange", title: "Design a Stock Trading Exchange", difficulty: "staff" },
+]} />

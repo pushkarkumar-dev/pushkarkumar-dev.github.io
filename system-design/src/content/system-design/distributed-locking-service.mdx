@@ -1,0 +1,540 @@
+---
+title: "Design a Distributed Locking Service"
+slug: "distributed-locking-service"
+category: "foundations"
+difficulty: "staff"
+estimatedReadMinutes: 26
+tags: ["raft", "consensus", "lease", "fencing-tokens", "etcd", "chubby", "leader-election"]
+companyFlavors: ["Google Chubby", "etcd", "Apache ZooKeeper", "Redis Redlock", "HashiCorp Consul"]
+prerequisites: ["consistent-hashing"]
+relatedQuestions: ["distributed-kv-store", "distributed-unique-id-generator", "distributed-rate-limiter"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Design a distributed lock service that provides mutual exclusion across processes with lease-based expiry, fencing tokens to handle GC pauses, and Raft consensus for correctness — the primitives behind leader election, distributed coordination, and config management."
+javaPackages: ["io.etcd:jetcd-core:0.7.7", "org.redisson:redisson:3.29.0", "org.springframework.boot:spring-boot-starter:3.3.0"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="distributed-locking-service" title="Design a Distributed Locking Service" />
+
+<Tldr>
+- Locks need both **safety** (mutual exclusion — at most one holder) and **liveness** (progress — no deadlock if holder crashes). TTL-based leases give you liveness; fencing tokens give you safety.
+- **Fencing token**: a monotonically increasing counter returned with the lock. The protected resource rejects writes with a token ≤ its last seen token — this is the only correct solution to the GC pause problem where a client holds an expired lock and resumes writing after eviction.
+- **Raft consensus** (etcd, Chubby) is the correct foundation — it guarantees linearizability. Redis Redlock does NOT (Martin Kleppmann proved it unsound under clock drift or GC pauses); treating Redlock as production-safe is a career-limiting assumption.
+- **Lease length**: 10–30 seconds. Too short → renewal overhead dominates and the lock service becomes a heartbeat sink; too long → recovery time after a crash is painful and blocks contending clients for the full TTL.
+- **Use cases**: leader election, distributed cron (exactly-once trigger), critical section across microservices, config management — any problem where "exactly one actor does this at a time" is a correctness requirement, not a performance preference.
+</Tldr>
+
+## Why distributed locking is hard
+
+A lock on a single machine is straightforward: the OS kernel arbitrates access through mutexes or file locks, and the clock that measures timeouts is the same clock all threads share. Distribute the lock across a network and both of those assumptions shatter simultaneously. There is no shared clock — each node runs an independent quartz oscillator that drifts at different rates, and NTP corrections can move clocks forward or backward by tens of milliseconds at arbitrary moments. The network itself introduces unbounded delay: a packet that carries "release the lock" can sit in a queue for hundreds of milliseconds, arrive out of order, or never arrive at all.
+
+The GC pause problem is the most dangerous failure mode and the one candidates consistently underestimate. Imagine client A holds a lease on lock `inventory/item-42` with a 30-second TTL. At second 29, the JVM decides to run a stop-the-world garbage collection that takes 15 seconds. From the lock service's perspective, client A has gone silent for longer than the TTL; it marks the lease as expired and grants the lock to client B at second 32. Client B immediately starts writing to the inventory record. At second 44, client A's GC pause ends. From client A's perspective, no time has passed — it still believes it holds a valid lease, so it resumes writing. Both A and B are now writing to the same record concurrently. If the underlying resource has no awareness of lock ownership, the last writer wins, and you have silent data corruption with no error surfacing anywhere in your stack.
+
+The second hard problem is split-brain during network partition. Suppose a 5-node Raft cluster partitions into a group of 3 and a group of 2. The group of 3 elects a new leader and continues accepting lock grants. The group of 2, meanwhile, contains the old leader — who may have been mid-lease when the partition occurred. The old leader cannot reach a quorum to renew its leadership, so Raft correctly strips it of authority. But clients connected to the minority side might briefly receive stale responses if they are reading from followers without linearizability guarantees. This is why lock operations must go through the Raft leader with full linearizable read semantics — a read from a stale follower that says "lock is free" when the leader says "lock is held" is a concurrency bug disguised as a performance optimization.
+
+## Clarifying questions
+
+| Question | Ideal answer | Why it matters |
+|---|---|---|
+| Is this for leader election, mutual exclusion, or both? | Often both — leader election is implemented on top of mutual exclusion | Shapes whether you need watch/notify semantics in addition to acquire/release |
+| How long are critical sections held? | Milliseconds (DB transaction) to minutes (batch job) | Drives TTL sizing; long-held locks need explicit renewal APIs |
+| Consistency requirement: linearizable or serializable? | Linearizable — every lock acquisition must reflect the globally latest state | Rules out reading from Raft followers; all operations must go to the leader |
+| What happens if the lock service is unavailable — can clients proceed without a lock? | Depends on the resource; for financial writes, no | Determines whether to fail open (risky) or fail closed (blocks clients) during outage |
+| Is the protected resource able to implement fencing token checks? | Yes for new services; often no for legacy systems | If not, TTL is your only safety boundary — a weaker guarantee |
+| Single datacenter or multi-region? | Multi-region active-active in 2–3 years | Single DC simplifies Raft placement; multi-region requires geo-distributed consensus or local lock services per region |
+| Expected lock contention? | Few highly contested locks (e.g., leader election) vs. many low-contention locks (one per user session) | High contention → need efficient queue/waitlist; low contention → simple try-retry is fine |
+| Reentrant locks needed? | Usually no, but sometimes for nested transactions | Reentrancy requires tracking the holder identity and recursion depth — adds significant complexity |
+
+## Functional requirements
+
+- Acquire a named lock with a configurable TTL lease; the service returns a `LockHandle` containing a monotonically increasing fencing token and lease expiry time
+- Release a lock by name and token; the service verifies the token matches the current holder before releasing
+- Renew a lease before it expires; the token is unchanged, only the expiry is extended
+- Non-blocking `tryLock` that returns immediately if the lock is contested
+- Watch a lock name for lease events (acquired, released, expired) as a streaming subscription
+- The service must automatically expire abandoned leases when the TTL elapses with no renewal
+- Support namespacing: locks in `leader/` namespace for election, `inventory/` for business objects, `cron/` for distributed cron
+
+## Non-functional requirements
+
+- **Lock acquisition latency**: p99 < 5 ms within a single datacenter (Raft commit latency dominates)
+- **Availability**: 99.99% (four nines) — achievable with a 5-node Raft cluster; five nines requires additional engineering at the Raft layer and is rarely justified for a lock service
+- **Lease renewal interval**: TTL / 3 — a 30-second lease renews every 10 seconds, giving three attempts before expiry under exponential backoff
+- **Fencing token monotonicity**: the token (Raft log index) must strictly increase across lock acquisitions, even across leader elections
+- **Throughput**: 10,000 lock operations per second per datacenter — typical for Chubby; Raft is not a high-throughput system and should not be used as one
+
+## Capacity estimation
+
+<Capacity title="Back-of-envelope: 5-node Raft cluster, 10K ops/sec, 30s TTL">
+
+**Lock operations throughput**
+
+A 5-node Raft cluster with nodes co-located in the same rack achieves roughly:
+
+$$
+\text{Raft commit latency} \approx 2 \times \text{network RTT} \approx 2 \times 0.5\text{ ms} = 1\text{ ms}
+$$
+
+$$
+\text{max throughput} = \frac{1}{\text{commit latency}} = \frac{1}{1\text{ ms}} = 1{,}000 \text{ ops/s per pipeline stage}
+$$
+
+With request pipelining (batching multiple log entries per AppendEntries RPC), practical throughput reaches 5,000–10,000 lock ops/sec. This is the Chubby-class operating envelope — lock services are coordination primitives, not data planes.
+
+**Renewal RPC load**
+
+Each held lock generates one renewal RPC every TTL/3 seconds.
+
+$$
+\text{renewal rate} = \frac{\text{concurrent locks}}{\text{TTL}/3} = \frac{10{,}000 \text{ locks}}{10\text{ s}} = 1{,}000 \text{ renewals/sec}
+$$
+
+This is well within the Raft throughput budget. The lock acquisition and release RPCs are the minority of traffic; renewal is the dominant steady-state load.
+
+**Storage requirements**
+
+Lock state is tiny — a lock entry is approximately 200 bytes (name, token, holder, expiry).
+
+$$
+\text{storage} = 10{,}000 \text{ concurrent locks} \times 200\text{ B} = 2\text{ MB}
+$$
+
+The Raft log grows at the rate of lock operations. With 10K ops/sec and log compaction (snapshots) every 60 seconds, the log retains at most:
+
+$$
+\text{log size} = 10{,}000 \text{ ops/s} \times 60\text{ s} \times 200\text{ B} = 120\text{ MB per compaction window}
+$$
+
+Storage is never the bottleneck for a lock service. CPU, network RTT, and Raft pipeline depth are the limiting factors.
+
+</Capacity>
+
+## API design
+
+The API surface is deliberately small — a lock service that tries to be too clever becomes too risky to depend on.
+
+```
+POST   /v1/locks/{name}/acquire
+Body:  { ttlSec: 30, clientId: "svc-inventory-7b4f", options: { waitMs: 5000 } }
+Response 200: { token: 10042, expiresAt: "2026-05-07T12:00:30Z", acquired: true }
+Response 200: { acquired: false }   (tryLock or waitMs timeout)
+
+DELETE /v1/locks/{name}
+Body:  { token: 10042 }
+Response 204: lock released
+Response 409: token mismatch — caller does not hold the lock
+
+POST   /v1/locks/{name}/renew
+Body:  { token: 10042, extensionSec: 30 }
+Response 200: { expiresAt: "2026-05-07T12:01:00Z" }
+Response 410: lease expired — must reacquire
+
+POST   /v1/locks/{name}/try-acquire
+Body:  { ttlSec: 30, clientId: "svc-cron-abc1" }
+Response 200: { token: 10043, expiresAt: "...", acquired: true }
+Response 200: { acquired: false }   (lock currently held, returns immediately)
+
+GET    /v1/locks/{name}/watch
+Response: Server-Sent Events stream
+  event: acquired  data: { token: 10042, holder: "svc-inventory-7b4f" }
+  event: released  data: { token: 10042 }
+  event: expired   data: { token: 10042 }
+```
+
+The `token` field in every response is the fencing token — callers must forward this to every write they make to a protected resource. The `clientId` is used for observability and for detecting reentrant callers (you can reject a second acquisition from the same client if reentrancy is disabled). The `waitMs` option in `acquire` enables fair queuing: the client blocks up to `waitMs` milliseconds for the lock to become available rather than returning immediately and requiring the caller to poll.
+
+## Data model
+
+Each lock is a single record in the distributed state machine replicated via Raft. The Raft log index serves as the fencing token — it is globally monotonically increasing because Raft never reuses a log index, and it increases on every state machine transition (not just on acquisitions).
+
+```
+LockEntry {
+  name:      string          // "inventory/item-42"  (primary key)
+  token:     int64           // Raft log index at time of last acquisition — the fencing token
+  holder:    string          // client ID of current holder — "" if free
+  expiresAt: timestamp       // wall time when the lease expires
+  version:   int64           // Raft log index of the last modification — used for optimistic CAS
+}
+```
+
+The lock service also maintains a sorted expiry queue (min-heap by `expiresAt`) so that a background goroutine can efficiently scan for expired leases without full-table scans. When a lease expires, the background process writes a `Release` entry to the Raft log — this ensures the expiry is also replicated and ordered consistently, not just applied locally on the leader.
+
+The protected resource (the service that the lock guards) maintains one additional field:
+
+```
+Resource {
+  ...its normal fields...
+  lastSeenFencingToken: int64   // rejects writes with token <= this value
+}
+```
+
+This field is the core of the fencing token mechanism. Without it, the lock service cannot prevent stale clients from corrupting data.
+
+## High-level architecture
+
+<Mermaid caption="Lock acquisition flow: Client → Raft Leader → Followers → LockHandle returned → fencing token forwarded to protected resource" diagram={`sequenceDiagram
+  autonumber
+  participant C as Client
+  participant L as Raft Leader
+  participant F1 as Follower 1
+  participant F2 as Follower 2
+  participant R as Protected Resource
+
+  C->>L: acquire("inventory/item-42", ttl=30s)
+  L->>L: append AcquireLock to Raft log (index=10042)
+  par replicate to quorum
+    L->>F1: AppendEntries(index=10042)
+    L->>F2: AppendEntries(index=10042)
+    F1-->>L: ack
+    F2-->>L: ack
+  end
+  L->>L: commit (quorum = 3/5)
+  L-->>C: LockHandle { token=10042, expiresAt=T+30s }
+
+  Note over C,R: Client now holds lock — writes to protected resource
+
+  C->>R: write(data, fencingToken=10042)
+  R->>R: check: 10042 > lastSeen(10041) → accept
+  R-->>C: 200 OK, lastSeen updated to 10042
+
+  Note over C,L: Client must renew before T+30s
+
+  C->>L: renew("inventory/item-42", token=10042, extensionSec=30)
+  L-->>C: expiresAt=T+60s
+
+  Note over C,R: Crash scenario — Client B acquires after TTL expiry
+
+  L->>L: TTL expired, write Release to Raft log (index=10043)
+  C->>L: acquire("inventory/item-42", ttl=30s)
+  L-->>C: LockHandle { token=10044, expiresAt=T+90s }
+  C->>R: write(data, fencingToken=10044)
+  R->>R: check: 10044 > lastSeen(10042) → accept
+  R-->>C: 200 OK`} />
+
+## Deep dives
+
+### Raft consensus internals
+
+Raft divides time into terms. Each term begins with a leader election: when a follower stops hearing heartbeats from the leader for a randomized timeout (150–300 ms, randomized to prevent split votes), it increments its term, transitions to candidate, and sends `RequestVote` RPCs to peers. A candidate becomes leader when it receives votes from a majority (⌊N/2⌋ + 1 nodes for an N-node cluster). Because the timeout is randomized, one node almost always calls the election before others, winning the vote before peers become candidates themselves.
+
+Once elected, the leader replicates log entries by sending `AppendEntries` RPCs to all followers. A log entry is "committed" — and its corresponding state machine operation applied — only when the leader has received acknowledgments from a majority. This commit rule is the key to linearizability: any two operations that are committed must have had their log entries ordered relative to each other, because you cannot get a majority acknowledgment for entry N without entry N-1 also being durably stored on a majority. Any two clients racing to acquire the same lock must both go through the Raft leader; their `AppendEntries` RPCs arrive in some order; one wins and its log entry is committed first; the other's acquisition fails because the lock is now held.
+
+For lock services specifically, Raft has an additional subtlety: reads must be linearizable too. A naïve implementation might serve reads from any follower, but a follower can be stale by up to one heartbeat period. If a client asks "is lock X held?" from a stale follower, it might get "no" when the leader has already granted it to someone else. To serve linearizable reads, the leader must confirm it is still the leader by sending a round-trip heartbeat to a quorum before responding. etcd calls this "linearized reads" and enables them with the `WithSerializable(false)` option (the default). ZooKeeper has a similar concept — reads from a ZK leader with sync are linearizable.
+
+### The GC pause problem and fencing tokens
+
+The attack scenario in full detail: client A acquires lock `orders/batch-export` with token 99 and a 30-second TTL. At second 25, the JVM triggers a full GC pause that lasts 18 seconds. The lock service, seeing no renewal heartbeat, expires the lease at second 30. Client B acquires the same lock at second 31, receiving token 100. Client B begins writing batch export data to S3 and to the orders database. At second 43, client A's GC pause ends. A does not know it was paused — it checks `System.currentTimeMillis()` and sees it is second 43, 18 seconds past its lease start, which is within the 30-second TTL from A's perspective (because A measured the TTL from before the pause). A proceeds to write to the orders database with token 99.
+
+Without fencing token enforcement, both A and B are writing concurrently. Their writes interleave. The batch export is corrupt, but no exception was thrown anywhere — both clients received successful HTTP 200s from the database.
+
+With fencing tokens enforced by the protected resource: when client B acquired the lock, the orders database also stored `lastSeenFencingToken = 100`. When client A attempts to write with token 99, the database checks `99 <= 100` and rejects the write with a `409 Conflict` (stale fencing token). Client A receives an error, logs it, and aborts. Client B's writes are consistent and uncorrupted.
+
+The critical implementation point: the lock service alone cannot enforce fencing. The lock service has already expired A's lease and knows nothing about A anymore. Only the protected resource, which remembers the highest token it has accepted, can make this check. This means fencing tokens only work when you own or can modify the protected resource. For legacy databases or third-party systems that do not support fencing token columns, you are back to relying on TTL alone — a weaker guarantee that you should document explicitly.
+
+### Lease renewal and failure detection
+
+The renewal interval should be TTL / 3, not TTL / 2. The reasoning: at TTL / 3, a client has two full renewal intervals to retry if the first attempt fails due to a transient network blip. With exponential backoff starting at 100 ms and a ceiling of 5 seconds, two retries within 10 seconds (for TTL=30) is very achievable even on a flaky network.
+
+The client-side implementation must be proactive, not reactive. Do not wait for the lock to expire and then scramble to renew. Use a background thread or scheduled executor that wakes at TTL/3 intervals and fires the renewal RPC. If renewal fails after all retries, the client must stop accessing the critical section immediately — not wait for the TTL to elapse. The client knows its lease is in danger; the correct response is to fence itself off from the protected resource and surface an error. A client that keeps writing after it believes its renewal failed is a liability even if the lease hasn't actually expired yet.
+
+Automatic lease expiry on the server side uses a background goroutine that periodically scans the expiry min-heap and writes a `Release` Raft log entry for any lock with `expiresAt < now`. The Raft commit of this release entry is the canonical moment when the lock becomes free — this ensures the expiry event is ordered and replicated, not just applied locally on the current leader. If the leader crashes mid-expiry, the new leader will re-run the expiry scan and commit the release, ensuring no lock is permanently orphaned.
+
+### Redis vs. etcd: correctness is not optional
+
+Redis Redlock is the most commonly proposed distributed lock algorithm that is also the most commonly misunderstood. The algorithm: acquire a lock with `SET NX EX` on N independent Redis nodes (N=5 is canonical), using a wall-clock timer to measure how long acquisition took. If a majority of nodes responded within TTL/2, you hold the lock. Otherwise, delete the keys from all nodes and retry.
+
+Martin Kleppmann's 2016 analysis identified the fundamental flaw: Redlock relies on the assumption that wall clocks across Redis nodes are synchronized and not subject to GC pauses or NTP jumps. Neither is true in practice. Scenario: a client acquires the lock on 3/5 nodes. Node 3 experiences a GC pause and its clock jumps forward by 10 seconds when it resumes. Node 3 now believes the lease has expired. A second client can now acquire the lock on nodes 3, 4, and 5 — a majority. Both clients believe they hold the lock. The lock service has failed at its only job.
+
+The rebuttal from Redlock's author (antirez) was that the failure scenario requires unrealistically long GC pauses. Kleppmann's counter-rebuttal: the entire point of a lock is to provide safety guarantees in the presence of exactly these failure modes. If you only need the lock to work when nothing goes wrong, you don't need a lock.
+
+The correct comparison is:
+
+- **Single Redis `SET NX EX`**: correct within a single node's lifetime. Fails if the node crashes before the key expires. Acceptable for low-stakes best-effort use cases.
+- **Redlock**: incorrect under adversarial timing. Do not use for anything where data corruption is unacceptable.
+- **etcd or ZooKeeper**: linearizable, correct by construction. Slower (5–10 ms) but sound.
+- **Database `SELECT FOR UPDATE`**: serializable isolation, correct. High latency (10–50 ms), does not scale beyond a single database.
+
+For staff-level interviews: recommend etcd for new systems, ZooKeeper if it already exists in the stack, and document why Redis is off the table for safety-critical locks.
+
+## Java integration
+
+### Part A — etcd-based distributed lock
+
+```java
+package dev.pushkar.lock;
+
+import io.etcd.jetcd.Client;
+import io.etcd.jetcd.Lock;
+import io.etcd.jetcd.lock.LockResponse;
+import io.etcd.jetcd.ByteSequence;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CompletableFuture;
+
+public final class EtcdDistributedLock implements AutoCloseable {
+
+    private final Client client;
+    private final Lock lockClient;
+    private final long leaseTtlSec;
+
+    public EtcdDistributedLock(String etcdEndpoint, long leaseTtlSec) {
+        this.client = Client.builder().endpoints(etcdEndpoint).build();
+        this.lockClient = client.getLockClient();
+        this.leaseTtlSec = leaseTtlSec;
+    }
+
+    /**
+     * Blocking acquire — waits until the lock is granted or the thread is interrupted.
+     * Returns a LockHandle containing the fencing token (Raft revision).
+     */
+    public LockHandle acquire(String lockName) throws Exception {
+        var leaseClient = client.getLeaseClient();
+
+        // Grant a lease — if this client crashes, etcd auto-revokes the lease after TTL seconds
+        long leaseId = leaseClient.grant(leaseTtlSec).get().getID();
+
+        // KeepAlive renews the lease in the background every TTL/3 seconds
+        var keepAlive = leaseClient.keepAlive(
+            leaseId,
+            io.etcd.jetcd.support.CloseableClient.KEEP_ALIVE_OBSERVER
+        );
+
+        ByteSequence key = ByteSequence.from(lockName, StandardCharsets.UTF_8);
+
+        // lockClient.lock() blocks until the lock is acquired (etcd queues waiters internally)
+        LockResponse resp = lockClient.lock(key, leaseId).get();
+
+        // The Raft cluster revision is our fencing token — globally monotonically increasing
+        long fencingToken = resp.getHeader().getRevision();
+
+        return new LockHandle(lockName, leaseId, fencingToken, resp.getKey(), keepAlive);
+    }
+
+    /**
+     * Non-blocking tryLock — returns empty if lock is currently held.
+     */
+    public java.util.Optional<LockHandle> tryAcquire(String lockName) throws Exception {
+        var leaseClient = client.getLeaseClient();
+        long leaseId = leaseClient.grant(leaseTtlSec).get().getID();
+
+        var keepAlive = leaseClient.keepAlive(
+            leaseId,
+            io.etcd.jetcd.support.CloseableClient.KEEP_ALIVE_OBSERVER
+        );
+
+        ByteSequence key = ByteSequence.from(lockName, StandardCharsets.UTF_8);
+
+        try {
+            LockResponse resp = lockClient.lock(key, leaseId)
+                .get(100, java.util.concurrent.TimeUnit.MILLISECONDS);
+            long fencingToken = resp.getHeader().getRevision();
+            return java.util.Optional.of(
+                new LockHandle(lockName, leaseId, fencingToken, resp.getKey(), keepAlive)
+            );
+        } catch (java.util.concurrent.TimeoutException e) {
+            // Lock is contested — revoke the lease and return empty
+            keepAlive.close();
+            leaseClient.revoke(leaseId).get();
+            return java.util.Optional.empty();
+        }
+    }
+
+    /**
+     * Release the lock. Always call this in a finally block.
+     */
+    public void release(LockHandle handle) throws Exception {
+        try {
+            lockClient.unlock(handle.key()).get();
+        } finally {
+            handle.keepAlive().close();
+            client.getLeaseClient().revoke(handle.leaseId()).get();
+        }
+    }
+
+    @Override
+    public void close() {
+        client.close();
+    }
+
+    public record LockHandle(
+        String name,
+        long leaseId,
+        long fencingToken,
+        ByteSequence key,
+        io.etcd.jetcd.support.CloseableClient keepAlive
+    ) {}
+}
+```
+
+### Part B — Spring Boot service using the lock
+
+```java
+package dev.pushkar.inventory;
+
+import dev.pushkar.lock.EtcdDistributedLock;
+import org.springframework.boot.ApplicationArguments;
+import org.springframework.boot.ApplicationRunner;
+import org.springframework.stereotype.Component;
+import org.springframework.stereotype.Service;
+
+import java.time.Duration;
+
+@Service
+public class CriticalSectionService {
+
+    private final EtcdDistributedLock locker;
+    private final InventoryRepository repo;
+
+    public CriticalSectionService(EtcdDistributedLock locker, InventoryRepository repo) {
+        this.locker = locker;
+        this.repo = repo;
+    }
+
+    /**
+     * Deducts inventory units for a product, protected by a distributed lock.
+     * The fencing token is forwarded into the DB write — the DB rejects stale tokens.
+     */
+    public void deductInventory(String productId, int qty) throws Exception {
+        String lockName = "inventory/" + productId;
+        EtcdDistributedLock.LockHandle handle = locker.acquire(lockName);
+        try {
+            // Pass fencing token into DB write — DB rejects writes where token <= lastSeenToken
+            repo.deductWithFence(productId, qty, handle.fencingToken());
+        } finally {
+            // Critical: always release in finally. An exception in the critical section
+            // must not leave the lock held for the full TTL duration.
+            locker.release(handle);
+        }
+    }
+}
+
+@Component
+public class DistributedLeaderElection implements ApplicationRunner {
+
+    private static final org.slf4j.Logger log =
+        org.slf4j.LoggerFactory.getLogger(DistributedLeaderElection.class);
+
+    private final EtcdDistributedLock locker;
+
+    public DistributedLeaderElection(EtcdDistributedLock locker) {
+        this.locker = locker;
+    }
+
+    /**
+     * Continuously campaigns for leader — only one instance holds the lock at a time.
+     * When the leader crashes or releases, the next instance acquires immediately.
+     */
+    @Override
+    public void run(ApplicationArguments args) throws Exception {
+        while (!Thread.currentThread().isInterrupted()) {
+            EtcdDistributedLock.LockHandle handle = locker.acquire("leader/scheduler");
+            log.info("Became leader, fencing token={}", handle.fencingToken());
+            try {
+                runAsLeader(handle.fencingToken());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } finally {
+                locker.release(handle);
+                log.info("Released leadership");
+            }
+        }
+    }
+
+    /**
+     * Performs leader-only work. If the lease is lost (KeepAlive fails),
+     * the etcd client will surface an error on the next operation — the leader
+     * must check its own liveness and stop work promptly.
+     */
+    private void runAsLeader(long fencingToken) throws InterruptedException {
+        // Do leader work — run cron jobs, coordinate cluster state, etc.
+        // In production this loop checks a liveness flag that the KeepAlive thread flips
+        // when it cannot renew the lease.
+        Thread.sleep(Duration.ofSeconds(30));
+    }
+}
+```
+
+The `deductWithFence` repository method on the database side looks like this (Postgres example):
+
+```sql
+UPDATE inventory
+SET    quantity = quantity - :qty,
+       last_fencing_token = :token
+WHERE  product_id = :productId
+  AND  :token > last_fencing_token
+  AND  quantity >= :qty;
+```
+
+If the `UPDATE` affects 0 rows because `:token <= last_fencing_token`, the application code detects this via `rowsAffected == 0` and throws a `StaleLockException`. This is the resource-side enforcement that makes fencing tokens work — without this SQL clause, the lock service provides no safety guarantee against GC pauses.
+
+<TradeoffTable title="Distributed locking implementation comparison">
+
+| Implementation | Correctness | Latency | Availability | When to use |
+|---|---|---|---|---|
+| Single Redis `SET NX EX` | Weak (node crash loses lock) | ~0.5 ms | Single-node SPOF | Low-stakes, best-effort coordination |
+| Redis Redlock (5 nodes) | Flawed (clock-dependent) | ~2 ms | Good | Avoid — use etcd instead |
+| etcd (Raft) | Linearizable | ~5 ms | 5-node quorum | Production mutual exclusion |
+| ZooKeeper (ZAB) | Linearizable | ~5–10 ms | 5-node quorum | Existing ZK infra |
+| Database (`SELECT FOR UPDATE`) | Serializable | ~10 ms | Follows DB HA | Simple cases, low contention |
+
+</TradeoffTable>
+
+<Pitfall title="Trusting TTL as your only safety guarantee">
+
+If the lock service is partitioned or the client experiences a GC pause, two clients can simultaneously believe they hold the lock after TTL expiry on different sides of a partition. TTL gives you liveness (the lock eventually becomes free) but not safety (at-most-one-holder). Fencing tokens with resource-side enforcement are required for true mutual exclusion. If the protected resource cannot implement fencing token checks — a legacy database, a third-party API — document this explicitly and accept that your "lock" is a best-effort coordination hint, not a correctness primitive.
+
+</Pitfall>
+
+<Pitfall title="Not releasing the lock in a finally block">
+
+An exception thrown inside the critical section — a NullPointerException, a database constraint violation, an HTTP timeout — will unwind the call stack and skip the `locker.release(handle)` call if it is not inside a `finally` block. The lock then remains held until the TTL expires, blocking all contending clients for up to 30 seconds. In a high-contention scenario (e.g., leader election across 50 service instances), this blocks your entire fleet from electing a leader for the full TTL duration. Always structure lock usage as acquire → try → finally-release, and strongly prefer `AutoCloseable` patterns that enforce this structurally.
+
+</Pitfall>
+
+<Curveball question="The Raft leader goes down while a client holds a lock. A new leader is elected. Is the lock still valid? How does the client know?">
+
+The lock state — name, token, holder, expiresAt — is replicated across all Raft nodes, not stored only on the leader. When the new leader is elected, it immediately has the full lock state from the committed Raft log. The lock is still valid as long as `expiresAt > now`. The client holding the lock does not need to reacquire. However, the KeepAlive connection the client established to the old leader is severed — the gRPC stream will return an error. The jetcd KeepAlive implementation automatically reconnects and reattaches the keepalive to the new leader's endpoint. The operational risk is the gap between the old leader crashing and the new leader becoming available: Raft leader election takes roughly 2–3 election timeout periods (300–900 ms with 150–300 ms randomized timeouts). If the TTL is 30 seconds and the election takes 1 second, the client has 29 seconds of remaining lease. For TTLs below 5 seconds, leader election can eat into the safety margin — size your TTLs accordingly or use a minimum floor of 15 seconds.
+
+</Curveball>
+
+<Curveball question="You need 1,000 concurrent distributed locks — one per active customer session — each held for up to 5 minutes. Does etcd scale to this? What is the practical limit?">
+
+One thousand concurrent leases is trivially within etcd's capacity — etcd is documented to handle tens of thousands of keys and thousands of concurrent watchers. The issue is not scale at 1K; it is the renewal storm at 5-minute TTLs. With a 5-minute TTL and TTL/3 renewal interval, each lock generates a renewal RPC every 100 seconds. At 1,000 locks, that is 10 renewals per second — completely negligible. The practical etcd limit is roughly 10,000–50,000 concurrent leases before you see lease management overhead affecting write throughput. At 50,000 concurrent session locks you would start thinking about sharding: partition your key namespace across multiple etcd clusters (e.g., by hashing customer ID), each cluster owning a subset of sessions. The session-locking pattern works well with etcd precisely because session locks are low-contention — each lock is only ever contested by at most a few instances of the same service, not by the entire fleet.
+
+</Curveball>
+
+<Curveball question="A microservice needs to perform a write, then call an external API, then do another write — all under one lock. The external API call takes 8 seconds but your lock TTL is 10 seconds. What is your strategy?">
+
+Four options, in order of preference:
+
+**Option 1 — Increase the TTL.** If the external API call reliably takes 8 seconds and your critical section requires it, set TTL to 60 seconds and accept 60-second recovery time after a crash. Adjust the renewal interval to 20 seconds. This is the simplest fix if the external API latency is bounded and the longer recovery window is acceptable.
+
+**Option 2 — Move the external call outside the lock.** Restructure the workflow: acquire lock → first write → release lock → call external API → reacquire lock → second write. The external API result is idempotent (fetch an exchange rate, validate a coupon code) so it can be computed outside the critical section. Dramatically reduces lock hold time.
+
+**Option 3 — Use a saga with optimistic locking.** Do not use a distributed lock at all for the orchestration. Use database-level optimistic locking (version columns) for the individual writes and treat the external API as an eventually consistent side effect. This is the correct architecture for long-running business transactions.
+
+**Option 4 — Adaptive TTL extension.** Before calling the external API, call `renew` to extend the lease by an additional 30 seconds. If the renewal fails (lock service unavailable), abort the entire workflow before the external API call — do not proceed and hold state in the critical section with a lock you cannot verify. This is operationally fragile and requires explicit failure handling, but keeps the option open when the critical section genuinely cannot be decomposed.
+
+</Curveball>
+
+<RelatedQuestions items={[
+  { slug: "distributed-kv-store", title: "Design a Distributed KV Store", difficulty: "staff" },
+  { slug: "distributed-unique-id-generator", title: "Design a Distributed Unique ID Generator", difficulty: "mid" },
+  { slug: "distributed-rate-limiter", title: "Design a Distributed Rate Limiter", difficulty: "mid" },
+]} />
+
+## Further reading
+
+- [The Chubby Lock Service for Loosely-Coupled Distributed Systems (Burrows, 2006)](https://research.google/pubs/pub27897/) — The original Google paper describing Chubby's design: lock service semantics, lease-based sessions, and the philosophy of building coordination primitives rather than general-purpose storage
+- [How to do distributed locking (Martin Kleppmann, 2016)](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html) — The canonical critique of Redlock, introducing fencing tokens as the correct solution to the GC pause problem; required reading before any distributed lock design discussion
+- [etcd documentation — distributed locking](https://etcd.io/docs/v3.5/dev-guide/api_concurrency_reference_v3/) — Reference for the Lock and LeaderElection APIs used in production etcd deployments, including the gRPC protobuf definitions
+- [In Search of an Understandable Consensus Algorithm (Ongaro and Ousterhout, 2014)](https://raft.github.io/raft.pdf) — The Raft paper: leader election, log replication, safety proofs, and cluster membership changes — the consensus protocol underlying etcd and most modern distributed lock services

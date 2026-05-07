@@ -1,0 +1,61 @@
+---
+// No props — slot should contain bullet list or short paragraphs
+---
+
+<aside class="tldr" role="note" aria-label="Summary">
+  <div class="tldr__header">
+    <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true">
+      <circle cx="6.5" cy="6.5" r="5.5" stroke="currentColor" stroke-width="1.4"/>
+      <path d="M6.5 3.5v3.2l1.8 1.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+    </svg>
+    TL;DR
+  </div>
+  <div class="tldr__body">
+    <slot />
+  </div>
+</aside>
+
+<style>
+  .tldr {
+    background: var(--accent-soft);
+    border: 1px solid var(--accent-line);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--r-md);
+    margin: 2rem 0;
+    overflow: hidden;
+  }
+  .tldr__header {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.55rem 1.125rem;
+    color: var(--accent);
+    font-family: 'Geist', system-ui, sans-serif;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--accent-line);
+  }
+  .tldr__body {
+    padding: 0.875rem 1.125rem;
+    font-size: 0.9375rem;
+    line-height: 1.7;
+    color: var(--ink-2);
+  }
+  .tldr__body :global(ul) {
+    margin: 0;
+    padding-left: 1.2rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+  .tldr__body :global(li) { margin: 0; }
+  .tldr__body :global(p) { margin: 0; }
+  .tldr__body :global(code) {
+    font-size: 0.85em;
+    background: rgba(232, 184, 122, 0.12);
+    padding: 0.1em 0.35em;
+    border-radius: 4px;
+  }
+</style>

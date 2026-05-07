@@ -1,0 +1,490 @@
+---
+title: "Design a Live Sports Score System"
+slug: "live-sports-scores"
+category: "realtime"
+difficulty: "mid"
+estimatedReadMinutes: 18
+tags: ["websocket", "redis", "kafka", "fan-out", "pub-sub", "SSE"]
+companyFlavors: ["ESPN", "Bleacher Report", "Google Sports", "Yahoo Sports"]
+relatedQuestions: ["stock-trading-exchange", "collaborative-editor", "online-auction"]
+publishedAt: "2025-01-07"
+updatedAt: "2025-01-07"
+summary: "Ingest score events from sports data feeds, fan-out updates to millions of concurrent WebSocket and SSE connections, and maintain a globally consistent live scoreboard with sub-second latency."
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+
+<Bookmark slug="live-sports-scores" title="Design a Live Sports Score System" />
+
+<Tldr>
+- **Redis as the source of truth for live state**: every game's current score lives in a Redis hash so any connection server can reconstruct a snapshot for reconnecting clients without touching a database.
+- **Kafka decouples ingestion from fan-out**: the ingest service writes to a Kafka topic partitioned by `gameId`; fan-out workers consume and publish to Redis Pub/Sub channels, letting each layer scale independently.
+- **One Redis Pub/Sub channel per game, not per client**: connection servers aggregate subscriptions internally and maintain in-memory `gameId → Set<WebSocketSession>` maps, keeping Redis Pub/Sub channel count bounded to the number of active games.
+- **Client-side reconciliation via event log**: a Redis sorted set keyed by timestamp lets reconnecting clients replay missed events using `ZRANGEBYSCORE`, making reconnection stateless on the server side.
+- **SSE and WebSocket coexist**: SSE's built-in `Last-Event-ID` replay covers browser clients; WebSocket covers mobile and low-latency clients; both connect to the same connection-server fleet backed by the same Redis Pub/Sub layer.
+</Tldr>
+
+## The scale of the problem
+
+Live sports has some of the most brutal fan-out characteristics in consumer tech — the final minute of a World Cup match can spike to tens of millions of concurrent connections, all expecting updates within a second of the real event. Unlike social feeds, sports scores are not personalized: every subscriber to the same game receives an identical payload. This property makes the fan-out problem tractable, but it also concentrates load: a single goal can trigger 8–10 million simultaneous pushes within 500 milliseconds, all originating from a single score event that arrived through a data provider webhook.
+
+The challenge is not ingestion. Sports data providers like Sportradar and Stats Perform emit score events at a rate of a few hundred per second across all active games globally — an ingest rate any modern message bus handles trivially. The challenge is the asymmetry between ingest rate (hundreds of events per second) and outbound delivery rate (millions of messages per second) and the latency SLA that makes buffering dangerous. This makes live sports score systems a canonical fan-out problem, closely related to pub/sub infrastructure design and connection server architecture.
+
+## Clarifying questions
+
+| Question | Why It Matters | Typical Answer |
+|---|---|---|
+| Which sports types must be supported? | Different sports have different event schemas — soccer emits goals and cards, basketball emits points on every possession. Schema flexibility affects the data model. | Start with soccer and basketball; abstract event schema with a `sport` discriminator field for extensibility |
+| What is the update latency SLA? | Drives the choice between polling, SSE, and WebSocket. A 5-second SLA could use polling; a sub-second SLA requires persistent connections. | < 500ms p99 from data provider event to client delivery |
+| WebSocket, SSE, or polling? | Each protocol has different reconnect semantics, infrastructure cost, and client support. | Support both WebSocket (mobile, desktop apps) and SSE (browser fallback); deprecate polling |
+| What device types are in scope? | Native mobile apps may not support SSE natively; browsers may not support binary WebSocket frames. | Web browsers (SSE preferred), iOS/Android native apps (WebSocket), smart TVs (WebSocket) |
+| Does the system require authentication? | Authenticated users need session handling and token validation on WebSocket upgrade; unauthenticated public scores simplify the connection path. | Public live scores are unauthenticated; premium fantasy data requires JWT validation on connect |
+| Is historical score access required? | Historical scores could be served by a separate read path (OLAP or object storage). Affects whether the real-time pipeline needs to write to a durable store. | Yes — game summaries and event timelines must be queryable after the game ends |
+| Are push notifications in scope? | Push notifications require a separate pipeline (FCM/APNs) and a subscription management store, and are triggered by high-value events like goals. | Yes — goal and game-end events trigger push notifications |
+
+## Functional requirements
+
+- Ingest score events from official data providers (Sportradar, Stats Perform, Opta) via webhook and streaming API.
+- Fan-out score updates to all connected clients for a given game in real time with sub-500ms latency.
+- Support both WebSocket and Server-Sent Events (SSE) connection protocols from a unified backend.
+- Provide a REST API returning the current game state snapshot for initial page load and reconnects.
+- Trigger push notifications (FCM/APNs) for high-value events such as goals, touchdowns, and game end.
+- Support historical score lookup — event timeline and final scores for completed games.
+- Allow clients to subscribe to multiple games on a single WebSocket connection.
+
+## Non-functional requirements
+
+- **Scale**: 50M concurrent connections globally during peak events (e.g. World Cup final); 500 active games simultaneously at peak.
+- **Delivery latency**: p99 < 500ms from event ingestion at the data provider boundary to delivery at the connected client.
+- **Availability**: 99.99% uptime for the connection and ingestion paths; planned outages no longer than 52 minutes per year.
+- **Delivery guarantee**: at-least-once delivery with monotonically increasing event IDs; clients handle deduplication.
+- **Horizontal scalability**: connection servers must scale out without coordination; adding a new node should require only registration with the load balancer.
+- **Fault isolation**: a crash of one connection server must not affect clients connected to other servers; state must never be stored exclusively in connection-server memory.
+
+<Capacity title="Live Score Fan-out">
+
+**Scale assumptions**
+
+- 50M concurrent WebSocket connections globally at peak
+- 500 active games simultaneously at peak
+- Average game has 100K subscribers
+- Score event rate: ~10 events/min per game (goal, substitution, yellow card, offside, half-time, etc.)
+- Each event payload: ~500 bytes
+
+**Inbound event rate**
+
+$$500 \text{ games} \times \frac{10}{60} \text{ events/s} \approx 83 \text{ events/s inbound}$$
+
+Entirely manageable for a single Kafka cluster; this is not the bottleneck.
+
+**Fan-out message rate**
+
+$$83 \text{ events/s} \times 100{,}000 \text{ subscribers/game} = 8{,}300{,}000 \text{ messages/s outbound}$$
+
+This 100,000× amplification is the core engineering challenge.
+
+**Egress bandwidth**
+
+$$8{,}300{,}000 \text{ msg/s} \times 500 \text{ B} = 4.15 \text{ GB/s egress}$$
+
+Spread across 500 connection servers this is $\approx 8.3 \text{ MB/s per server}$ — well within 10 Gbps NIC capacity.
+
+**Connection server fleet**
+
+Assuming 100K WebSocket connections per server (tuned OS, epoll, non-blocking I/O):
+
+$$\lceil 50{,}000{,}000 / 100{,}000 \rceil = 500 \text{ connection servers}$$
+
+**Redis Pub/Sub channels**
+
+One channel per active game: **500 active Pub/Sub channels** at peak. This is extremely low — Redis handles millions of channels. The fan-out concern is subscribers per channel (500 connection servers × 500 games = up to 250,000 channel subscriptions across the fleet).
+
+**Redis sorted set storage for event replay**
+
+Each event: 500 B × 10 events/min × 90 min per game = 450 KB per game. For 500 games with 24-hour retention: $500 \times 450 \text{ KB} \approx 225 \text{ MB}$ — negligible for Redis.
+
+</Capacity>
+
+## API design
+
+```text
+WebSocket: wss://live.sports.com/ws?games=game-123,game-456
+  → Client sends: { "type": "SUBSCRIBE", "gameId": "game-123" }
+  → Server pushes ScoreEvent JSON on score changes:
+    { "eventId": "uuid", "gameId": "game-123", "eventType": "GOAL",
+      "homeScore": 2, "awayScore": 1, "minute": 87, "timestamp": 1704067200000 }
+  → Client sends: { "type": "RECONNECT", "gameId": "game-123", "lastEventId": "uuid" }
+  → Server replays missed events in order
+
+SSE: GET /stream/game/{gameId}
+  Headers: Accept: text/event-stream
+           Last-Event-ID: {lastEventId}  (on reconnect)
+  → Streams: id: {eventId}
+             data: {JSON payload}
+             \n\n
+
+REST: GET /api/v1/games/{gameId}/score
+  → 200 { "gameId": "game-123", "homeScore": 2, "awayScore": 1,
+           "status": "LIVE", "minute": 87, "lastEventId": "uuid" }
+
+REST: GET /api/v1/games?sport=soccer&status=live
+  → 200 { "games": [ { "gameId": "...", "homeTeam": "...", "awayTeam": "...",
+                        "homeScore": 2, "awayScore": 1, "status": "LIVE" } ] }
+
+POST /api/v1/games/{gameId}/subscribe
+  Body: { "deviceToken": "fcm-token-abc", "events": ["GOAL", "GAME_END"] }
+  → 204 No Content
+```
+
+## Data model
+
+**Score event (canonical payload)**
+
+```json
+{
+  "eventId": "uuid",
+  "gameId": "game-123",
+  "sport": "soccer",
+  "eventType": "GOAL",
+  "timestamp": 1704067200000,
+  "homeScore": 2,
+  "awayScore": 1,
+  "minute": 87,
+  "playerId": "player-456",
+  "teamId": "team-789",
+  "description": "Header from corner kick"
+}
+```
+
+**Redis game state hash** — mutable, updated on every event, TTL 48h after game end:
+
+```text
+HASH game:{gameId}:state
+  homeScore    → "2"
+  awayScore    → "1"
+  status       → "LIVE"
+  minute       → "87"
+  startedAt    → "1704063600000"
+  lastEventId  → "uuid-of-last-event"
+  sport        → "soccer"
+  homeTeam     → "Brazil"
+  awayTeam     → "Argentina"
+```
+
+**Redis sorted set for event replay** — append-only per game, score = millisecond timestamp:
+
+```text
+ZSET game:{gameId}:events
+  score:  1704067200000  (millisecond epoch)
+  member: {"eventId":"uuid","gameId":"game-123","eventType":"GOAL",...}
+```
+
+**Redis deduplication set** — prevents duplicate ingestion of provider retries:
+
+```text
+STRING event:dedup:{eventId}  →  "1"
+TTL: 24 hours
+SET NX (only set if not exists)
+```
+
+**Push notification subscription store (PostgreSQL)**
+
+```sql
+CREATE TABLE push_subscriptions (
+    subscription_id  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    game_id          varchar(64) NOT NULL,
+    device_token     text        NOT NULL,
+    platform         varchar(8)  NOT NULL CHECK (platform IN ('fcm', 'apns')),
+    event_types      text[]      NOT NULL,
+    created_at       timestamptz DEFAULT now(),
+    UNIQUE (game_id, device_token)
+);
+
+CREATE INDEX idx_push_subscriptions_game_id ON push_subscriptions(game_id);
+```
+
+## Architecture overview
+
+<Mermaid diagram={`flowchart TD
+    DP[Data Provider\\nSportradar / Opta] -->|Webhook POST\\nor streaming API| IS[Ingest Service]
+    IS -->|1. Dedup check SETNX| RC[Redis Cluster]
+    IS -->|2. HSET + ZADD Lua script| RC
+    IS -->|3. Produce gameId key| KF[Kafka\\nscore-events topic]
+    KF -->|Consume by gameId partition| FW[Fan-out Workers]
+    FW -->|PUBLISH game:gameId| RC
+    RC -->|Pub/Sub deliver| CS1[Connection Server 1]
+    RC -->|Pub/Sub deliver| CS2[Connection Server 2]
+    RC -->|Pub/Sub deliver| CSN[Connection Server N]
+    CS1 -->|Push ScoreEvent| WS[WebSocket Clients]
+    CS1 -->|Push ScoreEvent| SSE[SSE Clients]
+    CS2 -->|Push ScoreEvent| WS2[WebSocket Clients]
+    CSN -->|Push ScoreEvent| WS3[WebSocket Clients]
+    KF -->|Consume| PN[Push Notification\\nService]
+    PN -->|FCM / APNs| MOB[Mobile Clients]
+    RESTAPI[REST API Service] -->|HGETALL game:gameId:state| RC
+    RESTAPI -->|ZRANGEBYSCORE missed events| RC
+    CLIENT[Client Browser] -->|GET /api/v1/games/id/score| RESTAPI
+    CLIENT -->|WebSocket upgrade| CS1`} />
+
+The data flow follows a strict left-to-right pipeline. Data providers push events to the Ingest Service, which atomically updates Redis state and publishes to Kafka. Fan-out Workers consume from Kafka and relay to Redis Pub/Sub channels. Connection servers subscribe to relevant Pub/Sub channels and push events to connected WebSocket and SSE clients. The REST API serves the Redis hash directly for initial loads and reconnects, never touching a relational database on the hot path.
+
+## Deep dive: score ingestion pipeline
+
+Official sports data providers — Sportradar, Stats Perform, and Opta are the three dominant vendors — deliver events via two mechanisms: webhook HTTP POST (push) and persistent streaming APIs (pull via long-lived HTTP or WebSocket). The Ingest Service acts as a normalization and deduplication layer between the provider protocol and the internal Kafka topic.
+
+The ingestion steps for each event:
+
+**Step 1 — Schema validation and normalization.** Each provider uses a proprietary event schema. The Ingest Service maps provider-specific fields to the canonical `ScoreEvent` format using a per-provider transformer. Unknown `eventType` values are logged and dropped; schema violations trigger an alert but are not propagated downstream.
+
+**Step 2 — Idempotency check.** Providers guarantee at-least-once delivery — the same event may arrive multiple times (retries after network errors, provider restarts). A `SETNX event:dedup:{eventId} "1"` with a 24-hour TTL gates further processing. If `SETNX` returns 0 (key already exists), the event is a duplicate and is discarded immediately. This prevents duplicate score updates from being applied.
+
+**Step 3 — Atomic state update.** A Lua script executes atomically on Redis: `HSET game:{gameId}:state` updates the score, minute, and `lastEventId` fields; `ZADD game:{gameId}:events {timestamp} {payload}` appends the event to the sorted replay log. Using a Lua script ensures that the state hash and the event log are always consistent — no client can read a state hash that references an `lastEventId` not yet present in the sorted set.
+
+**Step 4 — Kafka publish.** The event is published to the `score-events` Kafka topic with key `gameId`. Kafka's default partitioner routes all events for the same game to the same partition, guaranteeing ordering within a game. Consumers on the same consumer group receive events in order per partition.
+
+**Step 5 — Fan-out Worker relay.** Fan-out Workers consume from Kafka and call `PUBLISH game:{gameId} {payload}` on Redis. Redis Pub/Sub delivers the message to all connection servers that have active subscribers for this game's channel. The Fan-out Worker does not know which connection servers are subscribed — Redis handles the delivery list.
+
+The separation between Kafka and Redis Pub/Sub is intentional. Kafka provides durability and replay semantics: if a Fan-out Worker crashes and restarts, it resumes from its last committed offset and no events are lost. Redis Pub/Sub provides zero-copy low-latency delivery but is ephemeral — a message published to a channel with no subscribers is simply discarded. Kafka is the durable buffer; Redis Pub/Sub is the low-latency delivery mechanism.
+
+## Deep dive: WebSocket fan-out architecture
+
+Each connection server maintains an in-memory `ConcurrentHashMap<String, Set<WebSocketSession>>` mapping `gameId` to the set of WebSocket sessions subscribed to that game. When a client connects and sends a `SUBSCRIBE` message for `game-123`, the connection server adds the session to the in-memory map and calls `SUBSCRIBE game:game-123` on its Redis connection if it is not already subscribed to that channel.
+
+The key design insight is that Redis Pub/Sub subscription count is bounded by the number of unique games that have at least one subscriber on a given connection server — not by the number of connected clients. A connection server with 100K clients all watching the same soccer final holds exactly one Redis Pub/Sub subscription for that game. When a Redis `PUBLISH` arrives on the channel, the connection server iterates its in-memory `Set<WebSocketSession>` and writes the event payload to each open session.
+
+**The thundering herd problem at reconnect.** WebSocket connections are long-lived but fragile. A connection server restart or network partition causes all 100K clients connected to that server to detect a broken connection and attempt to reconnect simultaneously. Without mitigation, this creates a spike of 100K TCP connection attempts within milliseconds — enough to saturate the load balancer and overwhelm the Redis AUTH pipeline for token validation.
+
+Mitigation strategies:
+
+- **Exponential backoff with full jitter on the client.** The reconnect interval is sampled uniformly from `[0, min(cap, base × 2^attempt)]`. With `base = 1s` and `cap = 30s`, the first reconnect wave is spread over a 1-second window; subsequent waves spread further. This converts a synchronized spike into a smooth ramp.
+- **Load balancer connection rate limiting.** Cap new connection attempts per second per IP subnet at the load balancer (HAProxy or AWS ALB). Clients that exceed the rate are returned `HTTP 429` with a `Retry-After` header, which the client SDK respects.
+- **Graceful connection draining on server restart.** Before a connection server restarts (rolling deploy), it sends a WebSocket `GOING_AWAY` close frame with a `Retry-After` hint. Clients stagger their reconnects based on the hint, spreading the reconnect load over 30–60 seconds rather than 0 seconds.
+
+**Large game events and channel fan-out.** For a World Cup final with 8M subscribers across 500 connection servers, a single goal triggers 8M WebSocket writes. The bottleneck is not Redis Pub/Sub (it delivers to 500 connection servers in microseconds) but the connection server's per-session write loop. Each connection server must write the same 500-byte payload to 16K sessions (8M / 500 servers). At 16K `session.sendMessage()` calls on a connection pool with async I/O, modern Java (NIO with Virtual Threads or Netty) handles this in under 100ms per server — well within the 500ms SLA.
+
+## Deep dive: missed events and client reconciliation
+
+WebSocket connections drop — mobile clients switch between Wi-Fi and cellular, browser tabs suspend, VPNs reconnect. When a client reconnects, it must recover the score state without requiring a full page reload and without missing goals that occurred during the outage.
+
+**Reconnect protocol for WebSocket clients.** The client stores the `eventId` and `timestamp` of the last event it successfully processed. On reconnect, it sends:
+
+```json
+{ "type": "RECONNECT", "gameId": "game-123", "lastEventTimestamp": 1704067100000 }
+```
+
+The connection server executes:
+
+```text
+ZRANGEBYSCORE game:{gameId}:events (1704067100000 +inf
+```
+
+The open-bracket prefix makes the range exclusive of the last-seen timestamp, preventing replay of the already-processed event. The server returns all missed events in ascending timestamp order, and the client applies them sequentially. After replay completes, the connection server adds the client to its in-memory subscription map for ongoing delivery.
+
+**SSE native reconnect.** SSE handles this natively per the W3C specification. When the browser detects a dropped SSE connection, it automatically reconnects and includes the `Last-Event-ID` header set to the `id:` field of the last received event. The SSE endpoint extracts this header and runs the same `ZRANGEBYSCORE` query, replaying missed events before switching to live delivery. No client-side reconnect logic is required beyond standard browser behavior.
+
+**Sorted set TTL management.** The event replay sorted set `game:{gameId}:events` is retained for 24 hours after the game ends (game `status` field transitions to `FINAL`). A background job (scheduled Lambda or Kubernetes CronJob) scans for games that ended more than 24 hours ago and runs `DEL game:{gameId}:events`. The game state hash is retained longer (7 days) to serve the historical score REST API without hitting a database.
+
+## Java integration — Part A: ScoreFanoutService
+
+```java
+@Service
+@RequiredArgsConstructor
+public class ScoreFanoutService {
+
+    private final RedisTemplate<String, String> redis;
+    private final KafkaTemplate<String, ScoreEvent> kafka;
+    private final ObjectMapper mapper;
+
+    private static final String STATE_KEY = "game:%s:state";
+    private static final String EVENTS_KEY = "game:%s:events";
+    private static final String PUBSUB_CHANNEL = "game:%s";
+
+    public void ingestEvent(ScoreEvent event) {
+        String gameId = event.getGameId();
+        String stateKey = STATE_KEY.formatted(gameId);
+        String eventsKey = EVENTS_KEY.formatted(gameId);
+
+        try {
+            String payload = mapper.writeValueAsString(event);
+            String dedupKey = "event:dedup:" + event.getEventId();
+
+            Boolean isNew = redis.opsForValue().setIfAbsent(dedupKey, "1",
+                Duration.ofHours(24));
+            if (Boolean.FALSE.equals(isNew)) return;
+
+            redis.executePipelined((RedisCallback<Object>) conn -> {
+                byte[] key = stateKey.getBytes();
+                conn.hSet(key, "homeScore".getBytes(),
+                    String.valueOf(event.getHomeScore()).getBytes());
+                conn.hSet(key, "awayScore".getBytes(),
+                    String.valueOf(event.getAwayScore()).getBytes());
+                conn.hSet(key, "lastEventId".getBytes(),
+                    event.getEventId().getBytes());
+                conn.zAdd(eventsKey.getBytes(),
+                    event.getTimestamp(), payload.getBytes());
+                conn.expire(eventsKey.getBytes(), 86400);
+                return null;
+            });
+
+            kafka.send("score-events", gameId, event);
+
+            String channel = PUBSUB_CHANNEL.formatted(gameId);
+            redis.convertAndSend(channel, payload);
+
+        } catch (JsonProcessingException e) {
+            throw new ScoreIngestionException(
+                "Serialization failed for event " + event.getEventId(), e);
+        }
+    }
+
+    public List<ScoreEvent> getMissedEvents(String gameId, long sinceTimestamp) {
+        String eventsKey = EVENTS_KEY.formatted(gameId);
+        Set<String> raw = redis.opsForZSet()
+            .rangeByScore(eventsKey, sinceTimestamp + 1, Double.MAX_VALUE);
+        return raw.stream()
+            .map(json -> {
+                try { return mapper.readValue(json, ScoreEvent.class); }
+                catch (JsonProcessingException e) { throw new RuntimeException(e); }
+            })
+            .collect(Collectors.toList());
+    }
+}
+```
+
+## Java integration — Part B: LiveScoreWebSocketHandler
+
+```java
+@Component
+@RequiredArgsConstructor
+public class LiveScoreWebSocketHandler extends TextWebSocketHandler
+    implements MessageListener {
+
+    private final ConcurrentHashMap<String, Set<WebSocketSession>> gameSessions =
+        new ConcurrentHashMap<>();
+    private final RedisTemplate<String, String> redis;
+    private final ScoreFanoutService fanoutService;
+    private final ObjectMapper mapper;
+
+    @Override
+    public void afterConnectionEstablished(WebSocketSession session) {
+        String gameId = extractGameId(session.getUri().getQuery());
+        gameSessions.computeIfAbsent(gameId, k -> ConcurrentHashMap.newKeySet())
+            .add(session);
+    }
+
+    @Override
+    public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
+        gameSessions.values().forEach(sessions -> sessions.remove(session));
+    }
+
+    @Override
+    protected void handleTextMessage(WebSocketSession session, TextMessage message)
+            throws Exception {
+        ReconnectRequest req = mapper.readValue(message.getPayload(), ReconnectRequest.class);
+        if ("RECONNECT".equals(req.type())) {
+            List<ScoreEvent> missed = fanoutService.getMissedEvents(
+                req.gameId(), req.lastEventTimestamp());
+            for (ScoreEvent e : missed) {
+                session.sendMessage(new TextMessage(mapper.writeValueAsString(e)));
+            }
+        }
+    }
+
+    @Override
+    public void onMessage(Message<byte[]> message) {
+        try {
+            ScoreEvent event = mapper.readValue(message.getBody(), ScoreEvent.class);
+            Set<WebSocketSession> sessions = gameSessions.getOrDefault(
+                event.getGameId(), Set.of());
+            TextMessage wsMessage = new TextMessage(new String(message.getBody()));
+            for (WebSocketSession session : sessions) {
+                if (session.isOpen()) {
+                    session.sendMessage(wsMessage);
+                }
+            }
+        } catch (Exception e) {
+            log.error("Fan-out failed", e);
+        }
+    }
+
+    private String extractGameId(String query) {
+        return Arrays.stream(query.split("&"))
+            .filter(p -> p.startsWith("gameId="))
+            .map(p -> p.substring(7))
+            .findFirst().orElseThrow();
+    }
+}
+```
+
+## Tradeoffs
+
+<TradeoffTable title="Push Delivery Mechanism Trade-offs">
+
+| Approach | Latency | Server Load | Reconnect Handling | Best For |
+|---|---|---|---|---|
+| Long polling | 1–30s (one RTT per poll interval) | High — each client holds an open HTTP request; thundering herd on poll expiry | Client must track its own position; easy to implement with cursor parameter | Legacy clients, simple score widgets without tight latency requirements |
+| SSE | < 500ms (persistent HTTP/2 stream) | Medium — one long-lived HTTP connection per client; multiplexed on HTTP/2 | Native via `Last-Event-ID` header; browser auto-reconnects per spec | Browser-native clients; teams without WebSocket infrastructure; simpler ops |
+| WebSocket | < 100ms (full-duplex binary or text frames) | Medium — one TCP connection per client; lower overhead than SSE for bidirectional use | Manual — client must implement reconnect, backoff, and replay logic | Mobile apps, desktop clients, cases requiring bidirectional messaging (e.g. bet placement + score) |
+| WebSocket + Redis Pub/Sub | < 100ms with fan-out to millions | Low per server — Redis delivers one message per connection server regardless of subscriber count | Manual reconnect + `ZRANGEBYSCORE` replay; stateless server-side | Production-grade sports platforms with 50M+ concurrent connections and sub-500ms SLA |
+
+</TradeoffTable>
+
+<Pitfall title="Storing live score state only in WebSocket server memory">
+A common first design stores the current score in a hashmap on the connection server process itself — fast to write, zero network hops. The failure mode arrives the moment the server restarts: 100K clients reconnect, ask for the current score, and receive a 404 or an empty response because the process memory is gone. All mutable game state — current score, game status, minute, `lastEventId` — must live in Redis so that any connection server, including a freshly started replacement, can reconstruct a complete snapshot for reconnecting clients. The connection server's in-memory map should hold only transient routing state: which sessions are subscribed to which game. State that must survive a crash lives in Redis, not in process memory.
+</Pitfall>
+
+<Pitfall title="One Redis Pub/Sub channel per subscriber instead of per game">
+A naive implementation creates a Redis Pub/Sub channel for each connected WebSocket client (`channel:session:{sessionId}`) and routes events by iterating clients in the application layer. With 50M concurrent connections this means 50M Redis channel subscriptions — far exceeding what a Redis cluster can manage, and introducing a per-event O(N) publication loop at the application layer. The correct abstraction maps channels to games, not clients. One channel per game means 500 channels at peak for 500 active games. Connection servers subscribe to game channels and maintain the client fan-out internally using in-memory maps. This keeps Redis Pub/Sub subscription count bounded by the number of games, not the number of users — a difference of five orders of magnitude at World Cup scale.
+</Pitfall>
+
+<Curveball title="How would you handle a data provider outage mid-game?">
+The data provider is the single external dependency on the critical path. If Sportradar's webhook stops delivering events mid-game, clients will stop receiving updates but the last-known score state remains frozen in Redis, which is correct — a stale score is better than a wrong score. The design response has three layers.
+
+First, a **circuit breaker** on the ingest side monitors the rate of incoming events per game. If a game that was emitting 10 events per minute suddenly goes silent for 90 seconds, the circuit breaker opens and triggers an alert. This distinguishes a provider outage from a genuinely quiet period (half-time, injury stoppage).
+
+Second, **secondary provider failover**. Most production sports data platforms subscribe to two providers simultaneously (e.g. Sportradar primary, Stats Perform secondary). Both streams feed the same Ingest Service. Under normal operation, events from the secondary provider are deduplicated against the primary (same `eventId` from a shared sports data standard, or matched by game clock + event type). When the primary goes silent, the circuit breaker switches the "authoritative source" flag to the secondary, which begins accepting events without deduplication rejection.
+
+Third, **client-visible status indication**. The game state hash includes a `dataStatus` field: `"LIVE"`, `"DELAYED"`, or `"UNAVAILABLE"`. When the circuit breaker opens, the Ingest Service updates `dataStatus` to `"DELAYED"` and publishes a synthetic status event through the normal fan-out pipeline. Clients render a "Score updates may be delayed" banner rather than displaying a stale score as if it were current. This preserves trust while the failover resolves.
+</Curveball>
+
+<Curveball title="A major match ends and 40M clients simultaneously disconnect and then reload the score recap page — how do you handle the thundering herd?">
+The moment the final whistle is detected — a `GAME_END` event from the data provider — two things happen simultaneously: 40M WebSocket connections close (clients navigate away from the live view) and 40M HTTP GET requests arrive for the final score recap page. This is the most predictable thundering herd in consumer tech because the trigger (game end) is known in advance.
+
+The response strategy has three layers. First, the **REST API for the final score is served entirely from Redis** — the `game:{gameId}:state` hash is already populated with the complete final state. The REST API does a single `HGETALL` per request with no database fan-out. At 40M requests spread over 30 seconds, that is 1.3M RPS. Redis Cluster handles millions of GET operations per second; the bottleneck is the REST API application tier, which scales horizontally behind a load balancer.
+
+Second, **pre-warm the CDN** with the static final-score page. When the `GAME_END` event is ingested, a Lambda function fetches the final score REST API response and pushes it to the CDN edge as a cached response with a TTL of 5 minutes (enough to absorb the traffic spike) before expiring to a live origin. The first 40M requests hit CDN edge caches, not origin servers.
+
+Third, **stagger WebSocket reconnects** if clients are reopening a live connection to confirm the final score (e.g. a score widget that auto-refreshes). The `GAME_END` event payload includes a `reconnectHint: false` field instructing clients not to re-establish a WebSocket for a completed game, directing them to the REST API instead. This prevents 40M WebSocket upgrade attempts from hitting the connection server fleet.
+</Curveball>
+
+<Curveball title="The interviewer asks you to add fantasy sports point projections updated in real-time alongside scores.">
+Fantasy point projections are a fundamentally different data product from raw scores. A score update is a fact (the score changed); a projection update is a model output (the expected final fantasy points for a player given current game state, time remaining, and opponent matchup). The two pipelines must remain decoupled because their latency characteristics, computational cost, and subscriber populations differ.
+
+The fantasy projection pipeline runs as a separate Kafka consumer group (`fantasy-projection-workers`) that reads from the same `score-events` topic. Each score event triggers a projection model evaluation — typically a pre-trained regression or gradient-boosted model running in a Python inference service. The model takes game state, player stats, and contextual features (opponent strength, weather for outdoor sports) and emits per-player point delta events to a separate Kafka topic: `fantasy-projection-events`.
+
+These projection events are published to a separate Redis Pub/Sub namespace (`fantasy:game:{gameId}:player:{playerId}`) and delivered to clients via a dedicated subscription channel. A client watching a game subscribes to both `game:{gameId}` (raw score events) and optionally `fantasy:game:{gameId}` (projection events for players on their fantasy roster). The WebSocket subscription message is extended:
+
+```json
+{ "type": "SUBSCRIBE", "gameId": "game-123",
+  "fantasyPlayerIds": ["player-456", "player-789"] }
+```
+
+The connection server maintains a second in-memory map for fantasy subscriptions. This additive design means a fantasy-unaware client sees no change; a fantasy-aware client receives both score events and projection deltas on the same WebSocket connection without coupling the two pipelines' latency or throughput characteristics.
+</Curveball>
+
+## Further reading
+
+Sportradar's streaming API documentation is worth studying as a concrete example of how official sports data providers deliver events — the choice between webhook push and long-polling pull reflects the same tradeoffs discussed in the ingestion pipeline section. For the Redis layer, the tradeoff between Redis Pub/Sub and Redis Streams is non-trivial at scale: Pub/Sub is fire-and-forget with no persistence (missed messages on subscriber restart are gone), while Redis Streams provides consumer groups with at-least-once delivery and an acknowledgement model similar to Kafka, at the cost of slightly higher memory usage and operational complexity. For systems where Kafka already exists in the stack, Redis Pub/Sub is the right choice for the final delivery hop; for simpler stacks without Kafka, Redis Streams can serve double duty as both the durable event log and the fan-out mechanism. On the connection management side, WebSocket connection draining for zero-downtime deploys is a nuanced problem: the server must send a `GOING_AWAY` close frame, wait for clients to reconnect elsewhere, and only then terminate — a process that can take 30–60 seconds for large connection counts. SSE avoids this complexity because HTTP load balancers handle connection draining natively for HTTP requests; SSE's built-in reconnection via `Last-Event-ID` means the client re-establishes its stream against any healthy server without custom close-frame logic.
+
+<RelatedQuestions items={[
+  { slug: "stock-trading-exchange", title: "Design a Stock Trading Exchange", difficulty: "staff" },
+  { slug: "collaborative-editor", title: "Design a Collaborative Editor", difficulty: "staff" },
+  { slug: "online-auction", title: "Design an Online Auction System", difficulty: "senior" },
+]} />

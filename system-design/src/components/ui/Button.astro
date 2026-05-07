@@ -1,0 +1,91 @@
+---
+export interface Props {
+  variant?: 'primary' | 'ghost' | 'outline';
+  size?: 'sm' | 'md' | 'lg';
+  href?: string;
+  type?: 'button' | 'submit' | 'reset';
+  class?: string;
+  [key: string]: unknown;
+}
+
+const {
+  variant = 'primary',
+  size = 'md',
+  href,
+  type = 'button',
+  class: className = '',
+  ...rest
+} = Astro.props;
+
+const Tag = href ? 'a' : 'button';
+---
+
+<Tag
+  class:list={['btn', `btn--${variant}`, `btn--${size}`, className]}
+  href={href}
+  type={href ? undefined : type}
+  {...rest}
+>
+  <slot />
+</Tag>
+
+<style>
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5em;
+    font-family: 'Geist', system-ui, sans-serif;
+    font-weight: 500;
+    border-radius: var(--r-md);
+    cursor: pointer;
+    text-decoration: none;
+    border: 1px solid transparent;
+    transition:
+      background var(--dur-fast),
+      color var(--dur-fast),
+      border-color var(--dur-fast),
+      opacity var(--dur-fast);
+    white-space: nowrap;
+    line-height: 1;
+  }
+  .btn:disabled { opacity: 0.45; pointer-events: none; }
+
+  /* Sizes */
+  .btn--sm { font-size: 0.8rem;    padding: 0.45em 0.875em; }
+  .btn--md { font-size: 0.875rem;  padding: 0.6em 1.125em;  }
+  .btn--lg { font-size: 0.9375rem; padding: 0.7em 1.375em;  }
+
+  /* Primary */
+  .btn--primary {
+    background: var(--accent);
+    color: #1a1614;
+    border-color: var(--accent);
+  }
+  .btn--primary:hover {
+    background: var(--accent-dark);
+    border-color: var(--accent-dark);
+  }
+
+  /* Ghost */
+  .btn--ghost {
+    background: transparent;
+    color: var(--ink-2);
+    border-color: transparent;
+  }
+  .btn--ghost:hover {
+    background: var(--bg-raised);
+    color: var(--ink);
+  }
+
+  /* Outline */
+  .btn--outline {
+    background: transparent;
+    color: var(--ink-2);
+    border-color: var(--line-2);
+  }
+  .btn--outline:hover {
+    border-color: var(--accent-line);
+    color: var(--accent);
+    background: var(--accent-soft);
+  }
+</style>

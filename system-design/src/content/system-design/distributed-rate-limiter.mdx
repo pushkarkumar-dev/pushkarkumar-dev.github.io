@@ -1,0 +1,577 @@
+---
+title: "Design a Distributed Rate Limiter"
+slug: "distributed-rate-limiter"
+category: "foundations"
+difficulty: "mid"
+estimatedReadMinutes: 22
+tags: ["redis", "token-bucket", "sliding-window", "lua-scripts", "distributed-systems", "api-gateway"]
+companyFlavors: ["Stripe", "Twilio", "AWS API Gateway", "Cloudflare", "Kong"]
+prerequisites: []
+relatedQuestions: ["design-a-cache", "api-gateway-design", "consistent-hashing"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Build a distributed rate limiter that enforces per-user and per-endpoint quotas at millions of requests per second, with sub-millisecond overhead and no single point of failure."
+---
+
+<Bookmark slug="distributed-rate-limiter" title="Design a Distributed Rate Limiter" />
+
+<Tldr>
+- **Sliding window counter (hybrid)** is the production default: two Redis fields (current + previous window), O(1) memory per user, ~98% accurate
+- **Enforce at the gateway layer** — backends trust `X-RateLimit-Remaining`; they don't run their own checks
+- **Lua scripts** on Redis give you atomic increment + read + conditional set in one round-trip — no distributed locks needed
+- **Multi-region**: accept ~0.5% over-counting from asynchronous sync rather than paying 50 ms cross-region RTT on every request
+- **Rule of thumb**: one Redis `r7g.large` ($0.48/hr) handles ≈ 100 K rate-check ops/sec at < 0.5 ms p99 — sharding is a capacity decision, not an architecture one
+</Tldr>
+
+## Why rate limiting?
+
+Rate limiting is the gatekeeper that prevents three classes of system failure:
+
+1. **Abuse** — A single compromised API key hammering at 50 K req/s can saturate a backend service that was provisioned for 500 req/s peak.
+2. **Cascading load** — A chatty client that doesn't implement exponential backoff retries a failed request instantly, turning a 1-second blip into a sustained overload that brings down dependent services.
+3. **Cost runaway** — An AI inference endpoint that costs $0.02 per call, called 10 M times in a day by a single tenant, generates a $200 K surprise bill.
+
+The engineering challenge is enforcing these limits at scale — millions of users, hundreds of endpoints, **sub-2 ms overhead** per request — without introducing the rate limiter itself as a new single point of failure.
+
+## Clarifying questions
+
+Before reaching for Redis, get these answers:
+
+| Question | What to listen for | Why it matters |
+|---|---|---|
+| What are we limiting? | Per-user? Per-IP? Per-endpoint? Per API key? | Shapes your Redis key schema |
+| What window type? | Fixed 60 s? Sliding 60 s? Daily quota? | Drives algorithm selection |
+| What happens on breach? | Reject (429)? Queue? Shed? Soft-warn? | Determines synchronous vs async enforcement |
+| Latency budget for the rate check? | < 2 ms? < 5 ms? | Rules out designs requiring multiple round-trips |
+| Accuracy requirement? | Exact? Best-effort ± 1%? | Opens the door to distributed approximation |
+| Multi-region deployment? | Active-active? Single region? | Adds the distributed consistency dimension |
+| Differentiated quotas? | Free vs. paid tier? | Requires per-user quota lookup, not just a global constant |
+
+A common trap: jumping to "use Redis" before confirming the window type. A daily quota (24-hour sliding window) and a per-minute burst limit have very different data model implications.
+
+## Requirements
+
+**Functional**
+- Enforce configurable quotas: `N` requests per `W`-second window, per `(user_id, endpoint)` pair
+- Return `429 Too Many Requests` with `Retry-After` when over quota
+- Expose standard headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`
+- Support differentiated quotas per user tier
+
+**Non-functional**
+- p99 overhead: < 2 ms (additive latency to the actual API call)
+- Availability: rate limiter failure should degrade gracefully (fail open), not take down the API
+- Accuracy: ± 1% over-counting acceptable in distributed mode
+- Throughput: sustain 200 K req/s at peak with horizontal scalability
+
+## Capacity estimation
+
+<Capacity title="Back-of-envelope: 1 M active users, 1 K req/min quota, 10× burst">
+
+**Peak throughput**
+
+$$
+\text{peak\_rps} = \underbrace{10^6}_{\text{users}} \times \underbrace{\frac{1000}{60}}_{\text{avg req/s}} \times \underbrace{0.1}_{\text{active fraction}} \approx 167{,}000 \; \text{req/s}
+$$
+
+A 10× burst spike → ≈ 1.67 M concurrent rate-check calls — this is the sizing target.
+
+**Redis memory per user (sliding window counter)**
+
+Each user needs two counters: current window and previous window.
+
+$$
+\text{mem/user} = \underbrace{40\text{ B}}_{\text{Redis key overhead}} + \underbrace{16\text{ B}}_{\text{2 \times int64}} + \underbrace{8\text{ B}}_{\text{TTL}} \approx 64\text{ B}
+$$
+
+Total for 1 M users: `64 B × 10^6 = 64 MB` — trivially fits in a single Redis node. Memory is not the bottleneck; **CPU ops/sec is**.
+
+**Redis throughput**
+
+A sliding window counter check = 1 Lua script call = 1 Redis op.
+`r7g.large` Redis: ≈ 100 K ops/sec.
+
+For 167 K peak ops/sec → 2 shards needed. Add a third for headroom and HA.
+
+</Capacity>
+
+## Core algorithms
+
+Five algorithms appear in interviews. Know their tradeoffs cold.
+
+### Token bucket
+
+A bucket holds at most `B` tokens. Tokens refill at rate `R` per second. Each request consumes one token; if the bucket is empty, the request is rejected.
+
+**Key property**: burst up to `B` requests is allowed, so long as the long-run average stays ≤ `R`. This is the most common production choice because real traffic is bursty.
+
+Implementation: store `(token_count, last_refill_timestamp)` in Redis. On each request, compute tokens accumulated since last refill, cap at `B`, then decrement.
+
+**Gotcha**: the refill computation uses wall clock time, which means two Redis operations — read, compute, write — that must be atomic. Use a Lua script.
+
+### Leaky bucket
+
+Requests enter a FIFO queue (the "bucket") and are processed at a fixed rate `R`. If the queue is full, new requests are dropped.
+
+Useful when you need **smooth, constant-rate output** (e.g., outbound webhook delivery). Not suitable for API request gating because it adds queuing latency.
+
+### Fixed window counter
+
+Divide time into fixed windows (e.g., 00:00–01:00, 01:00–02:00). Count requests per window; reject when count exceeds limit.
+
+Simplest to implement — one Redis `INCR` + `EXPIRE`. But it has the **boundary burst problem**: a user can make `N` requests just before midnight and `N` more just after, effectively doubling their quota in a 2-second window.
+
+### Sliding window log
+
+Store a timestamp-sorted log of every request in Redis (as a sorted set). To check the limit, count entries in the past `W` seconds.
+
+**Pros**: exact accuracy, no boundary burst.  
+**Cons**: O(Q) memory per user (where Q is the quota), expensive `ZREMRANGEBYSCORE` + `ZCARD` on every request. At 1 K req/min quota × 1 M users = 1 TB RAM — not viable at scale.
+
+### Sliding window counter (hybrid) — recommended
+
+The best of token bucket and sliding window log. Keep two integer counters: `prev` (previous complete window) and `curr` (current window). On each request:
+
+$$
+\text{estimated\_count} = \underbrace{\text{prev} \times \frac{W - t_\text{elapsed}}{W}}_{\text{carry-over from previous window}} + \text{curr}
+$$
+
+If `estimated_count < N`, allow the request and increment `curr`. Otherwise, return 429.
+
+**Properties**:
+- O(1) memory per user regardless of quota size
+- ~98–99% accurate (interpolation approximates the true sliding window)
+- One Lua script call per request
+- Window TTL = 2W (keep prev + curr)
+
+## The recommended design: sliding window counter on Redis
+
+### Redis data model
+
+```
+Key:   rl:{user_id}:{endpoint}:{window_start_unix}
+Type:  Hash
+Fields:
+  curr  →  int64  (requests in current window)
+  prev  →  int64  (requests in previous complete window)
+TTL:   2 × W seconds
+```
+
+The `window_start_unix` is `floor(now / W) * W` — the start of the current window rounded down.
+
+### Lua script (atomic check-and-increment)
+
+```lua
+local key_curr = KEYS[1]   -- rl:user:ep:1746614160
+local key_prev = KEYS[2]   -- rl:user:ep:1746613800
+local limit    = tonumber(ARGV[1])   -- 1000
+local window   = tonumber(ARGV[2])   -- 60 (seconds)
+local now      = tonumber(ARGV[3])   -- current unix timestamp (ms)
+local ttl      = window * 2
+
+-- Sliding window interpolation
+local prev_count = tonumber(redis.call('GET', key_prev) or '0') or 0
+local curr_count = tonumber(redis.call('GET', key_curr) or '0') or 0
+local window_start = math.floor(now / 1000 / window) * window * 1000
+local elapsed_ms   = now - window_start
+local carry        = prev_count * (1 - elapsed_ms / (window * 1000))
+local estimated    = carry + curr_count
+
+if estimated >= limit then
+  -- Over quota: return remaining = 0, reset = next window start
+  local reset = window_start + window * 1000
+  return {0, math.floor(estimated), reset}
+end
+
+-- Under quota: increment curr
+redis.call('INCR', key_curr)
+redis.call('EXPIRE', key_curr, ttl)
+local remaining = limit - math.ceil(estimated) - 1
+local reset     = window_start + window * 1000
+return {1, remaining, reset}
+```
+
+The entire check-and-increment is one network round-trip to Redis. No race conditions, no locks.
+
+### Java client (Jedis)
+
+`scriptLoad` is called **once at startup** — Redis returns the SHA-1 of the script, which is stable as long as the script content doesn't change. Every request then calls `evalsha(sha, keys, args)` — one round-trip, fully atomic.
+
+```java
+// Dependency: redis.clients:jedis:5.x
+public final class RedisRateLimiter {
+
+    // Inline the same Lua script — SHA is deterministic from content
+    private static final String LUA = """
+            local key_curr = KEYS[1]; local key_prev = KEYS[2]
+            local limit = tonumber(ARGV[1]); local window = tonumber(ARGV[2])
+            local s   = redis.call('TIME')                       -- server clock avoids client skew
+            local now = s[1] * 1000 + math.floor(s[2] / 1000)
+            local ttl = window * 2
+            local prev = tonumber(redis.call('GET', key_prev) or '0') or 0
+            local curr = tonumber(redis.call('GET', key_curr) or '0') or 0
+            local ws   = math.floor(now / 1000 / window) * window * 1000
+            local est  = prev * (1 - (now - ws) / (window * 1000)) + curr
+            if est >= limit then
+              return {0, math.floor(est), ws + window * 1000}
+            end
+            redis.call('INCR', key_curr); redis.call('EXPIRE', key_curr, ttl)
+            return {1, limit - math.ceil(est) - 1, ws + window * 1000}
+            """;
+
+    private final JedisPool pool;
+    private final String    sha;   // loaded once; same content → same SHA on every Redis node
+
+    public RedisRateLimiter(JedisPool pool) {
+        this.pool = pool;
+        try (Jedis j = pool.getResource()) {
+            this.sha = j.scriptLoad(LUA);
+        }
+    }
+
+    public Result check(String userId, String endpoint, int limit, int windowSec) {
+        long now    = System.currentTimeMillis();
+        long ws     = (now / 1000 / windowSec) * windowSec * 1000L;
+        String kCurr = "rl:" + userId + ":" + endpoint + ":" + ws;
+        String kPrev = "rl:" + userId + ":" + endpoint + ":" + (ws - windowSec * 1000L);
+
+        try (Jedis j = pool.getResource()) {
+            @SuppressWarnings("unchecked")
+            var res = (List<Long>) j.evalsha(sha,
+                    List.of(kCurr, kPrev),
+                    List.of(String.valueOf(limit), String.valueOf(windowSec), String.valueOf(now)));
+            return new Result(res.get(0) == 1L, res.get(1), res.get(2) / 1000);
+        }
+    }
+
+    public record Result(boolean allowed, long remaining, long resetEpochSec) {}
+}
+```
+
+The `Result` record maps directly to the three response headers. The caller never sees Redis — it just calls `check()` and reads the struct.
+
+## Architecture
+
+<Diagram caption="High-level architecture: rate limiter sits as a sidecar or middleware in the API Gateway, all state lives in Redis Cluster">
+<svg width="680" height="300" viewBox="0 0 680 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Architecture diagram">
+  <rect width="680" height="300" fill="#0f0f0f" rx="10"/>
+  <rect x="18" y="108" width="88" height="52" rx="7" fill="#181818" stroke="#333" stroke-width="1.5"/>
+  <text x="62" y="131" text-anchor="middle" fill="#999" font-size="11" font-family="monospace">Clients</text>
+  <text x="62" y="148" text-anchor="middle" fill="#555" font-size="9" font-family="monospace">M req/s</text>
+  <line x1="107" y1="134" x2="148" y2="134" stroke="#444" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="150" y="94" width="120" height="80" rx="7" fill="#181818" stroke="#555" stroke-width="1.5"/>
+  <text x="210" y="126" text-anchor="middle" fill="#bbb" font-size="11" font-family="monospace">API Gateway</text>
+  <text x="210" y="143" text-anchor="middle" fill="#555" font-size="9" font-family="monospace">TLS · routing</text>
+  <text x="210" y="158" text-anchor="middle" fill="#555" font-size="9" font-family="monospace">auth · logging</text>
+  <path d="M270 118 Q295 70 318 68" stroke="#e8b87a" stroke-width="1.5" fill="none" stroke-dasharray="4 3" marker-end="url(#arr-amber)"/>
+  <text x="280" y="82" fill="#a87844" font-size="8" font-family="monospace">check()</text>
+  <rect x="320" y="44" width="140" height="64" rx="7" fill="#1a1500" stroke="#e8b87a" stroke-width="1.5"/>
+  <text x="390" y="72" text-anchor="middle" fill="#e8b87a" font-size="11" font-family="monospace">Rate Limiter</text>
+  <text x="390" y="88" text-anchor="middle" fill="#a87844" font-size="9" font-family="monospace">sidecar / middleware</text>
+  <text x="390" y="101" text-anchor="middle" fill="#a87844" font-size="9" font-family="monospace">Lua EVALSHA</text>
+  <line x1="460" y1="72" x2="496" y2="72" stroke="#5a9" stroke-width="1.5" marker-end="url(#arr-green)"/>
+  <rect x="498" y="34" width="148" height="92" rx="7" fill="#091510" stroke="#3a7a5a" stroke-width="1.5"/>
+  <text x="572" y="65" text-anchor="middle" fill="#5a9" font-size="11" font-family="monospace">Redis Cluster</text>
+  <text x="572" y="82" text-anchor="middle" fill="#3a6a4a" font-size="9" font-family="monospace">3 primaries · 3 replicas</text>
+  <text x="572" y="98" text-anchor="middle" fill="#3a6a4a" font-size="9" font-family="monospace">hash-slot sharding</text>
+  <text x="572" y="114" text-anchor="middle" fill="#3a6a4a" font-size="9" font-family="monospace">&lt; 0.5 ms p99</text>
+  <path d="M318 86 Q295 96 270 140" stroke="#5577cc" stroke-width="1.5" fill="none" marker-end="url(#arr-blue)"/>
+  <text x="264" y="105" fill="#4455aa" font-size="8" font-family="monospace">allowed</text>
+  <path d="M320 56 Q300 48 272 102" stroke="#cc5544" stroke-width="1" fill="none" stroke-dasharray="3 2" marker-end="url(#arr-red)"/>
+  <text x="278" y="52" fill="#aa4433" font-size="8" font-family="monospace">429</text>
+  <line x1="270" y1="154" x2="318" y2="188" stroke="#5577cc" stroke-width="1.5" marker-end="url(#arr-blue)"/>
+  <rect x="320" y="172" width="140" height="68" rx="7" fill="#090918" stroke="#4455aa" stroke-width="1.5"/>
+  <text x="390" y="202" text-anchor="middle" fill="#8899cc" font-size="11" font-family="monospace">Backend APIs</text>
+  <text x="390" y="218" text-anchor="middle" fill="#334488" font-size="9" font-family="monospace">auth · billing · core</text>
+  <text x="390" y="234" text-anchor="middle" fill="#334488" font-size="9" font-family="monospace">trusts X-RateLimit-*</text>
+  <rect x="498" y="166" width="148" height="58" rx="7" fill="#111" stroke="#444" stroke-width="1.2"/>
+  <text x="572" y="192" text-anchor="middle" fill="#888" font-size="11" font-family="monospace">Config Store</text>
+  <text x="572" y="208" text-anchor="middle" fill="#444" font-size="9" font-family="monospace">quotas per user tier</text>
+  <text x="572" y="222" text-anchor="middle" fill="#444" font-size="9" font-family="monospace">DynamoDB / pg</text>
+  <line x1="460" y1="90" x2="510" y2="170" stroke="#444" stroke-width="1" stroke-dasharray="3 2" marker-end="url(#arr)"/>
+  <defs>
+    <marker id="arr" markerWidth="7" markerHeight="7" refX="5" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L7,3 z" fill="#444"/>
+    </marker>
+    <marker id="arr-amber" markerWidth="7" markerHeight="7" refX="5" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L7,3 z" fill="#e8b87a"/>
+    </marker>
+    <marker id="arr-green" markerWidth="7" markerHeight="7" refX="5" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L7,3 z" fill="#5a9"/>
+    </marker>
+    <marker id="arr-blue" markerWidth="7" markerHeight="7" refX="5" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L7,3 z" fill="#5577cc"/>
+    </marker>
+    <marker id="arr-red" markerWidth="7" markerHeight="7" refX="5" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L7,3 z" fill="#cc5544"/>
+    </marker>
+  </defs>
+</svg>
+</Diagram>
+
+## Request flow
+
+<Mermaid caption="Sequence diagram: allowed request (left) vs. rate-limited request (right)" diagram={`sequenceDiagram
+  autonumber
+  participant C as Client
+  participant GW as API Gateway
+  participant RL as Rate Limiter
+  participant R as Redis Cluster
+  participant API as Backend
+
+  C->>GW: POST /v1/charges
+  GW->>RL: check(user=u1, ep=/charges)
+  RL->>R: EVALSHA lua_script rl:u1:/charges:T rl:u1:/charges:T-60 1000 60 now_ms
+  R-->>RL: [1, remaining=47, reset=1746614220000]
+  RL-->>GW: {allowed, remaining=47, reset}
+  GW->>API: forward + X-RateLimit-Remaining: 47
+  API-->>GW: 200 OK {charge_id: ch_xyz}
+  GW-->>C: 200 OK + X-RateLimit-Remaining: 47
+
+  Note over C,API: ... 47 more requests later ...
+
+  C->>GW: POST /v1/charges
+  GW->>RL: check(user=u1, ep=/charges)
+  RL->>R: EVALSHA lua_script ...
+  R-->>RL: [0, over_limit=1001, reset=1746614220000]
+  RL-->>GW: {denied, reset=1746614220000}
+  GW-->>C: 429 Too Many Requests + Retry-After: 34`} />
+
+## Distributed challenges
+
+### Race conditions → solved by Lua atomicity
+
+Without atomicity, two concurrent requests can both read `curr=999`, both decide they're under the 1000-limit, and both increment to 1000 — admitting one extra request. The Lua script runs as a single Redis command — no interleaving possible.
+
+**Do not use Redis transactions (`MULTI/EXEC`)** for this. They don't support conditional logic (no `if` inside a transaction), forcing you to use optimistic locking (`WATCH`) which retries on contention — bad for high-concurrency hotspots.
+
+### Redis high availability
+
+Use **Redis Cluster** (not Sentinel) for the rate limiter store:
+
+| Mode | Sharding | Failover | When to use |
+|---|---|---|---|
+| Standalone | No | Manual | Never in production |
+| Sentinel | No (single shard) | Automatic (30–60 s) | Single-region, < 100 K ops/s |
+| Cluster | Yes (16384 hash slots) | Automatic (10–30 s) | Multi-shard, > 100 K ops/s |
+
+In Redis Cluster, your Lua script keys must hash to the same slot. Use hash tags: `rl:{user_id}:curr` and `rl:{user_id}:prev` both hash on `{user_id}`, landing on the same slot.
+
+### Multi-region consistency
+
+The hard tradeoff: **global accuracy vs. latency**.
+
+- **Synchronous global counter** (strong consistency): Every rate check writes to a primary region. Correct, but adds 50–150 ms cross-region RTT on every request. Unacceptable.
+- **Local counters + async sync** (eventual consistency): Each region maintains its own counter. Counters are replicated asynchronously (Pub/Sub or CRDTs). A user can exceed their quota by up to `N × (number_of_regions)` in a pathological case — but for typical API rate limiting, this is acceptable.
+- **Soft + hard quotas**: Enforce a soft limit locally (e.g., 900/1000) and a hard global limit (1000) via async sync. The gap absorbs inter-region lag.
+
+**Stripe's approach** (published): Per-region local counters, best-effort sync. They accept that a user can briefly exceed quota during region failover.
+
+### Clock skew
+
+The window boundary depends on wall clock time. In a distributed cluster, clocks can drift by 1–50 ms. This means a request at `T=59999ms` and another at `T=60001ms` might be placed in different windows depending on which rate-limiter instance handles them.
+
+Mitigation: use `Redis TIME` command (returns server time) rather than client wall-clock time inside the Lua script. This anchors all window boundaries to a single clock source.
+
+```lua
+local server_time = redis.call('TIME')
+local now_ms = server_time[1] * 1000 + math.floor(server_time[2] / 1000)
+```
+
+## API design
+
+```
+Request headers (outbound):
+  X-RateLimit-Limit:     1000        -- quota for this window
+  X-RateLimit-Remaining: 47          -- requests left in current window
+  X-RateLimit-Reset:     1746614220  -- unix timestamp when window resets
+
+Response on breach (429):
+  Retry-After: 34                    -- seconds until next allowed request
+  Content-Type: application/json
+  Body: { "error": "rate_limit_exceeded", "limit": 1000, "reset_at": 1746614220 }
+```
+
+The `Retry-After` header is critical — clients that respect it back off gracefully rather than hammering the limiter.
+
+## Java integration (Spring Boot)
+
+`RedisRateLimiter.check()` is framework-agnostic. Wire it into Spring MVC as a `HandlerInterceptor` — it runs before every controller method, writes the standard headers, and short-circuits with 429 if the quota is exceeded.
+
+```java
+@Component
+public class RateLimitInterceptor implements HandlerInterceptor {
+
+    private final RedisRateLimiter limiter;
+    private final QuotaService     quotas;   // maps API key → per-tier limit (cached)
+
+    public RateLimitInterceptor(RedisRateLimiter limiter, QuotaService quotas) {
+        this.limiter = limiter;
+        this.quotas  = quotas;
+    }
+
+    @Override
+    public boolean preHandle(HttpServletRequest req, HttpServletResponse res, Object handler)
+            throws Exception {
+
+        String apiKey = req.getHeader("X-API-Key");
+        if (apiKey == null) {
+            res.sendError(SC_UNAUTHORIZED, "Missing X-API-Key header");
+            return false;
+        }
+
+        int limit  = quotas.getLimit(apiKey);          // 1 000 free tier / 10 000 paid
+        var result = limiter.check(apiKey, req.getRequestURI(), limit, 60);
+
+        res.setHeader("X-RateLimit-Limit",     String.valueOf(limit));
+        res.setHeader("X-RateLimit-Remaining", String.valueOf(result.remaining()));
+        res.setHeader("X-RateLimit-Reset",     String.valueOf(result.resetEpochSec()));
+
+        if (!result.allowed()) {
+            long retryAfter = result.resetEpochSec() - Instant.now().getEpochSecond();
+            res.setHeader("Retry-After", String.valueOf(Math.max(retryAfter, 1)));
+            res.sendError(429, "Rate limit exceeded");
+            return false;
+        }
+        return true;
+    }
+}
+```
+
+Register it to cover all `/api/**` routes, excluding health and metrics endpoints (you don't want the liveness probe counted against a quota):
+
+```java
+@Configuration
+public class WebConfig implements WebMvcConfigurer {
+
+    private final RateLimitInterceptor rl;
+    public WebConfig(RateLimitInterceptor rl) { this.rl = rl; }
+
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+        registry.addInterceptor(rl)
+                .addPathPatterns("/api/**")
+                .excludePathPatterns("/api/health", "/api/metrics");
+    }
+}
+```
+
+### QuotaService — per-tier lookup with Caffeine cache
+
+The interceptor calls `quotas.getLimit(apiKey)` on every request. That call must be sub-millisecond, so back it with a local Caffeine cache with a 30-second TTL. Tier upgrades propagate to all instances within 30 s — no restart or manual cache invalidation needed.
+
+```java
+@Service
+public class QuotaService {
+
+    private final LoadingCache<String, Integer> cache = Caffeine.newBuilder()
+            .expireAfterWrite(30, TimeUnit.SECONDS)
+            .maximumSize(100_000)
+            .build(this::fetchFromDb);
+
+    public int getLimit(String apiKey) {
+        return cache.get(apiKey);
+    }
+
+    private int fetchFromDb(String apiKey) {
+        // SELECT request_limit FROM api_keys WHERE api_key = ?
+        return apiKeyRepo.findByKey(apiKey)
+                         .map(ApiKey::requestLimit)
+                         .orElse(1_000);   // default: free tier
+    }
+}
+```
+
+The complete call chain for every incoming request is:
+
+```
+HTTP request
+  → RateLimitInterceptor.preHandle()
+      → QuotaService.getLimit()        ← Caffeine cache hit: ~50 ns
+      → RedisRateLimiter.check()       ← Jedis evalsha: ~0.5 ms
+  → Controller (if allowed)
+```
+
+Total overhead: **< 1 ms** on the happy path, all on the calling thread — no async complexity.
+
+## Algorithm comparison
+
+<TradeoffTable title="Rate limiting algorithm tradeoffs">
+
+| Algorithm | Memory per user | Accuracy | Burst allowed | Best for |
+|---|---|---|---|---|
+| **Token Bucket** | O(1) — 2 ints | High (≈exact) | Yes — up to bucket size | Default REST API choice |
+| **Leaky Bucket** | O(Q) — queue | Exact | No — smooth rate | Outbound webhook delivery |
+| **Fixed Window** | O(1) — 1 int | ~50% at boundary | Yes — 2N at boundary | Simple internal services |
+| **Sliding Window Log** | O(Q) — all timestamps | Exact | No | Low-volume exact quotas |
+| **Sliding Window Counter** | O(1) — 2 ints | ~98–99% | Yes — smoothed | **Production default** |
+
+</TradeoffTable>
+
+<Pitfall title="The boundary burst problem in fixed windows">
+
+A fixed window from 00:00 to 01:00 with a 1000 req/min limit can admit 2000 requests in 2 seconds: 1000 in the last second of the old window and 1000 in the first second of the new window. At 99 req/s normally, this 20× spike can saturate a downstream service.
+
+The sliding window counter eliminates this — the interpolation formula spreads the previous window's count across the boundary.
+
+</Pitfall>
+
+<Pitfall title="Not using Redis TIME inside Lua">
+
+If your Lua script reads `os.clock()` (Lua's local clock) rather than `redis.call('TIME')`, each Redis node in a cluster uses its own clock. During NTP corrections, windows can shift by up to 100 ms — causing the same request to be counted in two different windows simultaneously, over-counting by up to 2×.
+
+Always use `redis.call('TIME')` as the canonical clock inside Lua scripts.
+
+</Pitfall>
+
+<Pitfall title="Fail-closed on Redis outage">
+
+If the Redis cluster is unavailable and your rate limiter fails closed (rejects all requests with 429), you've turned a rate limiter failure into a complete API outage.
+
+Implement a **fail-open** circuit breaker: if the rate limit check times out (> 5 ms), allow the request through and log a warning. Downstream services can apply their own throttling as a backstop.
+
+</Pitfall>
+
+## Follow-up questions
+
+<Curveball question="How would you handle differentiated quotas — e.g., free tier gets 100 req/min, paid gets 10 000 req/min — without changing the rate limiter's core logic?">
+
+Store a `quota_config` table in DynamoDB or Postgres: `user_id → {limit, window_s, tier}`. The rate limiter sidecar fetches this at startup and caches it in memory (TTL 30 s). The Lua script receives `limit` as a parameter (ARGV[1]), so it's quota-agnostic — only the caller changes. For cache invalidation on tier upgrades, publish a Redis Pub/Sub event that all sidecar instances subscribe to.
+
+</Curveball>
+
+<Curveball question="Your API is behind an AWS NLB and you want to rate limit by client IP. How do you get the real IP?">
+
+The NLB forwards packets at L4 with the client's source IP preserved (no X-Forwarded-For header at L4). But if you're behind an ALB or nginx reverse proxy, extract the real IP from `X-Forwarded-For: <client>, <proxy1>` — always take the **leftmost** untrusted IP (the first entry the client adds). Never trust the rightmost IP; clients control what they send in the header. Add CIDR allowlist validation: only trust X-Forwarded-For headers from your known proxy IPs.
+
+</Curveball>
+
+<Curveball question="What's your strategy if the rate limiter needs to sustain 5 M req/s — 30× what one Redis cluster handles?">
+
+Three options, not mutually exclusive:
+
+1. **Shard by user_id hash** — distribute across 30+ Redis clusters, each owning a range of user IDs. The rate limiter sidecar routes to the correct shard deterministically.
+2. **Two-tier enforcement** — enforce a coarse local limit (e.g., 10× the fair share) in the application process memory (token bucket, no network round-trip), then check the precise Redis limit for overages. Reduces Redis load by 90% for well-behaved clients.
+3. **Move limits upstream** — push rate limiting to the CDN layer (Cloudflare, Fastly). They run distributed rate limiting at 100 M req/s globally with their own Key-Value stores (Cloudflare Workers KV). The application layer enforces a more permissive backstop.
+
+</Curveball>
+
+<Curveball question="How do you rate limit across a multi-tenant system where one tenant's traffic shouldn't impact another's Redis latency?">
+
+Key isolation is not enough — a noisy tenant doing millions of rate-check ops/sec will saturate Redis CPU, adding latency for all tenants on the same cluster.
+
+Options: (1) Shard Redis clusters by tenant tier — all Enterprise tenants on dedicated Redis, all Free tenants on shared Redis. (2) Use Redis 7.0's new ACL categories + `maxmemory-policy allkeys-lfu` with per-key LFU eviction — bursty tenants' keys get evicted first, protecting steady-state tenants. (3) Rate limit the rate limiter — add a secondary limit on the number of Lua script calls per Redis connection, throttling tenants at the connection pool level before they reach Redis.
+
+</Curveball>
+
+<RelatedQuestions items={[
+  { slug: "design-a-cache", title: "Design a Cache (CDN / In-process / Distributed)", difficulty: "mid" },
+  { slug: "api-gateway-design", title: "Design an API Gateway", difficulty: "senior" },
+  { slug: "consistent-hashing", title: "Consistent Hashing", difficulty: "mid" },
+]} />
+
+## Further reading
+
+- [Redis INCR pattern for rate limiting](https://redis.io/docs/manual/patterns/rate-limiting/) — Official Redis documentation with INCR-based and Lua-based examples
+- [Cloudflare's approach to sliding window rate limiting](https://blog.cloudflare.com/counting-things-a-lot-of-different-things/) — How Cloudflare handles trillions of requests with approximate counting
+- [Stripe's rate limiter architecture](https://stripe.com/blog/rate-limiters) — Production war stories from Stripe's payment API, including the exact algorithms they chose and why
+- [Kong Rate Limiting plugin source](https://github.com/Kong/kong/blob/master/kong/plugins/rate-limiting/) — Real production Lua implementation used by thousands of companies

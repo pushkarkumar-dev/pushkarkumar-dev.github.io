@@ -1,0 +1,496 @@
+---
+title: "Design a Distributed KV Store"
+slug: "distributed-kv-store"
+category: "foundations"
+difficulty: "staff"
+estimatedReadMinutes: 28
+tags: ["dynamo", "quorum", "vector-clocks", "anti-entropy", "merkle-trees", "eventual-consistency", "gossip", "sloppy-quorum"]
+companyFlavors: ["Amazon DynamoDB", "Apache Cassandra", "Riak", "Voldemort", "ScyllaDB"]
+prerequisites: ["consistent-hashing"]
+relatedQuestions: ["consistent-hashing", "design-a-cache", "distributed-locking-service"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Design an eventually-consistent, leaderless distributed key-value store in the style of Amazon Dynamo — covering quorum reads and writes, vector clocks for conflict resolution, gossip-based membership, Merkle trees for anti-entropy, and sloppy quorums for availability under partitions."
+javaPackages: ["redis.clients:jedis:5.1.3", "com.google.guava:guava:33.2.1", "org.springframework.boot:spring-boot-starter:3.3.0"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="distributed-kv-store" title="Design a Distributed KV Store" />
+
+<Tldr>
+- **Leaderless replication with quorum** (N=3, R=2, W=2, where R+W > N): any node can serve reads/writes; coordinator forwards to preference list; R+W > N guarantees at least one replica overlap between any read and write quorum
+- **Eventual consistency + last-write-wins (LWW) by default**; vector clocks detect concurrent writes that LWW would silently corrupt — two concurrent versions that neither dominates must be surfaced to the client for semantic merge
+- **Sloppy quorum + hinted handoff**: during a network partition, write to the next N healthy nodes outside the preference list, tagged with a hint pointing to the intended node; forward the data when the target recovers and delete the hint copy
+- **Anti-entropy via Merkle trees**: split the key range into a binary tree where each leaf hashes a sub-range; compare tree roots to find divergent segments without a full data scan — O(log n) comparisons to isolate the exact divergent range
+- **Gossip protocol for membership**: each node randomly selects 2 peers per second and exchanges member lists; failures are detected in O(log n) gossip rounds without any central coordinator
+</Tldr>
+
+## Why a leaderless design?
+
+The CAP theorem tells us that a distributed system can provide at most two of three properties simultaneously: consistency, availability, and partition tolerance. Since network partitions are not optional — they happen in every production system, whether between availability zones or across data center switches — the real choice is between CP (consistency + partition tolerance) and AP (availability + partition tolerance). Amazon Dynamo, the system that inspired most modern leaderless KV stores, explicitly chose AP: keep writes available even when nodes cannot reach each other, and reconcile conflicts after the partition heals. This is not a compromise made out of laziness — it is a deliberate engineering decision made after studying what Amazon's shopping cart service actually needed. Losing a cart write was worse than serving a slightly stale cart read; uptime was non-negotiable.
+
+Leader-based replication systems like Raft and Paxos achieve linearizability — every read sees the most recent committed write — by routing all writes through a single elected leader. This is powerful but brittle: during leader election, the cluster is unavailable for writes. If the leader is in a network partition with the minority side, neither partition can make progress without risking split-brain. In a 5-node cluster split into groups of 3 and 2, only the majority partition can elect a new leader; the minority stops accepting writes entirely. For an availability-first system serving millions of requests per second, this is unacceptable.
+
+Leaderless systems dissolve the leader concept entirely. Any node can accept a write, act as a coordinator, and forward the write to the preference list. There is no election timeout, no log replication pipeline that must serialize all writes, and no single node whose failure causes a write pause. The cost is that two nodes can accept concurrent writes to the same key during a partition, producing conflicting versions that the system must detect and resolve. Vector clocks are the mechanism for detecting those conflicts; sloppy quorums and hinted handoff are the mechanism for preserving availability when the preference list is partially unreachable. Understanding both is what separates a staff-level design from a senior-level one.
+
+## Clarifying questions
+
+Lock down these eight questions before sketching any architecture. Each one gates a significant design decision that will bifurcate the rest of the design.
+
+| Question | Ideal answer | Why it matters |
+|---|---|---|
+| What consistency model is required? | Eventual consistency with read-your-own-writes guarantee for the session | Strong consistency requires synchronous quorum on every read; eventual consistency allows async replication and sloppy quorums |
+| What is the key distribution and size? | UUID keys, average 1 KB value, up to 10 KB max | Determines whether we need range scan support or point lookups suffice; large values affect network and storage tier choices |
+| Read vs. write heavy? | Read-heavy, 10:1 read:write ratio | Drives quorum tuning — lower R (e.g., R=1) for read latency at the cost of occasional stale reads; higher W for write durability |
+| What replication factor N? | N=3, surviving 1 node failure without impacting availability | N=3 with W=2, R=2 is the DynamoDB default — tolerates 1 node failure; N=5 with W=3, R=3 tolerates 2 failures |
+| Do we need ordered range scans or just point lookups? | Point lookups only | Range scans require ordered storage (B-tree or sorted SSTable indexes); point lookups work with any partitioning scheme including hash partitioning |
+| What failure domains must we tolerate? | Single AZ failure with optional multi-region active-active | AZ-aware replica placement ensures no two replicas share an AZ; cross-region adds replication lag as a consistency dimension |
+| What conflict resolution strategy? | Last-write-wins for most keys; surfaced conflicts for shopping cart semantics | LWW is simple but lossy; vector clocks + client merge preserves all concurrent writes at the cost of application complexity |
+| Expected key/value size and TTL support? | Keys < 256 bytes, values < 64 KB, TTL support required for session keys | TTL requires a background compaction process and a per-key expiry index; large values affect memtable sizing |
+
+## Functional requirements
+
+- `GET(key)` — return the value and vector clock for a key; return nil if the key does not exist or has expired
+- `PUT(key, value, vectorClock)` — write a value with the client-supplied vector clock; if no clock is supplied, the coordinator generates a new one; return the updated vector clock
+- `DELETE(key)` — logically delete the key by writing a tombstone; tombstones are compacted after a configurable grace period to prevent resurrection from stale replicas
+- TTL support: `PUT(key, value, ttlSeconds)` — the key is automatically expired after the TTL elapses; a background sweeper thread handles physical deletion
+- Range scans are explicitly out of scope — this is a hash-partitioned store; ordered access requires a separate secondary index layer
+
+## Non-functional requirements
+
+- **Read latency**: p99 GET < 5 ms at N=3, R=2 quorum; p50 GET < 1 ms
+- **Write latency**: p99 PUT < 10 ms at W=2 quorum; the coordinator blocks until W acks are received; the third replica write is asynchronous
+- **Availability**: 99.99% (< 52 minutes per year); the system must serve reads and writes during single-node failures and single-AZ outages
+- **Fault tolerance**: survive 2-node failures in a 5-node cluster with N=3, R=2, W=2 quorum (any 3-node subset can still form a quorum)
+- **Scale**: support 100 TB total data with consistent hashing and horizontal sharding; adding nodes should move at most O(k/n) keys
+- **Throughput**: 100,000 reads/sec and 10,000 writes/sec sustained across the cluster
+- **Durability**: a confirmed write (W ack) must survive the loss of any single node; data is fsynced to the write-ahead log before the ack is returned
+
+## Capacity estimation
+
+<Capacity title="Storage, replication, and throughput sizing for a 100 TB dataset">
+
+**Storage with replication**
+
+With 1 billion keys and an average value size of 1 KB:
+
+$$
+\text{raw data} = 1 \times 10^9 \times 1\ \text{KB} = 1\ \text{TB}
+$$
+
+With N=3 replication factor, each byte is stored on 3 nodes:
+
+$$
+\text{total cluster storage} = 1\ \text{TB} \times 3 = 3\ \text{TB}
+$$
+
+Across 10 nodes with 150 GB of SSD each (e.g., `i3.2xlarge`), the usable storage is:
+
+$$
+\text{usable per node} = 150\ \text{GB} \Rightarrow \text{total usable} = 10 \times 150\ \text{GB} = 1.5\ \text{TB}
+$$
+
+To store 3 TB with 10 nodes, scale to 20 nodes — each holding 150 GB of replicated data. With 20% headroom for SSTable compaction and write-ahead log:
+
+$$
+\text{nodes required} = \lceil 3\ \text{TB} / (150\ \text{GB} \times 0.80) \rceil = \lceil 25 \rceil = 25\ \text{nodes}
+$$
+
+**Consistent hashing ring density**
+
+With 25 nodes and 150 virtual nodes per physical node:
+
+$$
+\text{ring positions} = 25 \times 150 = 3{,}750
+$$
+
+$$
+\text{average arc span} = \frac{2^{32}}{3{,}750} \approx 1{,}145{,}324\ \text{positions per vnode}
+$$
+
+**Write amplification per quorum write**
+
+For W=2, the coordinator sends a write RPC to all N=3 preference list nodes and waits for 2 acks. Each write is amplified 3× at the network level and 2× at the acknowledged storage level:
+
+$$
+\text{write RPCs per PUT} = N = 3
+$$
+
+$$
+\text{blocking RPCs per PUT} = W = 2
+$$
+
+At 10,000 writes/sec:
+
+$$
+\text{total write RPCs/sec cluster-wide} = 10{,}000 \times 3 = 30{,}000\ \text{RPCs/sec}
+$$
+
+**Read throughput per quorum read**
+
+For R=2, each GET fans out to N=3 nodes and waits for 2 responses. At 100,000 reads/sec:
+
+$$
+\text{total read RPCs/sec cluster-wide} = 100{,}000 \times 3 = 300{,}000\ \text{RPCs/sec}
+$$
+
+Each node handles approximately $300{,}000 / 25 = 12{,}000$ inbound RPCs/sec — well within the capacity of a single-threaded async I/O server.
+
+</Capacity>
+
+## API design
+
+The node-level API is internal — clients typically interact with a client library that picks a coordinator node from the ring. The internal HTTP API between nodes and from the client library to the coordinator:
+
+```
+PUT /keys/{key}
+  Headers: X-Vector-Clock: {A:3,B:2}
+           X-TTL-Seconds: 3600          (optional)
+  Body:    raw bytes (value)
+  Returns: 204 No Content
+           X-Vector-Clock: {A:4,B:2}   (incremented clock)
+
+GET /keys/{key}
+  Returns: 200 OK
+           X-Vector-Clock: {A:4,B:2}
+           X-Version-Siblings: 2        (>1 means concurrent versions exist)
+           Body: raw bytes (value, or multipart for siblings)
+         / 404 Not Found
+         / 409 Conflict                 (if siblings and client must resolve)
+
+DELETE /keys/{key}
+  Headers: X-Vector-Clock: {A:4,B:2}   (required to prevent resurrection)
+  Returns: 204 No Content
+
+GET /internal/merkle/{rangeStart}/{rangeEnd}
+  Returns: 200 OK
+           Body: { "rootHash": "...", "depth": 12 }
+  Used by anti-entropy background jobs between replica pairs
+
+POST /internal/hint
+  Body: { "intendedNode": "node-C", "key": "...", "value": "...", "clock": "..." }
+  Used for hinted handoff delivery when a previously down node recovers
+```
+
+The vector clock is transmitted as a base64-encoded JSON map in a custom header, keeping the value body as raw bytes with no envelope overhead. This matters for large values where a JSON wrapper adds meaningless overhead.
+
+## Data model
+
+**In-memory write buffer (memtable)**
+
+New writes land in an in-memory sorted skip list — the same structure used in LSM-tree implementations like LevelDB and RocksDB. A skip list provides O(log n) reads, writes, and range iterations. Keys are stored in sorted order within the skip list to facilitate sequential SSTable flushes. When the memtable exceeds a configured threshold (e.g., 64 MB), it is flushed to disk as an immutable SSTable file.
+
+**On-disk storage (SSTables + WAL)**
+
+Before a write enters the memtable, it is appended to a Write-Ahead Log (WAL) on disk with `fsync`. This ensures that even if the process crashes before the memtable is flushed, the write can be replayed from the WAL on restart. SSTables are immutable, sorted files with a Bloom filter at the head (for O(1) negative lookups) and a sparse index (for O(log n) key search within the file). Background compaction merges SSTables, discarding tombstoned and expired keys.
+
+**Vector clock per key**
+
+```
+VectorClock = Map<String nodeId, Long counter>
+
+Example:
+  key: "cart:user:42"
+  value: [item-A, item-B]
+  clock: { "node-1": 5, "node-3": 2 }
+```
+
+Each PUT increments the counter for the coordinating node. Two clocks are compared by checking dominance: clock A dominates clock B if every entry in A is >= the corresponding entry in B, with at least one strictly greater. If neither dominates, the writes are concurrent — a conflict.
+
+**Membership table (gossip state)**
+
+Each node maintains a local membership table with one entry per known node:
+
+```
+MemberEntry = {
+  nodeId:           String,
+  address:          String,    // host:port
+  status:           Enum { ALIVE, SUSPECT, DEAD },
+  generation:       Long,      // monotonically increasing, resets on restart
+  heartbeatCounter: Long,      // increments on every gossip round
+  lastSeen:         Instant    // local wall time of last received gossip
+}
+```
+
+The `generation` field disambiguates a restarted node from a node that was merely partitioned — a restarted node increments its generation, allowing peers to distinguish it from a stale entry.
+
+## High-level architecture
+
+<Mermaid caption="Leaderless ring topology: any node can act as coordinator. For a PUT, the coordinator routes to the N=3 preference list nodes and waits for W=2 acks. Gossip between all nodes maintains membership state." diagram={`graph TB
+  Client --> Coordinator["Coordinator Node\n(any node — request received first)"]
+  Coordinator --> N1["Node A\nprimary replica"]
+  Coordinator --> N2["Node B\nreplica 1"]
+  Coordinator --> N3["Node C\nreplica 2"]
+  N1 <-->|gossip| N2
+  N2 <-->|gossip| N3
+  N3 <-->|gossip| N1
+  N1 <-->|anti-entropy\nMerkle sync| N2
+  N2 <-->|anti-entropy\nMerkle sync| N3`} />
+
+<Mermaid caption="Quorum write flow: coordinator increments the vector clock and sends to all N=3 nodes in parallel. After W=2 acks, it responds to the client. The third write completes asynchronously." diagram={`sequenceDiagram
+  autonumber
+  participant C as Client
+  participant Co as Coordinator
+  participant A as Node A
+  participant B as Node B
+  participant Cx as Node C
+
+  C->>Co: PUT cart:42 {items} clock={A:3}
+  Co->>Co: increment clock → {A:4}
+  Co->>A: PUT cart:42 clock={A:4} (parallel)
+  Co->>B: PUT cart:42 clock={A:4} (parallel)
+  Co->>Cx: PUT cart:42 clock={A:4} (parallel)
+  A-->>Co: ACK
+  B-->>Co: ACK
+  Co-->>C: 204 OK clock={A:4} (W=2 quorum met)
+  Cx-->>Co: ACK (arrives after response — ignored for quorum)`} />
+
+## Deep dives
+
+### Quorum reads and writes
+
+The coordinator first determines the preference list: the top N distinct physical nodes clockwise from `hash(key)` on the consistent hash ring. For a write, the coordinator increments its own entry in the vector clock, then sends the write to all N nodes in parallel using a virtual thread per RPC. It waits for W acks before returning to the client. For a read, it sends GET to all N nodes in parallel and waits for R responses. If all R responses carry the same vector clock, it returns that value. If responses carry different clocks, the coordinator compares them:
+
+- If one clock dominates the others (has a strictly greater counter for every node in the other clock), the coordinator returns the dominant version and triggers a **read repair** for the stale nodes.
+- If no clock dominates (concurrent writes), the coordinator either returns both versions (siblings) for client-side resolution, or applies LWW by wall-clock timestamp if the client has opted into that simpler model.
+
+**Read repair** is the key mechanism that keeps replicas converging without a dedicated sync process. After a quorum read, any replica that returned a stale version receives a background write of the latest version. Over time, any key that is read at least once will converge across all its replicas. Keys that are never read again must be handled by anti-entropy — the Merkle tree mechanism covered below.
+
+The latency profile of quorum reads is bounded by the R-th fastest response out of N parallel requests. With N=3 and R=2, you wait for the 2nd fastest response and ignore the 3rd. This is the **hedged request** property: by firing at all 3 nodes simultaneously, you automatically absorb the variance of the slowest node. The p99 latency of a quorum-2 read is roughly the p66 latency of a single node read — a dramatic improvement over waiting for the median node.
+
+### Vector clocks for conflict detection
+
+A vector clock is a map from node ID to a monotonically increasing counter. Every time a node handles a write, it increments its own counter. The clock travels with the value and is updated on every subsequent write through any coordinator. Two vector clocks are compared as follows:
+
+- **A happens-before B**: every counter in A is less than or equal to the corresponding counter in B, and at least one is strictly less. B is the later version; A can be discarded.
+- **A equals B**: identical clocks — same version.
+- **Concurrent**: neither A happens-before B nor B happens-before A. Both writes are equally valid in causal time; the system cannot automatically resolve this.
+
+Consider a shopping cart. Client 1 reads `{items: [A], clock: {node1: 3}}` and adds item B, writing `{items: [A, B], clock: {node1: 4}}`. Meanwhile, Client 2 (having cached the old version) adds item C and writes `{items: [A, C], clock: {node1: 3, node2: 1}}`. Neither clock dominates the other: `{node1: 4}` vs `{node1: 3, node2: 1}` — node1's counter is higher in the first, node2's counter is higher in the second. These are concurrent writes. The correct resolution for a shopping cart is the union: `[A, B, C]`. The API surface must return both siblings to the client, which applies domain-specific merge logic and writes back the resolved value with a merged clock.
+
+Last-write-wins (LWW) resolves the conflict by picking the version with the higher wall-clock timestamp. This is what DynamoDB does by default. LWW is dangerous when clocks drift: NTP jitter of ±100 ms means a write that happened causally later can be assigned a lower timestamp than the write it overwrote. For a shopping cart, LWW means silently losing one client's items. This is why Dynamo's original paper advocates for vector clocks and client-side resolution for data where conflicts must be preserved — not wall-clock ordering.
+
+The vector clock grows unboundedly as more nodes coordinate writes. In practice, clocks are pruned by removing entries older than a threshold or by limiting the map size and dropping the oldest entry when the limit is exceeded. Dynamo's original implementation used a `(nodeId, counter, timestamp)` triple to enable pruning by wall-clock age.
+
+### Sloppy quorum and hinted handoff
+
+Under a network partition, the N nodes in the preference list may be unreachable from the coordinator. With a strict quorum, the write would be rejected — sacrificing availability to preserve consistency. Sloppy quorum instead allows the coordinator to write to the next N healthy nodes on the ring, even if they are not in the preference list for this key.
+
+The sloppy write is tagged with a **hint**: `{ intendedNode: "node-C", key: "...", value: "...", clock: "..." }`. The hint holder stores this entry in a separate "hints" column family, not in its main key-value store, so the hint does not pollute normal reads. When `node-C` recovers and rejoins the ring — detected via gossip — the hint holder forwards the write and deletes its local hint copy. Node C then applies the hinted write as a normal write, potentially triggering a read repair to other replicas.
+
+The critical nuance: the hint holder can itself fail before delivering the hint. If `node-D` is holding a hint for `node-C`, and `node-D` crashes before forwarding, the hint is lost. This is why sloppy quorum does not provide the same durability guarantees as strict quorum — it is a best-effort availability mechanism. Anti-entropy (Merkle tree sync) is the backstop: even if all hinted handoffs are lost, the background sync process will eventually detect and repair the divergence between `node-C` and its peers once it recovers.
+
+The operational consequence: sloppy quorum improves write availability during partitions but means that `W=2` does not guarantee 2 durable replicas on the intended preference list nodes. If your use case requires that guarantee (e.g., financial records), disable sloppy quorum and accept reduced availability during partitions — this is the CP trade-off.
+
+### Anti-entropy with Merkle trees
+
+Read repair and hinted handoff handle keys that are accessed after a partition heals. But cold keys — rarely accessed — can remain divergent across replicas indefinitely without a proactive sync mechanism. Merkle trees provide that mechanism.
+
+The key range owned by a replica pair is recursively split into a binary tree. Each leaf node hashes all the key-value pairs in its sub-range (e.g., `SHA-256(concat(k1v1, k2v2, ...))`). Each internal node hashes the concatenation of its two children's hashes. This produces a root hash that is a cryptographic fingerprint of the entire key range. If two replicas share the same root hash, they are byte-for-byte identical in that range.
+
+Anti-entropy between two nodes proceeds top-down:
+
+1. Exchange root hashes. If equal, done — O(1) for a fully-synced pair.
+2. If different, exchange left-child hashes. If left children match, the divergence is entirely in the right subtree — recurse into the right child only.
+3. Continue recursing into divergent subtrees until leaf nodes are reached. The leaf ranges that differ are the ranges that need synchronization.
+4. Stream only the divergent key-value pairs between the two nodes.
+
+The depth of the tree determines the sync granularity. A tree of depth 12 divides the key range into $2^{12} = 4{,}096$ leaves. Finding the divergent leaves requires at most 12 round-trips between the two nodes — O(log n) comparisons to locate the divergence, regardless of how many total keys exist. The number of network messages is bounded by the tree depth, not the dataset size. Only the final leaf sync transfers actual data.
+
+Merkle trees are recomputed incrementally as writes arrive: a write to a key triggers recomputation of only the log-depth path from the updated leaf to the root — O(log n) hash operations per write. The root hash is cached and updated atomically with each write batch.
+
+### Gossip-based membership
+
+Every node maintains a membership table. Once per second, each node picks 2 peers at random and exchanges its full membership table. On receipt, each node merges the incoming table with its own by taking the maximum heartbeat counter per node. This is a CRDT (conflict-free replicated data type) — the merge is associative, commutative, and idempotent, so gossip can be applied in any order without coordination.
+
+Each node increments its own heartbeat counter on every gossip round. When a node's heartbeat counter has not incremented for `T` seconds (as observed by another node's `lastSeen` timestamp), that node is marked **SUSPECT**. After `2T` seconds without a heartbeat increment, it is marked **DEAD**. The values of T typically range from 5 to 30 seconds depending on the required detection latency vs. false failure rate trade-off. Lower T means faster failure detection but more false positives when nodes are merely slow.
+
+The `generation` counter is critical for handling restarts. When a node crashes and restarts, it increments its generation. Peers receiving a gossip message with a higher generation know this is a fresh restart — they reset the heartbeat counter and lastSeen for that node and reclassify it as ALIVE, even if they had previously marked it DEAD. This prevents a restarted node from being ignored because its heartbeat counter appears stale relative to the last-seen timestamp.
+
+Information propagation time in a gossip network: each round, each node infects 2 peers with new information. After `k` rounds, a node's information has reached approximately `min(n, 2^k)` nodes — exponential spread. With 25 nodes, `log2(25) ≈ 4.6` rounds suffice to reach all nodes. At 1 round per second, a new node or failure detection propagates cluster-wide in roughly 5 seconds. This is the gossip convergence time — the window during which nodes may have inconsistent views of membership.
+
+## Java integration
+
+### Part A — Core quorum coordinator
+
+```java
+package dev.pushkar.kvstore;
+
+import java.util.*;
+import java.util.concurrent.*;
+
+public final class QuorumCoordinator {
+    private final ConsistentHashRing<KvNode> ring;
+    private final int replicationFactor; // N
+    private final int readQuorum;        // R
+    private final int writeQuorum;       // W
+    private final ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor();
+
+    public QuorumCoordinator(ConsistentHashRing<KvNode> ring, int n, int r, int w) {
+        this.ring = ring;
+        this.replicationFactor = n;
+        this.readQuorum = r;
+        this.writeQuorum = w;
+    }
+
+    public VersionedValue get(String key) throws Exception {
+        List<KvNode> nodes = ring.getReplicaNodes(key, replicationFactor);
+        var futures = nodes.stream()
+            .map(node -> CompletableFuture.supplyAsync(() -> node.get(key), pool))
+            .toList();
+
+        List<VersionedValue> responses = waitForQuorum(futures, readQuorum);
+
+        // Return the value with the highest vector clock
+        VersionedValue latest = responses.stream()
+            .max(Comparator.comparing(VersionedValue::vectorClock, VectorClock::compareTo))
+            .orElseThrow();
+
+        // Read repair: write latest to any stale nodes in background
+        responses.stream()
+            .filter(r -> !r.vectorClock().equals(latest.vectorClock()))
+            .forEach(stale -> pool.execute(() -> stale.node().put(key, latest)));
+
+        return latest;
+    }
+
+    public void put(String key, byte[] value, VectorClock clock) throws Exception {
+        VectorClock nextClock = clock.increment(localNodeId());
+        List<KvNode> nodes = ring.getReplicaNodes(key, replicationFactor);
+        var futures = nodes.stream()
+            .map(node -> CompletableFuture.runAsync(() ->
+                node.put(key, new VersionedValue(value, nextClock)), pool))
+            .toList();
+        waitForQuorum(futures, writeQuorum);
+    }
+
+    private <T> List<T> waitForQuorum(List<CompletableFuture<T>> futures, int quorum)
+            throws Exception {
+        var results = Collections.synchronizedList(new ArrayList<T>());
+        var latch = new CountDownLatch(quorum);
+        futures.forEach(f -> f.thenAccept(v -> {
+            results.add(v);
+            latch.countDown();
+        }).exceptionally(e -> {
+            // log.warn("Node error: {}", e.getMessage());
+            return null;
+        }));
+        if (!latch.await(100, TimeUnit.MILLISECONDS))
+            throw new QuorumException("Failed to reach quorum of " + quorum);
+        return results;
+    }
+
+    private String localNodeId() {
+        return ring.localNode().nodeId();
+    }
+}
+```
+
+The `waitForQuorum` method is the heart of the quorum logic. It fires all N RPCs in parallel using virtual threads (Project Loom — each virtual thread is a few hundred bytes, so N=3 threads per request at 100K reads/sec = 300K concurrent virtual threads, well within the JVM's capacity). The `CountDownLatch` counts down from W (or R) rather than N, so the method returns as soon as the quorum is satisfied without waiting for the slowest replica. Stragglers complete in the background and their results are ignored for the current request — they are wasted RPCs that serve the purpose of reducing p99 latency by not blocking on the slowest node.
+
+### Part B — Spring Boot REST endpoint
+
+```java
+@RestController
+@RequestMapping("/kv")
+public class KvController {
+    private final QuorumCoordinator coordinator;
+
+    public KvController(QuorumCoordinator coordinator) {
+        this.coordinator = coordinator;
+    }
+
+    @GetMapping("/{key}")
+    public ResponseEntity<KvResponse> get(@PathVariable String key) throws Exception {
+        VersionedValue val = coordinator.get(key);
+        return ResponseEntity.ok()
+            .header("X-Vector-Clock", val.vectorClock().encode())
+            .body(new KvResponse(key, val.value()));
+    }
+
+    @PutMapping("/{key}")
+    public ResponseEntity<Void> put(
+            @PathVariable String key,
+            @RequestBody byte[] value,
+            @RequestHeader(value = "X-Vector-Clock", required = false) String clockHeader)
+            throws Exception {
+        VectorClock clock = clockHeader != null
+            ? VectorClock.decode(clockHeader)
+            : VectorClock.empty();
+        coordinator.put(key, value, clock);
+        return ResponseEntity.noContent().build();
+    }
+
+    record KvResponse(String key, byte[] value) {}
+}
+```
+
+The vector clock round-trips through the client: the client reads the `X-Vector-Clock` header on every GET, caches it, and sends it back on the next PUT for the same key. This is the mechanism by which the coordinator knows the causal history of the write and can detect concurrent versions. A client that forgets to send the vector clock (or sends `VectorClock.empty()`) will produce a write with an uninformed clock — the coordinator will not be able to detect conflicts with concurrent writers, effectively forcing LWW behavior for that write. The API design makes this opt-in: `required = false` allows stateless clients to omit the clock, accepting LWW semantics.
+
+<TradeoffTable title="Consistency model comparison for distributed KV stores">
+
+| Model | Consistency | Availability | Latency | Best for |
+|---|---|---|---|---|
+| **Strong (strict quorum, no sloppy)** | Linearizable — reads always see latest write | Sacrificed during partition — write unavailable if W nodes unreachable | Highest — blocks on slowest of W nodes | Financial records, inventory counts, leader election |
+| **Eventual (sloppy quorum + LWW)** | Eventual — replicas converge after partition heals | Maximum — any N healthy nodes can serve writes | Lowest — coordinator returns after 2nd ack | Shopping carts, user preferences, metrics aggregation |
+| **Session consistency** | Read-your-own-writes — within a session, reads reflect prior writes | Good — session sticky routing, falls back gracefully | Low — single-node session read path | User profile reads, settings pages, feed personalization |
+| **Monotonic read** | No regressions — once you read version V, you never see an older version | Good — requires version tracking per client | Low — version watermark checked on each read | News feed timelines, comment threads, event sourcing |
+
+</TradeoffTable>
+
+<Pitfall title="Using wall-clock timestamps for last-write-wins">
+
+NTP jitter of ±100 ms means a write that arrived causally later at Node A can be assigned a timestamp 150 ms earlier than a write that arrived causally earlier at Node B due to clock skew between nodes. When LWW discards the lower-timestamp version, it silently loses a write that from the application's perspective happened second. The symptom is phantom data loss: a user updates their profile picture, refreshes the page, and sees the old picture — not because the write failed, but because an earlier concurrent write had a higher wall-clock timestamp on a node with a fast clock.
+
+The correct solution is logical clocks — either Lamport timestamps (a single counter that is max(local, received) + 1 on every event) or vector clocks. Lamport timestamps provide total ordering of causally related events but cannot detect concurrent writes. Vector clocks provide partial ordering that correctly identifies concurrent writes as concurrent rather than assigning a false winner. Use wall-clock LWW only when the application can tolerate occasional write loss and all nodes are running with PTP hardware clock synchronization (< 1 µs drift) — essentially only in same-datacenter deployments with hardware timestamping.
+
+</Pitfall>
+
+<Pitfall title="Not implementing read repair">
+
+Without read repair, stale replicas remain stale until anti-entropy runs — and Merkle tree anti-entropy is typically scheduled as a background job running every few minutes to hours, not continuously. A replica that missed a write during a brief network hiccup can serve stale data for hours on every read that happens to route to it. At a 33% probability (1 of 3 replicas stale) with R=2 quorum, roughly 33% of reads will include the stale replica in the quorum response — and if the stale version's clock does not dominate the fresh version's clock, the coordinator returns fresh data. But the stale replica continues to serve the stale version for any subsequent read that reaches quorum with the stale replica as one of the R respondents.
+
+Read repair is free in terms of additional RPCs — you are already reading from N nodes to form the R-quorum; the repair is a background write to the stale nodes that piggybacks on work you were already doing. The implementation cost is minimal: compare vector clocks across the R responses, identify stale respondents, and fire async writes to them. Not implementing read repair is a false economy that trades correctness for a few hours of engineering time.
+
+</Pitfall>
+
+## Curveballs
+
+<Curveball question="A network partition splits your 5-node ring into groups [A, B] and [C, D, E]. With N=3, R=2, W=2, which partition can still serve reads? Writes? What happens when the partition heals?">
+
+With N=3 and W=2, a write requires 2 acks from the preference list. For any key whose preference list spans both partitions, the [A, B] partition has at most 2 nodes — it can form a W=2 write quorum only if both A and B are in the preference list for that key. The [C, D, E] partition has 3 nodes and can always form W=2 and R=2 quorums. In practice, the majority partition [C, D, E] continues to serve full read/write traffic. The minority partition [A, B] can serve reads for keys where both A and B are in the preference list (R=2 quorum from 2 nodes — exactly meeting quorum, so zero tolerance for node errors within the partition). Writes from the minority partition either fail quorum or, with sloppy quorum enabled, succeed by writing to nodes outside the preference list with hints. When the partition heals, the Merkle tree anti-entropy process compares root hashes between all replica pairs and streams divergent key ranges. Concurrent writes that occurred on both sides of the partition surface as vector clock conflicts and are resolved by the client or by LWW depending on the configured strategy. The most important operational point: the majority partition's writes are canonical — minority partition writes that conflict are the ones requiring resolution.
+
+</Curveball>
+
+<Curveball question="Two clients simultaneously write different values to the same key with clock {A:1}. After quorum, the cluster has two conflicting versions. How does the client resolve it, and what should your API surface look like?">
+
+The two writes produce clocks `{A:2, nodeX:1}` and `{A:2, nodeY:1}` — neither dominates the other (node X counter is higher in the first, node Y counter is higher in the second). When a subsequent read assembles R=2 responses, it may receive both conflicting versions if different replicas hold different versions. The coordinator detects the conflict by comparing clocks and returns an HTTP 200 with `X-Version-Siblings: 2` and a multipart body containing both versions with their respective clocks. The client is expected to apply domain-specific merge logic — for a shopping cart, union of items; for a counter, sum; for a user profile, last-edited-field wins. The client then writes back the merged value with a merged clock: `{A:2, nodeX:1, nodeY:1}` — this clock dominates both conflicting versions, resolving the conflict on all replicas that receive the next write. The API must be designed to make siblings visible: a simple 200 with a single body silently loses one of the conflicting versions. The Riak HTTP API (`X-Riak-Vclock`, `multipart/mixed` response body for siblings) is the canonical reference implementation for this pattern.
+
+</Curveball>
+
+<Curveball question="Your Merkle tree anti-entropy detects a 10% key-range divergence between two nodes after a 30-minute partition. Syncing 10% of 1 TB = 100 GB. How do you sync this without impacting live traffic?">
+
+Naively streaming 100 GB at full network speed on a 10 Gbps link takes about 80 seconds — but saturating the NIC during sync would starve live read/write traffic. The mitigation is rate-limited, priority-queued streaming. The sync process runs as a background goroutine (or virtual thread) with a token bucket rate limiter capped at 10–20% of available network bandwidth — roughly 1–2 Gbps, allowing sync to complete in 7–14 minutes while leaving 80% of bandwidth for live traffic. Within the sync, prioritize recently written keys (those with high vector clock counters or recent WAL entries) over cold keys — the hot keys are more likely to be read and will benefit most from being consistent first. The Merkle tree narrows the divergence to specific leaf ranges rather than requiring a full key scan: only keys in the 10% divergent range are streamed. Additionally, the sync is idempotent — if it is interrupted and restarted, it simply compares Merkle hashes again and resumes from where the trees still diverge. The key interview point is demonstrating awareness of the backpressure mechanism: unlimited sync bandwidth is a common operational anti-pattern that has caused cascading failures when syncing a recovered node overwhelms the rest of the cluster.
+
+</Curveball>
+
+<RelatedQuestions items={[
+  { slug: "consistent-hashing", title: "Design a Consistent Hashing Service", difficulty: "senior" },
+  { slug: "design-a-cache", title: "Design a Distributed Cache", difficulty: "senior" },
+  { slug: "distributed-locking-service", title: "Design a Distributed Locking Service", difficulty: "staff" },
+]} />
+
+## Further reading
+
+- [Dynamo: Amazon's Highly Available Key-value Store](https://dl.acm.org/doi/10.1145/1294261.1294281) — DeCandia et al., SOSP 2007. The foundational paper. Sections 4.3 (partitioning), 4.4 (replication), 4.5 (data versioning with vector clocks), and 4.8 (anti-entropy using Merkle trees) are the essential reading. The entire system design vocabulary in this article — sloppy quorum, hinted handoff, preference list, N/R/W — originates here.
+- [Designing Data-Intensive Applications](https://dataintensive.net/) — Martin Kleppmann, Chapter 5 (Replication) and Chapter 7 (Transactions). The clearest prose explanation of vector clocks, read repair, and the leaderless replication model available in print. Chapter 5's treatment of multi-leader and leaderless replication is the canonical reference for interview preparation.
+- [Apache Cassandra Architecture — Dynamo](https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html) — Cassandra's production implementation of the Dynamo model, including `num_tokens` (virtual nodes), gossip internals, lightweight transactions (Paxos for CAS), and `NetworkTopologyStrategy` for AZ-aware replica placement. Particularly useful for understanding how the theoretical Dynamo model maps to a shipping system.
+- [Riak Documentation — Vector Clocks](https://docs.riak.com/riak/kv/latest/learn/concepts/causal-context/) — Riak's implementation of causal context (vector clocks and DVVSets — dotted version vectors) is the most thorough production documentation of the conflict detection and sibling resolution model. DVVSets solve the clock pruning problem that Dynamo's original vector clock implementation encountered at scale.

@@ -1,0 +1,480 @@
+---
+title: "Design a Metrics & Monitoring System"
+slug: "metrics-monitoring"
+category: "infra"
+difficulty: "senior"
+estimatedReadMinutes: 22
+tags: ["prometheus", "time-series", "gorilla-compression", "pull-vs-push", "cardinality", "alertmanager", "grafana"]
+companyFlavors: ["Prometheus", "Datadog", "InfluxDB", "Timescale", "AWS CloudWatch", "VictoriaMetrics"]
+prerequisites: []
+relatedQuestions: ["distributed-logging-system", "distributed-job-scheduler", "api-gateway"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Design a time-series metrics system that collects billions of data points per day, stores them with 10× compression, evaluates alerting rules in near-real-time, and supports ad-hoc queries — covering pull vs push, cardinality limits, Gorilla compression, and downsampling."
+javaPackages: ["io.micrometer:micrometer-core:1.13.0", "io.micrometer:micrometer-registry-prometheus:1.13.0", "org.springframework.boot:spring-boot-starter-actuator:3.3.0"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="metrics-monitoring" title="Design a Metrics & Monitoring System" />
+
+<Tldr>
+- **Pull model** (Prometheus scrapes targets every 15 s) is operationally simpler than push (agents push to a central endpoint) — service discovery becomes a config problem, not an infrastructure problem
+- **Gorilla compression** (Facebook's TSDB paper): delta-of-delta encoding for timestamps + XOR encoding for values → ~1.37 bytes per data point vs 16 bytes raw (12× compression)
+- **High cardinality kills TSDB**: `http_requests_total{userId="abc123"}` with 10 M users creates 10 M time series — this is a "cardinality bomb". Use `user_segment` or `user_tier` instead
+- **Rule evaluation**: alerting rules run on the Prometheus server every 15 s as PromQL queries. Don't put business logic in alerts — use recording rules to precompute expensive aggregations
+- **Downsampling for long-term storage**: keep raw (1 s resolution) for 3 days, 1-minute aggregates for 30 days, 1-hour aggregates for 1 year. Query costs drop 60× for year-over-year comparisons
+</Tldr>
+
+## Why time-series is different from general-purpose storage
+
+A relational database is designed around random reads and writes: you look up a row by primary key, update arbitrary columns, and run joins across tables. None of that describes how metrics work. Metrics are append-only: you never update a past data point, you never delete a single sample, and every write carries a monotonically increasing timestamp. The access pattern is almost entirely time-range scans — "give me all samples for `http_requests_total{service='api'}` between noon and 1 PM." That is structurally different from what a B-tree index is optimized for.
+
+The throughput requirements make the gap even wider. A production Postgres instance handles 10 K–100 K writes per second under favorable conditions. A single Prometheus instance routinely ingests 1–5 million samples per second, each sample being a `(timestamp, float64)` pair. Achieving that throughput requires a write path that bypasses traditional indexing entirely: samples stream into an in-memory chunk buffer, are appended sequentially, and are flushed to disk as immutable blocks. There are no update locks, no WAL-redo overhead for value columns, and no index B-tree to rebalance. The entire TSDB is built around the one invariant that makes this possible: **time only moves forward**.
+
+Query patterns reinforce the specialization. Dashboards aggregate over time ranges — `rate(metric[5m])`, `avg_over_time(metric[1h])`. These are range scans over a contiguous slice of a sorted array, which a column-store layout handles at memory bandwidth speeds. A general-purpose database would need to deserialize rows, apply predicates across multiple columns, and aggregate in a generic executor. A TSDB can push raw compressed chunks directly into the aggregation kernel, skipping deserialization for chunks that don't match the label filter. The result is that TSDBs can answer a 1-hour aggregation over 10 million samples in under 100 ms — a query that would take seconds in a general-purpose database.
+
+## Clarifying questions
+
+| Question | Ideal answer to elicit | Why it matters |
+|---|---|---|
+| Pull or push model? | Pull for long-running services, push gateway for batch jobs | Shapes the ingestion architecture and service discovery story |
+| Data retention policy? | Raw 3 days, 1-min aggregates 30 days, 1-hour aggregates 2 years | Determines storage tier design and downsampling pipeline |
+| Query patterns — real-time dashboards or long-term trend analysis? | Both — p99 dashboards need < 1 s, year-over-year needs < 10 s | Drives whether you need Thanos/Cortex for long-term query federation |
+| Alerting latency requirement? | Alert fires within 1–2 minutes of condition starting | Rules out sub-second alerting paths; sets scrape_interval budget |
+| Expected cardinality — how many unique time series? | 10 M active series at peak | Single most important number for head block memory sizing |
+| Multi-tenant? | Yes — 50 teams, isolated namespaces | Requires per-tenant cardinality limits and query isolation |
+| High availability for the metrics system itself? | Yes — metrics must survive a single AZ outage | Drives Prometheus HA pairs + remote write to replicated object storage |
+| Integration with existing systems? | Grafana for dashboards, PagerDuty for alert routing | Informs AlertManager config and Grafana data source setup |
+
+Two questions that often go unasked but matter significantly: (1) What is the maximum label count per metric? Unbounded labels are how cardinality explosions start. (2) Does the organization need audit logs of alert state changes? That adds an event store requirement to the alerting path.
+
+## Functional requirements
+
+- **Metric ingestion**: services expose a `/metrics` endpoint in the Prometheus text exposition format; the system scrapes those endpoints on a configurable interval (default 15 s)
+- **Metric types**: counter (monotonically increasing), gauge (arbitrary value), histogram (bucketed distribution for latency/size), summary (client-side quantile computation)
+- **Ad-hoc queries**: a PromQL-compatible query engine that supports instant queries and range queries over arbitrary time windows
+- **Alerting rules**: users define alerting rules as PromQL expressions with a `for` duration; the system evaluates rules on every scrape cycle and fires alerts when the condition persists beyond the `for` period
+- **Alert routing and notification**: AlertManager deduplicates, groups, and routes alerts to configured receivers (PagerDuty, Slack, email)
+- **Dashboards**: Grafana connects to the query API; the metrics system does not own the dashboard UI
+- **Recording rules**: precomputed aggregations stored as new time series, reducing query cost for high-cardinality aggregations
+- **Federation**: a global Prometheus can scrape aggregated metrics from per-cluster Prometheus instances for cross-cluster views
+
+## Non-functional requirements
+
+- **Ingest throughput**: 5 M samples/sec sustained, 10 M samples/sec burst
+- **Active time series**: 10 M unique label sets
+- **Query latency**: < 1 s p99 for queries over the last hour of data; < 10 s p99 for queries spanning one year
+- **Alert evaluation latency**: rule evaluates within 30 s of condition becoming true (15 s scrape + 15 s rule evaluation interval)
+- **Retention**: 3-day raw storage at full resolution; 30-day 1-minute downsampled; 2-year 1-hour downsampled
+- **Availability**: 99.9% uptime for the ingestion and query paths; scrape gaps < 30 s during rolling restarts
+- **Durability**: no data loss for samples older than 2 hours (head block WAL provides recovery for the most recent 2 hours)
+
+## Capacity estimation
+
+<Capacity title="Back-of-envelope: 5 M samples/sec, 10 M active series, 2-year retention">
+
+**Raw ingest bandwidth**
+
+$$
+5 \times 10^6 \; \text{samples/s} \times 16 \; \text{bytes/sample (timestamp + float64)} = 80 \; \text{MB/s raw}
+$$
+
+**After Gorilla compression (12× typical)**
+
+$$
+\frac{80 \; \text{MB/s}}{12} \approx 6.7 \; \text{MB/s compressed}
+$$
+
+**3-day raw storage (compressed)**
+
+$$
+6.7 \; \text{MB/s} \times 86{,}400 \; \text{s/day} \times 3 \; \text{days} \approx 1.7 \; \text{TB}
+$$
+
+**30-day 1-minute downsampled tier**
+
+At 1-minute resolution, 5 M series each emit one sample per minute:
+
+$$
+\frac{5 \times 10^6 \; \text{series}}{60 \; \text{s}} \approx 83{,}333 \; \text{samples/s}
+$$
+
+$$
+83{,}333 \times 16 \; \text{B} \times 86{,}400 \; \text{s/day} \times 30 \; \text{days} \approx 3.4 \; \text{TB}
+$$
+
+**1-year 1-hour downsampled tier**
+
+$$
+\frac{5 \times 10^6}{3{,}600} \approx 1{,}389 \; \text{samples/s} \times 16 \; \text{B} \times 31{,}536{,}000 \; \text{s/year} \approx 700 \; \text{GB}
+$$
+
+**Head block memory (in-memory ingestion buffer)**
+
+Each active series holds approximately one 2-hour compressed chunk in memory:
+
+$$
+10 \times 10^6 \; \text{series} \times 3 \; \text{KB/series} = 30 \; \text{GB RAM}
+$$
+
+This is the minimum RAM for the Prometheus head block — add OS page cache and label index overhead, and a real deployment needs 64–128 GB per Prometheus instance.
+
+**Total 2-year storage (all tiers)**
+
+$$
+1.7 \; \text{TB} + 3.4 \; \text{TB} + 0.7 \; \text{TB} \approx 5.8 \; \text{TB}
+$$
+
+Stored on S3-compatible object storage at ~$0.023/GB-month: approximately $134/month for the long-term tiers.
+
+</Capacity>
+
+## API design
+
+The query API follows the Prometheus HTTP API contract, which Grafana and most observability tooling already understand.
+
+```
+POST /api/v1/write
+Content-Type: application/x-protobuf
+Content-Encoding: snappy
+Body: Prometheus remote write protobuf (TimeSeries[])
+
+Writes a batch of time series samples. Used by remote write clients
+(Prometheus, OpenTelemetry Collector) to push data to a central store.
+Response: 204 No Content on success, 400 on schema violation, 429 on overload.
+```
+
+```
+GET /api/v1/query?query=<PromQL>&time=<unix_timestamp>
+
+Instant query — evaluates the PromQL expression at a single point in time.
+Returns: { "status": "success", "data": { "resultType": "vector", "result": [...] } }
+Example: /api/v1/query?query=rate(http_requests_total[5m])&time=1746614160
+```
+
+```
+GET /api/v1/query_range?query=<PromQL>&start=<ts>&end=<ts>&step=<seconds>
+
+Range query — evaluates the expression at each step interval between start and end.
+Returns: { "status": "success", "data": { "resultType": "matrix", "result": [...] } }
+Example: query=sum(rate(http_requests_total[5m]))&start=1746528000&end=1746614400&step=60
+```
+
+```
+POST /api/v1/rules
+Content-Type: application/json
+Body: { "name": "payment-alerts", "type": "alerting" | "recording", "expr": "<PromQL>",
+        "for": "2m", "labels": {}, "annotations": {} }
+
+Creates or updates an alerting or recording rule group.
+Response: 201 Created with rule ID.
+```
+
+```
+GET /api/v1/alerts
+
+Returns all currently active alerts across all rule groups.
+Response: { "status": "success", "data": { "alerts": [ { "labels": {}, "state": "firing", ... } ] } }
+```
+
+## Data model
+
+**Time series identity**: a time series is uniquely identified by its metric name plus a set of key-value labels: `{__name__="http_requests_total", method="GET", path="/api/v1/users", status="200"}`. The label set is hashed to produce a 64-bit series ID. Two label sets that differ by any single label value are distinct series — this is why cardinality explodes when label values are unbounded.
+
+**Sample**: a `(int64 timestamp_ms, float64 value)` tuple. 16 bytes uncompressed.
+
+**Chunk**: a 2-hour compressed block of samples for a single time series, using Gorilla encoding. Typical size after compression: 1–2 KB for a series scraped every 15 s (480 samples at ~1.37 bytes each ≈ 660 bytes).
+
+**Head block**: the in-memory data structure holding the most recent 2 hours of data for all active series. Backed by a Write-Ahead Log (WAL) for crash recovery — if Prometheus restarts, it replays the WAL to reconstruct the head block. The WAL is truncated when a head block is compacted and flushed to disk.
+
+**Persistent blocks**: immutable, directory-based data structures on disk. Each block covers a non-overlapping time range (default 2 hours initially, compacted into larger blocks over time). A block directory contains: `chunks/` (the compressed chunk data), `index` (label inverted index + series metadata), `meta.json` (block metadata), and `tombstones` (deleted series markers for soft deletes).
+
+**Label index**: an inverted index mapping `label_name=label_value → [seriesId₁, seriesId₂, ...]`. This is what makes label-based queries fast — a query for `{job="api-server"}` looks up that label value in the index and gets the list of matching series IDs directly, without scanning all series.
+
+**Block compaction**: Prometheus compacts small 2-hour blocks into larger blocks (up to a configurable max, default 31 days) to reduce the number of open file handles and improve query performance. Compaction also applies tombstones and runs retention deletion.
+
+## High-level architecture
+
+<Mermaid caption="System architecture: scrape pipeline, storage, alerting, and long-term federation" diagram={`graph TB
+  Services["Microservices\\n/metrics endpoints"] --> Prom["Prometheus\\nScrape + TSDB"]
+  PushGW["Push Gateway\\nfor batch jobs"] --> Prom
+  Prom --> RemoteWrite["Remote Write\\nThanos / Cortex"]
+  RemoteWrite --> ObjStore["Object Store\\nS3 - long-term"]
+  Prom --> AlertMgr["AlertManager"]
+  AlertMgr --> PagerDuty["PagerDuty /\\nSlack"]
+  Prom --> Grafana["Grafana\\nDashboards"]`} />
+
+The scrape loop is the heartbeat of the system. Every 15 seconds, Prometheus iterates over its list of scrape targets (populated by service discovery — Kubernetes pod annotations, Consul catalog, or static config), issues an HTTP GET to each target's `/metrics` endpoint, and parses the Prometheus text exposition format into a stream of `(series, timestamp, value)` triples. Each triple is appended to the head block in memory and written to the WAL.
+
+The Pushgateway is the escape hatch for jobs that cannot expose a `/metrics` endpoint because they are too short-lived. A Kubernetes Job that runs for 30 seconds finishes before Prometheus's next scrape — it pushes its final metric values to the Pushgateway before exiting, and Prometheus scrapes the Pushgateway normally. The Pushgateway is intentionally not a general-purpose metrics aggregation layer; it is designed specifically for this batch job pattern.
+
+AlertManager sits downstream of Prometheus's rule evaluation engine. When a rule's PromQL expression evaluates to a non-empty result for longer than the `for` duration, Prometheus sends a "firing" alert payload to AlertManager. AlertManager handles the operational complexity: deduplicating repeated alert sends, grouping related alerts (e.g., all alerts for the same service into one PagerDuty incident), silencing alerts during planned maintenance, and routing to the right receiver based on label matchers.
+
+## Deep dives
+
+### Gorilla compression
+
+Facebook's 2015 TSDB paper ("Gorilla: A Fast, Scalable, In-Memory Time Series Database") introduced the compression scheme that Prometheus and virtually every modern TSDB has adopted.
+
+**Timestamp compression** exploits the regularity of scrape intervals. If you scrape every 15 seconds, every consecutive timestamp pair has a delta of exactly 15,000 ms. The delta-of-delta (the change in the delta) is 0. Gorilla stores the first timestamp in full (64 bits), the first delta in 14 bits, and then each subsequent delta-of-delta using a variable-length encoding: if it's 0, store a single `0` bit; if it fits in 7 bits, store `10` followed by 7 bits; if it fits in 9 bits, store `110` followed by 9 bits; otherwise store `1110` followed by 12 bits. For a perfectly regular scrape interval, every timestamp after the first two costs **1 bit**.
+
+**Value compression** uses XOR with the previous value. If a gauge changes by a small amount (e.g., CPU usage fluctuates from 0.432 to 0.437), the XOR has many leading zeros and many trailing zeros — only the middle bits differ. Gorilla encodes the XOR using the control bit scheme: `0` if the XOR is zero (value unchanged), `10` followed by a 5-bit block length and 6-bit leading-zero count if the XOR fits in the same block as the previous one, or `11` followed by the full XOR value. Counter metrics that increment monotonically by 1 on each scrape will have XOR values in the range of the machine epsilon — extremely compressible.
+
+The combined result is approximately **1.37 bytes per sample** for typical production metrics — compared to 16 bytes raw. That is an 11.7× compression ratio, which is why the commonly quoted figure is "12× compression."
+
+### Cardinality management
+
+Cardinality is the count of distinct time series — the count of distinct label set combinations. It is the single most important operational concern in a Prometheus deployment.
+
+Consider `http_requests_total{method="GET", path="/api/v1/users", status="200"}`. That is one time series. Now add `userId` as a label: `http_requests_total{method="GET", path="/api/v1/users", status="200", userId="user-abc-123"}`. If your service has 10 million users, that creates 10 million distinct time series for this one metric — each requiring its own chunk buffer in the head block, its own WAL entry, its own label index entry. At 3 KB per series, that is 30 GB of RAM just for this one metric. This is the cardinality bomb.
+
+The root cause is a misunderstanding of what a metric is designed to express. Metrics are for **aggregates**, not for individual entities. The question "how many HTTP requests did user abc123 make in the last hour?" is not a metrics question — it is a tracing or logging question. The correct metric is `http_requests_total{user_tier="premium", status="200"}`, which has a cardinality proportional to the number of user tiers (typically 3–5), not the number of users.
+
+Practical defenses: (1) Set a per-series ingestion limit in Prometheus (`--storage.tsdb.max-block-duration`, and more critically, the `sample_limit` in scrape config). (2) Use recording rules to pre-aggregate high-cardinality metrics — record `sum by (status, method) (rate(http_requests_total[5m]))` and query the recording rule instead of the raw metric. (3) Use exemplars: Prometheus supports attaching a single trace ID to a histogram observation (`# HELP`, `# TYPE` with `{trace_id="abc123"}`) without creating a new time series — the trace ID is stored as metadata on one sample, not as a label that multiplies series count.
+
+### Pull vs push
+
+Prometheus's pull model has a surprising operational advantage: the server controls when scrapes happen and has a complete list of targets. If a target disappears — whether due to a crash, network partition, or deployment — the scrape simply fails. You can write an alerting rule: `up == 0` — and know precisely which service is down. In a push model, you have to infer missing data from absent metric writes, which requires tracking expected senders.
+
+Service discovery integrations (Kubernetes SD, Consul SD, EC2 SD) mean the target list is maintained automatically. A new pod annotated with `prometheus.io/scrape: "true"` and `prometheus.io/port: "8080"` appears in the scrape list within one SD refresh cycle (typically 5 minutes for Kubernetes). No agent configuration is needed.
+
+The pull model's main limitation is the 15-second scrape floor. Events shorter than one scrape interval are invisible. Prometheus is not designed for millisecond-resolution metrics — if you need that, you need a push-based system (StatsD, OpenTelemetry with a push exporter) with a higher-frequency collection path.
+
+Push model trade-offs in detail:
+
+| Dimension | Pull (Prometheus) | Push (Datadog Agent / OTLP) |
+|---|---|---|
+| Service discovery | Centralized in scrape config | Each agent self-registers |
+| Down detection | Scrape failure → `up=0` alert | Missing heartbeat → explicit tracking |
+| Firewall requirements | Prometheus must reach targets | Agents must reach collector endpoint |
+| Short-lived jobs | Requires Pushgateway | Native fit |
+| Sub-15s resolution | Not supported | Configurable per agent |
+
+### Long-term storage with Thanos and Cortex
+
+A single Prometheus instance is practical up to approximately 2 weeks of retention and 10 M active series. Beyond that, you need a federated or horizontally scalable layer.
+
+**Thanos** augments Prometheus without replacing it. The Thanos sidecar runs alongside each Prometheus instance, uploads completed 2-hour blocks to object storage (S3, GCS) after local compaction, and exposes a gRPC Store API. The Thanos Query component federates queries across multiple Prometheus sidecars and the object storage backend — you query Thanos Query as if it were a single Prometheus, and it fans out to all data sources and merges results. Thanos Compactor runs as a singleton to compact and downsample blocks in object storage.
+
+**Cortex** (now Grafana Mimir) takes a different approach: it replaces Prometheus's storage entirely with a horizontally scalable distributed TSDB. Ingest goes through a Distributor (hashes series to Ingesters using consistent hashing), Ingesters write to a Dynamo-style ring, and chunks are eventually flushed to object storage. Cortex is fully multi-tenant — tenant ID is passed as an HTTP header, and all data is isolated per tenant with per-tenant cardinality limits.
+
+**VictoriaMetrics** is a notable alternative: a single-binary cluster mode that is simpler to operate than Cortex, benchmarks faster than Prometheus on compression and query speed, and supports the Prometheus remote write protocol natively. Many organizations use VictoriaMetrics as a long-term storage backend for Prometheus via remote write.
+
+## Java integration
+
+**Part A — Micrometer metrics instrumentation**
+
+Micrometer is the standard metrics facade for JVM applications — it is to metrics what SLF4J is to logging. It supports dozens of backends (Prometheus, Datadog, InfluxDB, CloudWatch) via registry implementations, so instrumentation code is backend-agnostic.
+
+```java
+package dev.pushkar.monitoring;
+
+import io.micrometer.core.instrument.*;
+import org.springframework.stereotype.Service;
+import java.util.concurrent.atomic.AtomicInteger;
+
+@Service
+public class PaymentService {
+    private final Counter paymentCounter;
+    private final Timer paymentTimer;
+    private final Gauge pendingPaymentsGauge;
+    private final AtomicInteger pendingCount = new AtomicInteger(0);
+    private final MeterRegistry meterRegistry;
+
+    public PaymentService(MeterRegistry registry) {
+        this.meterRegistry = registry;
+
+        this.paymentCounter = Counter.builder("payments.processed.total")
+            .tag("status", "success")
+            .description("Total payments processed successfully")
+            .register(registry);
+
+        this.paymentTimer = Timer.builder("payments.processing.duration")
+            .description("Payment processing latency")
+            .publishPercentiles(0.5, 0.95, 0.99)
+            .register(registry);
+
+        this.pendingPaymentsGauge = Gauge.builder("payments.pending", pendingCount, AtomicInteger::get)
+            .description("Current number of in-flight payments")
+            .register(registry);
+    }
+
+    public PaymentResult processPayment(PaymentRequest req) {
+        pendingCount.incrementAndGet();
+        return paymentTimer.record(() -> {
+            try {
+                var result = doProcess(req);
+                paymentCounter.increment();
+                return result;
+            } catch (Exception e) {
+                Counter.builder("payments.processed.total")
+                    .tag("status", "error")
+                    .tag("error_type", e.getClass().getSimpleName())
+                    .register(meterRegistry)
+                    .increment();
+                throw e;
+            } finally {
+                pendingCount.decrementAndGet();
+            }
+        });
+    }
+
+    private PaymentResult doProcess(PaymentRequest req) {
+        // actual payment processing logic
+        return new PaymentResult(req.id(), "success");
+    }
+}
+```
+
+Three instrumentation patterns shown here are worth calling out explicitly. The `Timer.record(Supplier<T>)` overload measures the exact wall-clock duration of the lambda including exceptions — you never need to manually start and stop a timer. The `Gauge` is bound to the `AtomicInteger` directly via a method reference, so it always reflects the live value without requiring manual updates. The error counter uses a different `tag("status", "error")` rather than a separate metric name — this keeps related counter series aligned under the same metric name, making PromQL ratio queries trivial: `rate(payments_processed_total{status="error"}[5m]) / rate(payments_processed_total[5m])`.
+
+**Part B — Spring Boot Actuator and Prometheus endpoint configuration**
+
+Spring Boot Actuator exposes Micrometer metrics at `/actuator/prometheus` in the Prometheus text exposition format. Prometheus scrapes this endpoint directly — no agent needed.
+
+```java
+// application.yml — expose /actuator/prometheus for Prometheus scraping
+// management:
+//   endpoints:
+//     web:
+//       exposure:
+//         include: prometheus, health, info
+//   metrics:
+//     distribution:
+//       percentiles-histogram:
+//         http.server.requests: true
+//       slo:
+//         http.server.requests: 100ms, 500ms, 1000ms
+
+@Configuration
+public class MetricsConfig {
+
+    @Bean
+    public MeterRegistryCustomizer<PrometheusMeterRegistry> commonTags(
+            @Value("${spring.application.name}") String appName) {
+        return registry -> registry.config()
+            .commonTags(
+                "application", appName,
+                "region", System.getenv().getOrDefault("AWS_REGION", "us-east-1")
+            )
+            .meterFilter(MeterFilter.maximumAllowableTags(
+                "http.server.requests", "uri", 200, MeterFilter.deny()));
+    }
+}
+```
+
+The `MeterFilter.maximumAllowableTags` call caps the cardinality of the `uri` tag to 200 unique values. Without this, a service that receives requests to arbitrary URL paths (e.g., `/api/v1/users/{userId}`) will create one series per user ID — a cardinality bomb. Spring Boot's `WebMvcTagsContributor` already normalizes `{userId}` path variables into `/api/v1/users/{userId}` template form, but the filter is a useful safety net.
+
+The `percentiles-histogram: true` setting switches Micrometer from summary quantiles (computed client-side, not aggregatable) to native histograms (stored as bucket counts, aggregatable across instances). This matters at scale: if you have 10 pods, client-side P99 values cannot be averaged — `avg(p99)` is not `p99(all)`. Histogram buckets can be summed across instances: `histogram_quantile(0.99, sum(rate(http_server_requests_seconds_bucket[5m])) by (le))` gives the true P99 across all pods.
+
+**Part C — Prometheus alerting rule**
+
+```yaml
+groups:
+  - name: payment-alerts
+    rules:
+      - alert: HighPaymentErrorRate
+        expr: |
+          rate(payments_processed_total{status="error"}[5m])
+          / rate(payments_processed_total[5m]) > 0.01
+        for: 2m
+        labels:
+          severity: critical
+          team: payments
+        annotations:
+          summary: "Payment error rate above 1%"
+          description: >
+            Payment error rate is {{ printf "%.2f" (mul $value 100) }}%
+            on {{ $labels.instance }}. Investigate payment processor logs.
+          runbook_url: "https://wiki.internal/runbooks/high-payment-error-rate"
+
+  - name: payment-recording-rules
+    rules:
+      - record: job:payments_processed:rate5m
+        expr: sum(rate(payments_processed_total[5m])) by (job, status)
+```
+
+The recording rule pre-aggregates the per-instance counter into a per-job rate, stored as a new time series `job:payments_processed:rate5m`. Dashboards and subsequent alerting rules query this recording rule instead of the raw metric — query time drops from scanning 10-instance counter series to reading 1 pre-aggregated series. Recording rules follow the naming convention `<aggregation_level>:<metric_name>:<operation>` (e.g., `job:`, `cluster:`).
+
+<TradeoffTable title="TSDB backend comparison">
+
+| Backend | Cardinality Limit | Query Speed | Scalability | Multi-tenant |
+|---|---|---|---|---|
+| Prometheus (single-node) | ~10 M series | Very fast (local TSDB) | Single-node (~2 TB) | No |
+| Thanos | ~100 M series | Fast (federated gRPC) | Unlimited (S3-backed) | Partial (per-cluster) |
+| Cortex / Mimir | ~1 B series | Fast (distributed ingesters) | Unlimited (horizontal) | Yes — full isolation |
+| VictoriaMetrics | ~1 B series | Fastest (custom storage engine) | Cluster mode available | Partial |
+| InfluxDB | ~100 M series | Fast (IOx columnar engine) | Cluster (enterprise tier) | Yes |
+| AWS CloudWatch | No stated limit | Moderate (aggregated APIs) | Fully managed | Yes (per-account) |
+
+</TradeoffTable>
+
+The performance gap between VictoriaMetrics and Prometheus is real in benchmarks: VictoriaMetrics uses a custom merge tree storage format that achieves better compression than Prometheus's Gorilla implementation and significantly faster ingestion. The trade-off is operational complexity — it is a separate system to deploy and operate, rather than a drop-in extension of an existing Prometheus setup.
+
+<Pitfall title="Cardinality bomb — high-cardinality labels">
+
+Adding `userId`, `requestId`, `ip_address`, or `session_id` as a Prometheus label where the value has high cardinality creates millions of time series. Each series requires its own chunk buffer in the head block (~3 KB), its own WAL entries, and its own label index entries. The math is unforgiving: 10 M users × 3 KB = 30 GB just for the head block of a single metric. The Prometheus process will OOM before you notice the problem in a dashboard.
+
+The correct approach: use exemplars for request-level data. A histogram observation can carry an exemplar — a single `{trace_id="abc123"}` annotation stored as metadata on one sample, not multiplied across series. This gives you the ability to jump from a latency spike in Grafana to the specific trace in Jaeger, without the cardinality cost.
+
+</Pitfall>
+
+<Pitfall title="Scraping too frequently creates a self-inflicted DDoS">
+
+Setting `scrape_interval: 1s` for 10,000 targets creates 10,000 HTTP requests per second from Prometheus to your services — before any user traffic exists. At 1 s interval with a 500 ms scrape timeout, Prometheus will have 5,000 concurrent scrape connections in flight at all times. This is enough to saturate the connection pool of a typical Spring Boot service.
+
+The default `scrape_interval: 15s` is a carefully chosen balance: it provides adequate granularity for sub-minute alerting rules (using `rate(...[5m])` windows), while keeping the aggregate scrape load manageable. If you need sub-15 s alerting, use recording rules that evaluate on a faster interval — not a shorter scrape interval. Alert rule evaluation is cheap (PromQL over local data); scraping is expensive (N×HTTP connections).
+
+</Pitfall>
+
+<Curveball question="A Kubernetes cluster deploys 10,000 pods, each exposing 100 metrics with 5 labels each. How much memory does Prometheus need in its head block, and can a single Prometheus instance handle this?">
+
+First, calculate cardinality. If each metric has an average of 10 unique label combinations across the 10,000 pods (one per pod for pod-level metrics), that is 100 metrics × 10,000 pods = 1 M time series. At 3 KB per series in the head block: 3 GB of RAM just for chunk buffers. Add label index overhead (approximately 50 bytes per series per label: 5 labels × 50 B × 1 M series = 250 MB), WAL buffer, and OS page cache for persistent blocks — total memory requirement is approximately 8–12 GB.
+
+A single Prometheus instance can handle this — the 1 M series is well within the 10 M practical limit. However, 10,000 scrape targets at a 15 s interval means Prometheus must sustain 667 concurrent HTTP connections. The main bottleneck becomes the scrape goroutine pool and network file descriptors. Set `--web.max-connections` and use a Prometheus instance with at least 4 vCPUs. For resilience, run two Prometheus instances in HA mode (identical scrape config), with Thanos Deduplicator or Grafana Mimir's deduplication layer removing duplicate samples.
+
+</Curveball>
+
+<Curveball question="An alert fires: HighPaymentErrorRate. You open Grafana and the error rate is 0%. The alert clears after 2 minutes. What is happening, and how do you prevent alert flapping?">
+
+This is a classic alert flapping scenario caused by the interaction between scrape interval, `for` duration, and metric staleness. The most likely cause: the `rate()` function computes over a 5-minute window, but if there were zero successful payments during a brief window (e.g., during a deployment restart), the denominator of `rate(payments_processed_total[5m])` briefly becomes very small or zero, causing the ratio to spike spuriously. By the time you look at Grafana, the window has rolled forward and the denominator is healthy again.
+
+Prevention strategies: (1) Use `rate(...[10m])` instead of `rate(...[5m])` to smooth over scrape gaps during restarts. (2) Add a minimum traffic guard: `rate(payments_processed_total{status="error"}[5m]) / rate(payments_processed_total[5m]) > 0.01 and rate(payments_processed_total[5m]) > 10` — only fire the alert if there is meaningful traffic. Without the `and` clause, a denominator of 0.001 req/s makes 0.00001 errors/s look like a 1% error rate. (3) Increase the `for: 2m` to `for: 5m` — flapping alerts almost always fail to sustain for more than a scrape cycle or two. (4) Use AlertManager's `group_wait` and `repeat_interval` to suppress rapid re-firing.
+
+</Curveball>
+
+<Curveball question="Your Prometheus instance uses 256 GB of RAM and is OOMing nightly. You diagnose high cardinality. How do you identify which metrics are consuming the most memory, and how do you fix it without losing the data you need?">
+
+**Diagnosis**: Prometheus exposes a TSDB status API at `GET /api/v1/status/tsdb`. The response includes `seriesCountByMetricName` (top metrics by series count), `labelValueCountByLabelName` (top labels by value cardinality), and `seriesCountByLabelValuePair` (top label-value combinations). Run:
+
+```bash
+curl http://localhost:9090/api/v1/status/tsdb | jq '.data.seriesCountByMetricName[:10]'
+```
+
+This immediately tells you which metric names have the most time series. A healthy distribution shows no single metric above 100,000 series. If you see `http_requests_total: 8000000`, that metric is the culprit.
+
+**Fix without data loss**: (1) Add a `metric_relabel_config` in the scrape config to drop the high-cardinality label — this stops creating new series but does not delete existing ones. (2) Use `POST /api/v1/admin/tsdb/delete_series?match[]={high_cardinality_label=~".+"}` to soft-delete the offending series (requires `--web.enable-admin-api`). (3) Run `POST /api/v1/admin/tsdb/clean_tombstones` to reclaim the memory. For the data you need to preserve, use a recording rule to pre-aggregate it before dropping the raw label: record `sum by (method, status) (rate(http_requests_total[5m]))` and delete the raw series. The aggregated recording rule preserves the signal without the per-instance cardinality.
+
+</Curveball>
+
+<RelatedQuestions items={[
+  { slug: "distributed-logging-system", title: "Design a Distributed Logging System", difficulty: "senior" },
+  { slug: "distributed-job-scheduler", title: "Design a Distributed Job Scheduler", difficulty: "senior" },
+  { slug: "api-gateway", title: "Design an API Gateway / Service Mesh", difficulty: "senior" },
+]} />
+
+## Further reading
+
+- [Gorilla: A Fast, Scalable, In-Memory Time Series Database](https://www.vldb.org/pvldb/vol8/p1816-teller.pdf) — The Facebook TSDB paper (VLDB 2015) that introduced delta-of-delta and XOR compression. Required reading before any TSDB interview.
+- [Prometheus Storage Documentation](https://prometheus.io/docs/prometheus/latest/storage/) — Official documentation on the Prometheus TSDB block format, compaction strategy, and WAL design.
+- [Thanos Architecture](https://thanos.io/tip/thanos/design.md/) — Deep dive into how Thanos extends Prometheus with object storage and federated querying without modifying the Prometheus binary.
+- [Monitoring Distributed Systems — Google SRE Book, Chapter 6](https://sre.google/sre-book/monitoring-distributed-systems/) — The canonical reference on the four golden signals (latency, traffic, errors, saturation) and the whitebox vs blackbox monitoring distinction.
+- [Cardinality is Key — Prometheus Blog](https://prometheus.io/blog/2016/07/23/pull-does-not-scale-or-does-it/) — Honest discussion of where the pull model scales and where it does not, from the Prometheus core team.

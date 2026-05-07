@@ -1,0 +1,631 @@
+---
+title: "Design an LLM Serving Infrastructure"
+slug: "llm-serving"
+category: "ai"
+difficulty: "staff"
+estimatedReadMinutes: 28
+tags: ["LLM", "KV-cache", "continuous-batching", "speculative-decoding", "PagedAttention", "vLLM", "quantization"]
+companyFlavors: ["OpenAI", "Anthropic", "Google", "Meta", "Microsoft Azure"]
+relatedQuestions: ["ml-inference-pipeline", "recommendation-engine", "vector-database"]
+publishedAt: "2025-01-07"
+updatedAt: "2025-01-07"
+summary: "Design production LLM serving infrastructure handling auto-regressive token generation at scale, using continuous batching, PagedAttention KV cache management, speculative decoding, and multi-node tensor parallelism."
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+
+<Bookmark slug="llm-serving" title="Design an LLM Serving Infrastructure" />
+
+<Tldr>
+- Auto-regressive decoding is memory-bandwidth-bound, not compute-bound: each token requires reading all model weights from HBM, leaving the GPU starved for data rather than compute.
+- Continuous batching (iteration-level scheduling) removes wasted GPU slots from finished requests — the key to 2–3× throughput improvement over static batching for mixed-length workloads.
+- PagedAttention manages the KV cache like virtual memory pages, eliminating 60–80% GPU memory waste from static max-context pre-allocation and enabling practical long-context serving.
+- Speculative decoding uses a small draft model to propose N tokens that the large model verifies in one forward pass — delivering 2–4× throughput gains for predictable, structured text.
+- Tensor parallelism splits each transformer layer across GPUs within a node via NVLink; pipeline parallelism splits layers across nodes for models that exceed aggregate per-node VRAM.
+</Tldr>
+
+Serving a large language model is a fundamentally different problem from serving a classification model. Instead of a single forward pass producing a fixed-size output, LLM inference is auto-regressive: generating a 1,000-token response requires 1,000 sequential forward passes. Each pass is memory-bandwidth-bound — the GPU spends more time reading model weights from HBM than computing — which means GPUs are starved for data, not compute. The entire LLM serving research area of the last three years (vLLM, TensorRT-LLM, SGLang) exists to solve this memory bandwidth problem.
+
+## Clarifying Questions
+
+Before sketching an architecture, a staff engineer should surface the assumptions that change the design by an order of magnitude:
+
+| Question | Why It Matters |
+|---|---|
+| Model size? (7B / 13B / 70B / 405B) | Determines minimum GPU count for weights alone; 70B at FP16 = 140GB, requiring multiple H100s |
+| Context window? (4K / 32K / 128K) | KV cache memory scales linearly with context; 128K contexts can require hundreds of GB per request |
+| Target TTFT and inter-token latency? | TTFT < 500ms drives prefill optimization; ITL < 50ms drives decode batch size ceiling |
+| GPU budget and cloud provider? | H100 NVLink topology dictates feasible tensor-parallel degree; A100 vs H100 affects HBM bandwidth by 2× |
+| Streaming output required? | If yes, SSE/WebSocket infrastructure needed; token is delivered as soon as it is generated |
+| Multi-turn chat or single-shot? | Multi-turn means KV cache grows across turns; prefix caching becomes valuable |
+| Safety/content classifier in the critical path? | Async classifier adds complexity; synchronous blocks streaming latency |
+| Model update cadence? | Weekly fine-tune pushes require zero-downtime blue-green deployment strategy |
+| Embedding endpoint alongside generation? | Separate serving path — embedding is compute-bound, not bandwidth-bound |
+| SLA tiers? (interactive vs batch) | Batch endpoints tolerate higher latency; separate queues with different scheduling policies |
+
+## Functional Requirements
+
+- Serve auto-regressive text generation with streaming output via Server-Sent Events, delivering tokens to the client as they are generated rather than buffering the entire response.
+- Support multi-turn conversation where the KV cache is preserved and extended across turns within a session, avoiding re-computation of the prompt on every round.
+- Allow request cancellation mid-generation: the client can abort a streaming response and the server must reclaim GPU resources (KV blocks) immediately.
+- Provide token-level usage tracking (prompt tokens, completion tokens) for billing and rate limiting enforcement per user and per API key.
+- Run a parallel safety classifier on generated output that can halt streaming and return a refusal without exposing unsafe content to the client.
+- Support zero-downtime model version updates with canary traffic splitting between old and new model versions.
+
+## Non-Functional Requirements
+
+- Time to first token (TTFT) under 500ms at p99 for standard prompts (up to 2K tokens).
+- Inter-token latency under 50ms (at least 20 tokens/sec) at p99 during the decode phase.
+- Support 10,000 concurrent streaming requests across the fleet.
+- 99.9% availability (less than 8.7 hours downtime per year).
+- Horizontal scalability: adding GPU nodes should increase throughput proportionally.
+- Graceful degradation under overload: queue requests rather than dropping them; expose backpressure metrics.
+
+## Capacity Estimation
+
+<Capacity title="LLM Serving Capacity">
+
+**Model weight memory (70B parameters, FP16):**
+
+$$W_{\text{weights}} = 70 \times 10^9 \times 2\,\text{B} = 140\,\text{GB}$$
+
+This requires at minimum 2× H100 80GB GPUs to hold weights alone, before any activations or KV cache.
+
+**KV cache memory per token:**
+
+Each transformer layer stores a key vector and a value vector. For a model with 64 attention heads, head dimension 128, stored in FP16:
+
+$$\text{KV per token per layer} = 2 \times 64 \times 128 \times 2\,\text{B} = 32{,}768\,\text{B} \approx 32\,\text{KB}$$
+
+Across 80 layers (typical for 70B):
+
+$$\text{KV per token (all layers)} = 80 \times 32\,\text{KB} = 2.56\,\text{MB/token}$$
+
+**KV cache per request at 4K context:**
+
+$$\text{KV}_{4096} = 4096 \times 2.56\,\text{MB} \approx 10\,\text{GB per request}$$
+
+**Total GPU memory formula:**
+
+$$\text{GPU memory} = W_{\text{weights}} + N_{\text{concurrent}} \times L_{\text{avg\_ctx}} \times \text{KV\_per\_token}$$
+
+For 100 concurrent requests at 4K average context with static allocation:
+
+$$140\,\text{GB} + 100 \times 10\,\text{GB} = 1{,}140\,\text{GB} \approx 1.14\,\text{TB}$$
+
+That would require 15 H100 80GB GPUs just for KV cache — unworkable. PagedAttention allocates only *used* tokens on demand, and typical fill rates average 20–30% of max context, cutting actual KV usage to roughly 200–300GB for the same concurrency.
+
+**Throughput estimation:**
+
+An 8× H100 server with continuous batching achieves approximately 5,000 output tokens/sec for a 70B model in FP16. For 10K concurrent users each generating at an effective average rate of 0.5 output tokens/sec (accounting for think time between turns):
+
+$$\text{Required throughput} = 10{,}000 \times 0.5\,\text{tok/s} = 5{,}000\,\text{tok/s}$$
+
+This requires 1 cluster of 8× H100s at full utilization. Adding 2× headroom for burst and prefill overhead: **2 clusters of 8× H100s = 16 H100s** for the decode fleet, plus separate capacity for prefill if using prefill/decode disaggregation.
+
+</Capacity>
+
+## API Design
+
+```text
+POST /v1/completions
+  body: { model, prompt, max_tokens, temperature, stream: true/false, stop: [str] }
+  → SSE: data: {"token": "Hello", "finish_reason": null}
+         data: {"token": " world", "finish_reason": null}
+         data: {"token": ".", "finish_reason": "stop"}
+         data: [DONE]
+
+POST /v1/chat/completions  (OpenAI-compatible)
+  body: { model, messages: [{role, content}], max_tokens, stream }
+  → Same SSE format; role tokens handled by the server-side chat template
+
+POST /v1/embeddings
+  body: { model, input: [str] }
+  → { embeddings: [[float]], usage: {prompt_tokens: int} }
+
+GET /v1/models
+  → { models: [{id, status, context_length, parameter_count}] }
+
+DELETE /v1/completions/{request_id}
+  → 204 No Content; server cancels generation and frees KV blocks
+```
+
+Key design decisions in the API:
+
+The `stream: true` flag on the completions endpoint returns SSE rather than waiting for the full response. This is not optional for interactive use cases: a 500-token response at 20 tok/s takes 25 seconds; users will close the connection if the first byte takes that long.
+
+Using the OpenAI-compatible `/v1/chat/completions` format matters for ecosystem compatibility. Most client libraries, LangChain, and third-party tooling assume this exact schema. Deviating from it without a strong reason creates unnecessary integration friction.
+
+The `DELETE /v1/completions/{request_id}` endpoint is often omitted from naive implementations but is critical for cost control. Without it, a user closing their browser still consumes GPU slots until the request times out.
+
+## Data Model
+
+```sql
+CREATE TABLE inference_requests (
+    request_id        UUID PRIMARY KEY,
+    user_id           UUID,
+    model_version     VARCHAR(100) NOT NULL,
+    prompt_tokens     INT NOT NULL,
+    completion_tokens INT,
+    status            VARCHAR(20) NOT NULL,
+    ttft_ms           INT,
+    total_latency_ms  INT,
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    completed_at      TIMESTAMPTZ
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE model_versions (
+    model_id        VARCHAR(100) NOT NULL,
+    version         VARCHAR(50)  NOT NULL,
+    artifact_uri    VARCHAR(1000) NOT NULL,
+    parameter_count BIGINT NOT NULL,
+    context_length  INT NOT NULL,
+    status          VARCHAR(20) NOT NULL,
+    deployed_at     TIMESTAMPTZ,
+    PRIMARY KEY (model_id, version)
+);
+```
+
+In-memory KV cache state managed by the inference server (not persisted to a database):
+
+```text
+PagedAttention block pool:
+  block_size       = 16 tokens per block
+  bytes_per_block  = 16 × kv_bytes_per_token × num_layers
+  total_blocks     = available_HBM / bytes_per_block
+  free_blocks      : stack<block_id>          (O(1) alloc/free)
+  block_table      : request_id → List[block_id]  (logical→physical mapping)
+  ref_counts       : block_id → int          (for copy-on-write in beam search)
+  cpu_swap_pool    : request_id → List[cpu_buffer]  (preempted blocks)
+```
+
+The `inference_requests` table is append-only and partitioned by day. Completed requests are written asynchronously (fire-and-forget from the inference path) so the database write never adds latency to token generation.
+
+## Architecture Diagram
+
+<Mermaid diagram={`flowchart TD
+  Client["Client (Browser / SDK)"]
+  GW["API Gateway\\n(auth, rate limit, routing)"]
+  LB["Load Balancer\\n(least-outstanding-requests)"]
+  S1["Inference Server A\\n(8× H100, TP=8)"]
+  S2["Inference Server B\\n(8× H100, TP=8)"]
+  S3["Inference Server C\\n(8× H100, TP=8)"]
+  SCH["Continuous Batching\\nScheduler"]
+  ENG["Inference Engine\\n(tensor-parallel forward pass)"]
+  KV["KV Cache\\n(PagedAttention blocks)"]
+  SC["Safety Classifier\\n(async BERT, 50-token windows)"]
+  EMB["Embedding Server\\n(/v1/embeddings, compute-bound)"]
+  MQ["Metrics Collector\\n(Prometheus)"]
+  DB["Request Log\\n(Postgres, partitioned)"]
+
+  Client --> GW
+  GW --> LB
+  LB --> S1
+  LB --> S2
+  LB --> S3
+  LB --> EMB
+  S1 --> SCH
+  S2 --> SCH
+  S3 --> SCH
+  SCH --> ENG
+  SCH --> KV
+  ENG --> KV
+  ENG --> SC
+  SC --> Client
+  S1 --> MQ
+  S2 --> MQ
+  S3 --> MQ
+  MQ --> DB
+`} />
+
+**Component responsibilities:**
+
+The API Gateway handles authentication (API key validation), per-user rate limiting (token bucket on prompt tokens/min and requests/min), and request routing. It does not touch model inference.
+
+The Load Balancer uses a least-outstanding-requests algorithm rather than round-robin. LLM requests have wildly varying lengths; round-robin can send a 10,000-token request to an already-busy server while idle servers sit empty. Least-outstanding-requests naturally load-balances based on actual server queue depth.
+
+The Continuous Batching Scheduler runs within each Inference Server and manages the single most important resource: the running batch. It decides which requests to run, which to queue, and which to preempt when KV memory is exhausted.
+
+The Embedding Server is kept separate from the generation servers because their compute profiles are opposite: embedding is a single forward pass (compute-bound), while generation is auto-regressive (memory-bandwidth-bound). Mixing them on the same GPUs would cause resource contention and complicate scheduling.
+
+## Deep Dive 1: Auto-Regressive Decoding and Memory Bandwidth
+
+Understanding why LLM inference is fundamentally different from standard ML inference is the prerequisite for everything else in this design.
+
+A standard classifier (ResNet, BERT) performs one forward pass and returns a fixed-size output. The compute cost is $O(1)$ per request. A language model generating a 1,000-token response performs 1,000 sequential forward passes, each depending on the previous output. The compute cost is $O(T)$ per request where $T$ is the response length.
+
+Each forward pass through a 70B model reads approximately 140GB of weights from HBM. At H100 HBM bandwidth of 3.35TB/s:
+
+$$t_{\text{token}} = \frac{140\,\text{GB}}{3.35\,\text{TB/s}} \approx 42\,\text{ms per token at batch size 1}$$
+
+At batch size 1, arithmetic intensity is roughly 1 FLOP per byte — far below the H100's compute roofline of ~180 FLOP/byte at FP16. The GPU's tensor cores are idle more than 99% of the time, waiting for data from HBM.
+
+Increase the batch size to 64: the same 140GB weight read is now amortized across 64 requests simultaneously. Arithmetic intensity rises to ~64 FLOP/byte, approaching the compute roofline. GPU utilization jumps from under 1% to 30–40% and continues rising with batch size until memory bandwidth is saturated.
+
+This is the fundamental equation of LLM serving throughput: **you must batch requests to amortize weight reads**. An LLM serving system that processes requests one at a time is wasting 99%+ of GPU compute.
+
+There is a crucial asymmetry between the two phases of inference:
+
+**Prefill phase** (processing the prompt): all prompt tokens are processed in parallel in a single forward pass. This is compute-bound — arithmetic intensity is high because we're doing matrix multiplications over a large sequence at once. Prefill throughput scales well with compute.
+
+**Decode phase** (generating output tokens one at a time): each token requires a separate forward pass, constrained to be sequential because each token is an input to the next. This is memory-bandwidth-bound. No amount of additional compute accelerates it without batching more requests together.
+
+These opposite characteristics mean prefill and decode benefit from different optimization strategies, and some architectures (PD-disaggregation, used by systems like Mooncake and Distserve) route them to different GPU pools entirely.
+
+## Deep Dive 2: Continuous Batching
+
+Static batching is the naive approach: collect $N$ requests into a batch, run inference until every request in the batch finishes, then collect the next batch. This is exactly how image classification inference works, and it is catastrophically inefficient for LLMs.
+
+The problem is output length variance. A user asking "What is 2+2?" generates 2 tokens. A user asking "Write a 500-word essay on photosynthesis" generates 500 tokens. In a static batch, the short request occupies a GPU slot for the entire 500-token generation of the long request, doing nothing.
+
+With a batch of 32 requests where lengths follow a realistic distribution (exponential with mean 200 tokens), the average GPU slot utilization from finished-but-waiting requests is 40–60%. Static batching wastes nearly half your GPU capacity.
+
+**Continuous batching** (also called iteration-level scheduling or in-flight batching) solves this by re-evaluating the batch composition after every single token generation step (every forward pass). When a request finishes, its GPU slot is immediately reclaimed and given to the next waiting request:
+
+```text
+Iteration 1:  batch = [req_A (512 tokens left), req_B (300 left), req_C (50 left)]
+Iteration 50: req_C finishes → slot freed → admit req_D immediately
+Iteration 51: batch = [req_A (462 left), req_B (250 left), req_D (800 left)]
+Iteration 300: req_B finishes → admit req_E
+...
+```
+
+The batch composition is dynamic. The scheduler runs between every forward pass and makes three decisions:
+
+1. **Evict**: remove any finished requests (generated EOS token or hit max_tokens) and free their KV blocks.
+2. **Admit**: pull waiting requests from the queue up to `max_batch_size`, subject to KV memory availability.
+3. **Preempt**: if KV memory is exhausted, swap the KV blocks of a low-priority request to CPU RAM and return it to the waiting queue.
+
+The result: GPU utilization increases from 30–40% (static batching) to 70–90% (continuous batching) for mixed-length workloads. This is not a marginal improvement — it is a 2–3× throughput increase from a scheduling change alone, with no hardware changes.
+
+The admission control step is critical and easy to get wrong. A request can only join the running batch if there is enough free KV memory to hold its KV cache for its full potential output. If admission is too aggressive, you run out of KV memory mid-generation and must preempt requests, which is expensive (CPU swap). If too conservative, GPU slots are wasted.
+
+## Deep Dive 3: PagedAttention
+
+To understand why PagedAttention is necessary, consider the pre-PagedAttention world.
+
+**Static KV allocation**: when a request arrives with a maximum sequence length of $L_{\max}$ tokens, pre-allocate a contiguous GPU memory region of size $L_{\max} \times \text{kv\_per\_token} \times \text{num\_layers}$. For a 70B model with 128K context window:
+
+$$\text{KV}_{128K} = 128{,}000 \times 2.56\,\text{MB} \approx 327\,\text{GB per request}$$
+
+On a 2-node cluster with 16× H100 80GB (1.28TB aggregate), after subtracting 140GB for model weights, you have ~1.14TB for KV cache — enough for **three** 128K-context requests concurrently. That is not a production system.
+
+Even for 4K context, pre-allocating 10GB per request means you can serve at most ~100 concurrent requests on a 2-node cluster. The problem is compounded by fragmentation: contiguous allocation means you cannot reuse freed blocks until the entire allocation is freed, and you waste the pre-allocated space for all token positions that are never reached.
+
+**PagedAttention** treats the KV cache exactly like an OS treats physical memory: divide it into fixed-size pages (blocks), manage a free-block pool, and map logical token positions to physical blocks through a per-request block table.
+
+Key properties:
+
+- **Block size**: typically 16 tokens per block. Each block holds the KV vectors for 16 sequential token positions across all layers.
+- **On-demand allocation**: blocks are allocated as tokens are generated, not pre-allocated for the full sequence. A request generating 100 tokens uses 7 blocks (ceil(100/16)), not ceil(128000/16) = 8000 blocks.
+- **O(1) alloc/free**: the free block pool is a stack; allocation and deallocation are constant time.
+- **Preemption**: when HBM is exhausted, swap the block list of a low-priority request to CPU RAM. When that request resumes, swap back. This is analogous to swapping pages to disk.
+- **Copy-on-write for beam search**: multiple beam search branches can share prefix blocks via reference counting. Only when a branch diverges is a block copied (copy-on-write), reducing memory usage for beam search by the beam width factor.
+- **Prefix caching**: for multi-turn chat, the KV blocks for previous turns can be cached and reused across requests from the same user. The block table for turn N begins with the cached blocks from turns 1 through N-1.
+
+The memory efficiency gain is substantial: typical sequences use 20–30% of their maximum allocated length. Static allocation wastes 70–80% of reserved KV memory. PagedAttention reclaims this, increasing effective concurrency by 3–5× on typical workloads.
+
+## Deep Dive 4: Speculative Decoding
+
+Speculative decoding exploits a simple observation: running a large model's forward pass is expensive, but verifying whether a proposed token is correct is free (it happens as a byproduct of the forward pass).
+
+The algorithm:
+
+1. A small **draft model** (e.g., 7B) generates $\gamma$ tokens autoregressively. This is fast because the draft model is small.
+2. The **target model** (70B) runs a single forward pass over the original context plus the $\gamma$ draft tokens in parallel (one forward pass, not $\gamma$ passes).
+3. The target model's output at each position gives the "correct" probability distribution. Compare draft token $t_i$ against target distribution $p_i$:
+   - If accepted (the target agrees), keep the token.
+   - If rejected at position $k$, discard tokens $k$ through $\gamma$ and resample from the target's corrected distribution at position $k$.
+4. The accepted tokens plus one guaranteed token from the target at the first rejection are emitted.
+
+Expected throughput analysis: let $\alpha$ = draft acceptance rate, $\gamma$ = draft tokens per speculation, $c$ = cost of draft model as fraction of target cost.
+
+$$\text{Expected tokens per target forward pass} = \frac{1 - \alpha^{\gamma+1}}{1 - \alpha}$$
+
+$$\text{Speedup} \approx \frac{\text{Expected tokens}}{\gamma \cdot c + 1}$$
+
+For $\alpha = 0.8$, $\gamma = 5$, $c = 0.1$:
+
+$$\text{Expected tokens} = \frac{1 - 0.8^6}{1 - 0.8} \approx \frac{1 - 0.262}{0.2} \approx 3.69$$
+
+$$\text{Speedup} \approx \frac{3.69}{5 \times 0.1 + 1} = \frac{3.69}{1.5} \approx 2.5\times$$
+
+**When it works well**: code completion (next line is predictable), structured output (JSON with a fixed schema), repetitive or formulaic text, continuation of known patterns.
+
+**When it fails**: creative writing, diverse sampling with high temperature, long-form open-ended generation where the distribution is wide and the draft model's guesses are frequently wrong. At $\alpha < 0.5$, speculative decoding can be slower than greedy decoding because draft cost exceeds the speedup from token batching.
+
+The draft model must share the same tokenizer as the target model. In practice, the draft is usually a smaller version of the same model family (e.g., Llama 3.1 8B as draft for Llama 3.1 70B). Alternatively, EAGLE (a fine-tuned draft head that predicts the target's next token distribution) achieves higher acceptance rates by training specifically on the target model's output distribution.
+
+## Deep Dive 5: Tensor and Pipeline Parallelism
+
+For models that fit on a single GPU (e.g., 7B in INT8 = 7GB), no parallelism is needed. For 70B in FP16 (140GB), a single H100 80GB cannot hold the model. You must split the model across multiple GPUs.
+
+**Tensor Parallelism (TP)**: split each individual weight matrix across $N$ GPUs along one dimension. For an attention layer with weight matrix $W \in \mathbb{R}^{d_{\text{model}} \times d_{\text{model}}}$, each GPU holds $W[:,\,j \cdot d/N\,:\,(j+1)\cdot d/N]$. Each GPU computes its shard of the output; an AllReduce synchronizes the partial results into the full output.
+
+Cost of AllReduce: on NVLink within a single 8-GPU H100 node, an AllReduce of a 4MB tensor takes roughly 500μs. For 80 transformer layers, each with 2 AllReduce calls (attention + FFN): $80 \times 2 \times 500\text{μs} = 80\text{ms}$ of communication overhead per token. This is acceptable on NVLink but prohibitive over standard Ethernet.
+
+TP works within a single node where NVLink provides ~600GB/s bidirectional bandwidth. Across nodes (using InfiniBand at 400Gb/s ≈ 50GB/s), the AllReduce latency would add seconds per token — unusable.
+
+**Pipeline Parallelism (PP)**: split transformer layers across nodes rather than splitting each layer. Node 1 runs layers 1–20, node 2 runs layers 21–40, node 3 runs 41–60, node 4 runs 61–80. Each node passes its output activations (not weights) to the next node via InfiniBand. Activation tensors are much smaller than weight matrices — passing a batch's activations (e.g., batch=32, seq=4096, d_model=8192 in FP16 = 2GB) takes ~40ms at 50GB/s, which is still significant.
+
+PP introduces the **pipeline bubble**: during prefill of the first micro-batch, nodes 2–4 are idle waiting for node 1. Micro-batch pipelining mitigates this by splitting the batch into smaller micro-batches that flow through the pipeline with overlap, but cannot eliminate it entirely. The bubble fraction is $(P-1) / (P-1 + M)$ where $P$ is pipeline stages and $M$ is micro-batches.
+
+**Typical configuration for 70B production deployment**:
+- 2 nodes × 8× H100 80GB
+- TP=8 within each node (NVLink): each GPU holds 140GB/8 = 17.5GB of weights
+- PP=2 across nodes (InfiniBand): node 1 runs first 40 layers, node 2 runs last 40 layers
+
+This fits the model in 16× H100 80GB with ~62GB remaining per GPU for KV cache and activations.
+
+**Expert Parallelism (EP)** for Mixture-of-Experts models (GPT-4, Mixtral, Grok): each expert is placed on a different GPU. Token routing selects 2 experts per token; activation transfer happens only for the selected experts. This is more complex to implement but dramatically more parameter-efficient: a 8×7B MoE model uses 47B active parameters per token despite having 47B total parameters.
+
+## Implementation: ContinuousBatchingScheduler
+
+```python
+from collections import deque
+from dataclasses import dataclass, field
+from typing import List
+import time
+
+EOS_TOKEN_ID = 2
+
+@dataclass
+class InferenceRequest:
+    request_id: str
+    tokens: List[int]
+    max_new_tokens: int
+    generated: List[int] = field(default_factory=list)
+    cancelled: bool = False
+    arrival_time: float = field(default_factory=time.monotonic)
+
+    @property
+    def is_finished(self) -> bool:
+        return (len(self.generated) >= self.max_new_tokens
+                or self.cancelled
+                or (self.generated and self.generated[-1] == EOS_TOKEN_ID))
+
+class ContinuousBatchingScheduler:
+    def __init__(self, inference_engine, kv_manager, max_batch_size: int = 64):
+        self.engine = inference_engine
+        self.kv = kv_manager
+        self.max_batch = max_batch_size
+        self.running: List[InferenceRequest] = []
+        self.waiting: deque[InferenceRequest] = deque()
+
+    def add_request(self, request: InferenceRequest):
+        self.waiting.append(request)
+
+    def step(self) -> List[InferenceRequest]:
+        self._evict_finished()
+        self._schedule_waiting()
+        if not self.running:
+            return []
+
+        next_tokens = self.engine.generate_next_tokens(
+            [req.tokens + req.generated for req in self.running]
+        )
+
+        finished = []
+        for req, token in zip(self.running, next_tokens):
+            req.generated.append(token)
+            if req.is_finished:
+                self.kv.free_blocks(req.request_id)
+                finished.append(req)
+        self.running = [r for r in self.running if not r.is_finished]
+        return finished
+
+    def _evict_finished(self):
+        self.running = [r for r in self.running if not r.is_finished]
+
+    def _schedule_waiting(self):
+        while self.waiting and len(self.running) < self.max_batch:
+            req = self.waiting[0]
+            if self.kv.can_allocate(req.request_id, len(req.tokens)):
+                self.waiting.popleft()
+                self.kv.allocate(req.request_id, len(req.tokens))
+                self.running.append(req)
+            else:
+                self._preempt_if_needed()
+                break
+
+    def _preempt_if_needed(self):
+        if self.running:
+            victim = min(self.running, key=lambda r: len(r.generated))
+            self.kv.swap_to_cpu(victim.request_id)
+            self.waiting.appendleft(victim)
+            self.running.remove(victim)
+```
+
+## Implementation: TokenStreamingHandler
+
+```python
+import asyncio
+import json
+from typing import AsyncIterator
+
+class TokenStreamingHandler:
+    def __init__(self, scheduler: ContinuousBatchingScheduler):
+        self.scheduler = scheduler
+        self._queues: dict[str, asyncio.Queue] = {}
+
+    def register(self, request_id: str) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=200)
+        self._queues[request_id] = q
+        return q
+
+    def on_token(self, request_id: str, token: int, tokenizer):
+        q = self._queues.get(request_id)
+        if q is None:
+            return
+        text = tokenizer.decode([token], skip_special_tokens=True)
+        q.put_nowait({"token": text, "finish_reason": None})
+
+    def on_finish(self, request_id: str, finish_reason: str = "stop"):
+        q = self._queues.get(request_id)
+        if q is None:
+            return
+        q.put_nowait({"token": "", "finish_reason": finish_reason})
+        q.put_nowait(None)
+
+    async def stream(self, request_id: str) -> AsyncIterator[str]:
+        q = self._queues.get(request_id)
+        if q is None:
+            return
+        try:
+            while True:
+                chunk = await asyncio.wait_for(q.get(), timeout=30.0)
+                if chunk is None:
+                    yield "data: [DONE]\n\n"
+                    break
+                yield f"data: {json.dumps(chunk)}\n\n"
+        except asyncio.TimeoutError:
+            yield "data: [DONE]\n\n"
+        finally:
+            self._queues.pop(request_id, None)
+```
+
+## Quantization: Trading Precision for Memory and Throughput
+
+Quantization reduces model weights from FP16 (2 bytes/param) to INT8 (1 byte) or INT4 (0.5 bytes). The memory and bandwidth savings are proportional:
+
+| Precision | Memory (70B) | Bandwidth per token | Quality loss |
+|---|---|---|---|
+| FP16 | 140 GB | 140 GB/token | None (baseline) |
+| INT8 (W8A16) | 70 GB | 70 GB/token | < 1% perplexity |
+| GPTQ INT4 | 35 GB | 35 GB/token | 2–5% perplexity |
+| AWQ INT4 | 35 GB | 35 GB/token | 1–3% perplexity |
+
+INT8 (weights-only quantization, W8A16) is lossless for most benchmarks and halves memory usage, allowing a 70B model to fit on a single 8× H100 node. AWQ (Activation-aware Weight Quantization) and GPTQ are the preferred INT4 methods; they select which weights to quantize carefully to minimize output degradation.
+
+Activations and KV cache are typically kept in FP16 (or BF16) even when weights are quantized, because quantization error in activations compounds over the autoregressive generation steps. FP8 is an emerging format (supported on H100) that quantizes both weights and activations to 8-bit floating point with hardware acceleration, providing ~1.5–1.7× throughput over FP16 with minimal quality loss.
+
+## Observability and SLO Monitoring
+
+Three latency metrics define LLM serving health:
+
+**TTFT (Time to First Token)**: wall-clock time from request receipt to first token sent to client. Dominated by prefill compute time + scheduler queue time. Alert if p99 > 500ms.
+
+**ITL (Inter-Token Latency)**: time between consecutive tokens during decode. Dominated by memory bandwidth. Alert if p99 > 50ms (< 20 tok/s).
+
+**E2E latency**: total request time. Alert if p99 > estimated_tokens × 50ms + 500ms.
+
+Key throughput metrics:
+
+- Output tokens/sec per GPU (target: > 600 for H100 at 70B FP16)
+- Prompt tokens/sec (prefill throughput)
+- KV cache utilization (target: 70–85%; above 90% triggers preemption storms)
+- Batch size distribution (if p50 batch size < 8, you're under-loaded or queue depth is too low)
+
+```yaml
+alerts:
+  - name: HighTTFT
+    expr: histogram_quantile(0.99, llm_ttft_ms) > 500
+    severity: page
+  - name: LowBatchSize
+    expr: avg(llm_batch_size) < 4
+    severity: warn
+  - name: KVCacheExhaustion
+    expr: llm_kv_cache_utilization > 0.92
+    severity: page
+  - name: PreemptionRate
+    expr: rate(llm_preemptions_total[5m]) > 10
+    severity: warn
+```
+
+<TradeoffTable title="LLM Serving Frameworks Compared">
+
+| Framework | Continuous Batching | KV Cache Efficiency | Multi-GPU | Throughput | Ease of Use |
+|---|---|---|---|---|---|
+| Naive HuggingFace `generate()` | No (static batching) | Poor (static pre-alloc) | Limited (device_map) | Baseline (1×) | Excellent (pip install) |
+| TensorRT-LLM | Yes (in-flight batching) | Good (paged) | Excellent (TP + PP) | 3–4× baseline | Hard (C++, TensorRT build) |
+| vLLM (PagedAttention) | Yes (iteration-level) | Excellent (PagedAttention) | Good (TP within node) | 2–4× baseline | Good (Python, pip install) |
+| SGLang | Yes (RadixAttention) | Excellent (prefix caching) | Good (TP within node) | 3–5× baseline (with prefix reuse) | Good (Python, active OSS) |
+
+</TradeoffTable>
+
+<Pitfall title="Pre-allocating KV cache for max_sequence_length for every request">
+
+Static pre-allocation of `max_context × kv_size_per_token × num_layers` contiguous GPU memory per request is not a suboptimal choice — it is a non-starter for modern long-context models. For a model with 128K context window, each request slot consumes approximately 327GB of KV cache memory. On a 2-node 16× H100 cluster with 1.28TB aggregate HBM, you can serve exactly three concurrent requests after accounting for model weights. That is zero throughput for any practical traffic load.
+
+The common mistake in system design interviews is treating this as an engineering tradeoff ("we waste some memory"). It is not a tradeoff; it makes the system unable to serve concurrent users at all. PagedAttention is not an optional optimization you add after launch. It is the prerequisite for any long-context LLM serving system. The interview answer must include PagedAttention as a foundational component, not an afterthought, and must explain why: on-demand block allocation means you only consume memory for tokens that have actually been generated, not for the theoretical maximum a request could generate.
+
+</Pitfall>
+
+<Pitfall title="Measuring throughput in requests/second instead of tokens/second">
+
+Requests/second is a dangerously misleading metric for LLM serving. Consider two systems under identical GPU load: System A serves 100 requests/sec where each request generates an average of 10 tokens (1,000 output tokens/sec). System B serves 10 requests/sec where each request generates 500 tokens (5,000 output tokens/sec). By requests/sec, System A looks 10× better. By GPU utilization, System B is 5× more efficient — the GPU is spending time doing useful work on large batches rather than repeatedly paying the fixed overhead of request setup for tiny outputs.
+
+The correct primary throughput metrics for LLM serving are output tokens/sec (the rate at which the system generates new tokens across all requests) and input tokens/sec (the rate at which it processes prompt tokens during prefill). These metrics are proportional to GPU revenue — they tell you what fraction of available memory bandwidth is being converted to useful work. Requests/sec is a useful secondary metric for capacity planning (how many users can you onboard) but should never be the headline throughput number. Report them separately because prefill and decode have different hardware bottlenecks.
+
+</Pitfall>
+
+<Curveball title="A user submits a 100K-token prompt. How do you handle this without OOM?">
+
+A 100K-token prompt at 2.56MB/token across 80 layers = 256GB of KV cache for the prefill phase alone. You cannot fit this in a single GPU's HBM during prefill, and pre-allocating 256GB for one request would starve all other concurrent requests.
+
+Several approaches can be layered:
+
+**API-level enforcement**: enforce a context limit at the gateway (e.g., 32K tokens) with an error returned to the caller before any GPU work is done. This is the right answer for most production systems — long contexts are expensive and you charge accordingly for higher limits.
+
+**Chunked prefill**: process the 100K-token prompt in sequential 4K-token chunks, building the KV cache incrementally. Each chunk's attention only attends to the previously computed KV blocks. This transforms a 256GB single-step allocation into 25 sequential 10GB steps. Chunked prefill is implemented in SGLang and recent vLLM versions. The tradeoff: TTFT increases proportionally with the number of chunks, since prefill now takes 25 forward passes instead of 1.
+
+**KV cache offloading**: use PagedAttention's preemption mechanism proactively — compute KV blocks and immediately swap completed blocks to CPU RAM or NVMe, reading them back during the decode phase as needed. This works for read-heavy decode patterns (long prompt, short output) but adds significant latency from PCIe transfers (16GB/s on PCIe 4.0 vs 3.35TB/s HBM).
+
+**Architecture-level solution**: for genuinely long-context workloads (>128K tokens), consider Mamba or other SSM-based architectures whose memory usage is $O(1)$ per token rather than $O(L)$, or Ring Attention for transformer models that distributes KV cache across a ring of GPUs. These require model-level decisions made before deployment, not runtime hacks.
+
+</Curveball>
+
+<Curveball title="How do you add safe output filtering without adding latency to the streaming response?">
+
+A naive implementation adds a safety classifier to the critical path: generate a token → classify → if safe, stream. A classifier adding 100ms per token at 20 tok/s makes every response 2× slower. This is unacceptable.
+
+The correct approach is asynchronous windowed classification with a short token buffer:
+
+Run a lightweight safety classifier (a fine-tuned BERT or DistilBERT model — not another LLM) on a sliding window of every 50 generated tokens. This classifier runs on a separate CPU or small GPU instance, asynchronously from the generation loop. The generation server maintains a 50-token buffer: it streams tokens to the client only after the classifier has cleared the preceding window.
+
+Effective latency impact: 50 tokens × 50ms/token = 2.5 seconds of buffer before the first token reaches the client. However, because generation itself takes 2.5 seconds to produce 50 tokens, the classifier runs in parallel with generation — the real added latency is only the classification time for the first window (typically 20–50ms for a BERT-class model on a single GPU).
+
+If the classifier flags unsafe content in any window: halt generation, discard the buffered tokens, and send a refusal message. The client never receives the unsafe content because it was buffered, not streamed.
+
+Key implementation detail: the classifier must run on token strings, not token IDs, because safety is a semantic property. Use the model's tokenizer to decode each window to text before classification. Run 2-3 classifier instances in parallel with a load balancer to avoid becoming a bottleneck at high concurrency.
+
+</Curveball>
+
+<Curveball title="How do you deploy a new fine-tuned model version without downtime?">
+
+Model weight updates are the most operationally complex event in LLM infrastructure. Loading a 70B FP16 model from object storage to GPU HBM takes 10–30 minutes at typical NVMe→PCIe bandwidth. You cannot take the serving fleet offline for 30 minutes to update weights.
+
+**Blue-green deployment at the fleet level**:
+
+Maintain two fleets: the **blue fleet** (current production, serving 100% of traffic) and a **green fleet** (pre-warming new model version). The green fleet is provisioned 10–30 minutes before the cutover window, loading new weights in the background while blue serves all traffic.
+
+Once green's health checks pass (TTFT p99 < 500ms, ITL p99 < 50ms on synthetic traffic), begin canary traffic shifting: route 1% → 5% → 25% → 100% of requests to green, with 5-minute observation windows between each step. The load balancer manages the split via weighted routing.
+
+**Cost challenge**: during the weight-loading phase, the green fleet is consuming GPU resources without serving users. For a 16× H100 fleet ($50K/month per node), the 30-minute load phase costs approximately $50K × (30/720) ≈ $2K per deployment. Mitigate with spot/preemptible instances for the green fleet during loading (using the full on-demand fleet only after promotion). For weekly deployments, this is acceptable; for daily, it requires either faster weight loading (pre-stage to local NVMe on each node) or in-place weight update without full fleet replacement.
+
+**Rollback**: if the canary step at 25% shows regression (TTFT increases 20%, error rate rises), immediately shift 100% back to blue. Green fleet is terminated. Total user-facing impact: a small fraction of requests at the 25% canary step experience degraded quality, all others are unaffected.
+
+**State management**: in-flight requests on the old model complete on the blue fleet. The blue fleet is kept alive and draining until all in-flight requests complete, then terminated. Typical drain time: max_response_length / ITL = 4096 tokens × 50ms = ~3.4 minutes.
+
+</Curveball>
+
+## Further Reading
+
+The theoretical foundation for this system design comes from a handful of papers and resources worth reading in depth. The vLLM paper by Kwon et al. (2023), "Efficient Memory Management for Large Language Model Serving with PagedAttention," is the single most important paper for this design — it introduces the block-table abstraction and preemption mechanism and includes rigorous measurements of memory waste in static allocation. The Anyscale blog post "How continuous batching enables 23x throughput in LLM inference while reducing p50 latency" (Aminabadi et al.) provides the clearest explanation of the iteration-level scheduling model with concrete throughput numbers.
+
+For multi-GPU parallelism, the Megatron-LM paper (Narayanan et al., 2021) remains the definitive reference for tensor and pipeline parallelism combinations, including the analysis of pipeline bubbles. NVIDIA's TensorRT-LLM documentation covers the practical engineering details of fused attention kernels (FlashAttention-2 integration), CUDA graph capture for reduced kernel launch overhead, and FP8 quantization with H100 hardware acceleration.
+
+Speculative decoding is covered in "Fast Inference from Transformers via Speculative Decoding" (Leviathan et al., 2022). The EAGLE approach (Li et al., 2024) extends this with a trained draft head that achieves higher acceptance rates by learning the target model's distribution directly. For long-context approaches beyond PagedAttention, the Ring Attention paper (Liu et al., 2023) and the Mamba SSM paper (Gu and Dao, 2023) provide the architectural alternatives. For CPU inference and resource-constrained deployment, llama.cpp implements INT4 quantization with GGUF format and achieves 10–15 tok/s on a modern CPU for 7B models — useful for edge deployment but not production LLM serving at scale.
+
+<RelatedQuestions items={[
+  { slug: "ml-inference-pipeline", title: "Design an ML Model Serving Infrastructure", difficulty: "staff" },
+  { slug: "recommendation-engine", title: "Design a Recommendation Engine", difficulty: "staff" },
+  { slug: "vector-database", title: "Design a Vector Database", difficulty: "staff" },
+]} />

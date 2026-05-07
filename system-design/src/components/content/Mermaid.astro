@@ -1,0 +1,44 @@
+---
+export interface Props {
+  diagram: string;
+  caption?: string;
+}
+const { diagram, caption } = Astro.props;
+---
+
+<figure class="mermaid-figure" role="figure" aria-label={caption ?? 'Architecture diagram'}>
+  <div class="mermaid-wrap">
+    <div class="mermaid" role="img" aria-label={caption ?? 'Architecture diagram'}>{diagram}</div>
+  </div>
+  {caption && <figcaption class="mermaid-caption">{caption}</figcaption>}
+</figure>
+
+<style>
+  .mermaid-figure {
+    margin: 2.5rem 0;
+  }
+  .mermaid-wrap {
+    background: var(--bg-card);
+    border: 1px solid var(--line-2);
+    border-radius: var(--r-lg);
+    padding: 1.5rem;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 80px;
+  }
+  .mermaid-wrap :global(svg) {
+    max-width: 100%;
+    height: auto;
+    display: block;
+  }
+  .mermaid-caption {
+    margin: 0.625rem 0 0;
+    text-align: center;
+    font-size: 0.8rem;
+    color: var(--ink-4);
+    font-style: italic;
+  }
+</style>

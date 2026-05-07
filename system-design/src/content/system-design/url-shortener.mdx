@@ -1,0 +1,504 @@
+---
+title: "Design a URL Shortener"
+slug: "url-shortener"
+category: "foundations"
+difficulty: "mid"
+estimatedReadMinutes: 18
+tags: ["hashing", "base62", "caching", "read-heavy", "redis", "mysql"]
+companyFlavors: ["Bitly", "TinyURL", "Twitter", "Google", "LinkedIn"]
+prerequisites: []
+relatedQuestions: ["distributed-rate-limiter", "design-a-cache", "distributed-unique-id-generator"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Build a URL shortening service handling 100M new URLs/day and 10B redirects/day — the classic read-heavy, write-light system that tests your caching, hashing, and storage intuitions."
+javaPackages: ["redis.clients:jedis:5.1.3", "com.google.guava:guava:33.2.1"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Diagram from '../../components/content/Diagram.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="url-shortener" title="Design a URL Shortener" />
+
+<Tldr>
+- **Base62 encoding** (a-z A-Z 0-9) on a 64-bit auto-increment ID gives 7 chars, covering 3.5 trillion unique URLs with zero collision risk
+- **Read:write ratio is ~100:1** — optimize aggressively for reads using a CDN for popular links and Redis as a cache-aside layer in front of MySQL
+- **Never hash the long URL directly**: MD5/SHA truncated to 7 chars has a ~0.1% collision probability at 1B URLs. Generate a unique ID first, then encode it.
+- **Custom aliases need a separate uniqueness check** — use Redis `SET NX` for atomic idempotent reservation before writing to the database
+- **Expiry belongs in the DB and application layer**, not the cache — a cache miss after a Redis TTL still resolves the URL from the database; hard expiry requires a DB TTL column and a background cleanup job
+</Tldr>
+
+## Why URL shortening?
+
+Long URLs are hostile to users and systems alike. A 2,000-character query-string-laden tracking URL breaks SMS character limits, wraps awkwardly in emails, and gets mangled by legacy systems that cap header or body field lengths. A 7-character alias solves all of that.
+
+Beyond aesthetics, URL shorteners are analytics infrastructure. Every redirect is an instrumented event: which device, which country, which referrer, which time of day. Marketing teams route campaign traffic through short links specifically to measure click-through rates and A/B test landing pages — the short code is the tracking identifier.
+
+The design is deceptively simple on the surface — write a mapping, read it back — but beneath that simplicity lies a rich set of tradeoffs: how do you generate billions of unique codes without collisions, serve 100K redirects per second with single-digit millisecond latency, and handle cache invalidation for expired or deleted links? These are the questions this design covers.
+
+## Clarifying questions
+
+Before sketching any architecture, nail down the requirements. These eight questions separate a thoughtful design from a whiteboard guess.
+
+| Question | Ideal answer |
+|---|---|
+| What is the expected write rate and read rate? | 100M new URLs/day (~1.2K writes/sec); 10B redirects/day (~116K reads/sec) |
+| What is the maximum length of the short code? | 7 characters — enough for 3.5 trillion unique codes |
+| Are custom aliases required? | Yes — users can request a vanity alias (e.g., `bit.ly/launch`) |
+| Do we need analytics and click tracking? | Yes — store click events (timestamp, country, device type) per short code |
+| Is URL expiry required? | Yes — URLs can have an optional TTL; expired links return 410 Gone |
+| What is the availability requirement? | 99.99% — four nines; redirects are in the critical path for customers |
+| What is the read latency SLA? | p99 redirect latency < 10 ms end-to-end |
+| How do we handle collisions or alias conflicts? | Auto-generated codes are collision-free by construction; alias conflicts return a 409 |
+
+## Functional requirements
+
+- Accept a long URL and return a unique 7-character short code
+- Redirect `GET /{shortCode}` to the original long URL with HTTP 301 (permanent) or 302 (temporary, for analytics)
+- Support optional custom aliases; reject conflicts with a 409 response
+- Support optional expiry (TTL in seconds or absolute timestamp)
+- Track click events: timestamp, country (from IP), device type (from User-Agent), referrer
+- Allow deletion of a short URL by its owner (`DELETE /{shortCode}`)
+
+## Non-functional requirements
+
+- p99 redirect latency: < 10 ms (including cache hit path)
+- Write throughput: sustain 1.5K writes/sec with burst headroom to 5K writes/sec
+- Read throughput: sustain 116K reads/sec with burst headroom to 500K reads/sec
+- Availability: 99.99% uptime — planned maintenance excluded from redirect path
+- Durability: zero URL mapping loss after acknowledgment to the client
+- Storage: retain all URLs and click events for 5 years minimum
+- Cache hit rate: > 95% for redirect path under steady-state traffic
+
+## Capacity estimation
+
+<Capacity title="Back-of-envelope: 100M new URLs/day, 10B redirects/day, 5-year retention">
+
+**Write throughput**
+
+$$
+\text{write\_rps} = \frac{100 \times 10^6 \text{ URLs}}{86{,}400 \text{ s/day}} \approx 1{,}157 \text{ writes/sec}
+$$
+
+Round to **~1.2K writes/sec** at steady state. This is comfortably handled by a single MySQL primary.
+
+**Read throughput**
+
+$$
+\text{read\_rps} = \frac{10 \times 10^9 \text{ redirects}}{86{,}400 \text{ s/day}} \approx 115{,}740 \text{ reads/sec}
+$$
+
+Round to **~116K reads/sec**. This is the number that drives the cache design — MySQL alone cannot serve this without heavy caching.
+
+**Storage: URL mappings**
+
+Assume 500 bytes per URL record (long URL avg 200 chars + metadata):
+
+$$
+\text{storage} = 500 \text{ B} \times 100 \times 10^6 \text{ URLs/day} \times 365 \times 5 \text{ years} \approx 91 \text{ TB}
+$$
+
+At 91 TB over 5 years, this calls for sharded MySQL or a column-oriented store for analytics. The URL mapping table itself is relatively narrow.
+
+**Cache sizing (Pareto principle)**
+
+The top 20% of short codes generate ~80% of all traffic. At 100M URLs/day for 5 years, the "hot" working set is roughly 20% of recent URLs:
+
+$$
+\text{cache\_entries} = 0.20 \times 100 \times 10^6 = 20 \times 10^6 \text{ URLs}
+$$
+
+Each cache entry: short code (7 B key) + long URL (200 B value) + Redis overhead (~64 B) ≈ 271 B.
+
+$$
+\text{cache\_ram} = 271 \text{ B} \times 20 \times 10^6 \approx 5.4 \text{ GB}
+$$
+
+A single **r7g.large** Redis node (13 GB RAM) handles this with room to spare. A cluster of 3 nodes with replication provides HA.
+
+**Short code namespace**
+
+Base62 with 7 characters:
+
+$$
+62^7 = 3{,}521{,}614{,}606{,}208 \approx 3.5 \text{ trillion unique codes}
+$$
+
+At 100M new URLs/day, this namespace lasts:
+
+$$
+\frac{3.5 \times 10^{12}}{100 \times 10^6} = 35{,}000 \text{ days} \approx 95 \text{ years}
+$$
+
+No namespace exhaustion risk.
+
+</Capacity>
+
+## API design
+
+| Method | Endpoint | Request body / Params | Response |
+|---|---|---|---|
+| `POST` | `/shorten` | `{ longUrl, customAlias?, ttlSeconds? }` | `200 { shortCode }` or `409` on alias conflict |
+| `GET` | `/{shortCode}` | — | `301 Location: <longUrl>` or `410 Gone` if expired |
+| `DELETE` | `/{shortCode}` | Auth header required | `204 No Content` or `403 Forbidden` |
+| `GET` | `/{shortCode}/stats` | — | `200 { clicks, countries, devices, timeline }` |
+
+Use **301 (Moved Permanently)** when you want browsers to cache the redirect and remove the redirect hop from subsequent visits — this is optimal for latency but kills click analytics since the browser never calls your server again. Use **302 (Found / Temporary)** when you need every redirect to pass through your servers for analytics tracking. Most production URL shorteners default to 302 for this reason, even if the link is effectively permanent.
+
+## Data model
+
+**URLs table** — the core mapping store:
+
+```sql
+CREATE TABLE urls (
+    id            BIGINT UNSIGNED   NOT NULL AUTO_INCREMENT,
+    short_code    VARCHAR(16)       NOT NULL,
+    long_url      TEXT              NOT NULL,
+    owner_id      BIGINT UNSIGNED,
+    is_custom     BOOLEAN           NOT NULL DEFAULT FALSE,
+    expires_at    DATETIME,
+    created_at    DATETIME          NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at    DATETIME,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_short_code (short_code),
+    INDEX idx_owner (owner_id),
+    INDEX idx_expires (expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+The `id` column is the auto-increment integer that drives Base62 encoding. `short_code` stores the encoded result (and custom aliases). `expires_at` and `deleted_at` enable soft expiry and soft deletion — the application checks these columns; a background job hard-deletes rows older than retention window.
+
+**Click events table** — append-only analytics:
+
+```sql
+CREATE TABLE click_events (
+    id            BIGINT UNSIGNED   NOT NULL AUTO_INCREMENT,
+    short_code    VARCHAR(16)       NOT NULL,
+    clicked_at    DATETIME          NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    country_code  CHAR(2),
+    device_type   ENUM('mobile','desktop','tablet','bot','unknown'),
+    referrer      VARCHAR(512),
+    PRIMARY KEY (id),
+    INDEX idx_code_time (short_code, clicked_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+PARTITION BY RANGE (YEAR(clicked_at)) (
+    PARTITION p2026 VALUES LESS THAN (2027),
+    PARTITION p2027 VALUES LESS THAN (2028),
+    PARTITION p2028 VALUES LESS THAN (2029)
+);
+```
+
+Click events are write-heavy and read rarely (only for analytics dashboards). Partition by year so old partitions can be archived to cold storage. Do not write click events synchronously in the redirect path — enqueue them to Kafka and write asynchronously.
+
+## High-level architecture
+
+<Mermaid caption="URL shortener architecture: CDN and Redis absorb the read load; the ID generator ensures collision-free short codes" diagram={`graph LR
+  Client --> CDN
+  CDN --> AppServers[App Servers]
+  AppServers --> Cache[(Redis Cache)]
+  AppServers --> DB[(MySQL Primary)]
+  DB --> Replica[(MySQL Replica)]
+  AppServers --> IDGen[ID Generator Service]
+  AppServers --> Queue[(Kafka)]
+  Queue --> Analytics[Analytics Writer]
+  Analytics --> ClickDB[(Click Events DB)]`} />
+
+**Read path (redirect):**
+1. Client hits `GET /abc1234`
+2. CDN checks if the short code is cached at the edge (only effective for extremely popular links with 301 redirects)
+3. App server checks Redis cache (`url:abc1234` key)
+4. On cache miss, app server queries MySQL Replica
+5. Result is written back to Redis (cache-aside), then a 301/302 response is returned
+6. A click event is enqueued to Kafka asynchronously — zero added latency to the redirect
+
+**Write path (shorten):**
+1. App server calls the ID Generator Service for the next unique integer ID
+2. ID is Base62-encoded into a 7-character short code
+3. Record is inserted into MySQL Primary
+4. Short code is written to Redis cache immediately (warm the cache on creation for custom aliases; for auto-generated codes, warm on first access)
+
+## Deep dives
+
+### Hashing vs ID generation
+
+The naive approach — `MD5(longUrl).substring(0, 7)` — seems elegant but fails in production.
+
+**Why MD5 truncation is wrong:**
+
+The Birthday Problem says that with 7 hex characters (16^7 ≈ 268M possibilities), you hit a 50% collision probability at ~12K URLs. Base62 is better (62^7 ≈ 3.5T), but you're still mapping an unbounded input space (all possible long URLs) to a finite output space. Two different long URLs can produce the same 7-char prefix. You'd need a collision-retry loop that re-hashes with a salt, but now your short codes aren't stable — submitting the same URL twice can return different codes.
+
+**The correct approach: auto-increment ID + Base62 encode:**
+
+```
+long URL arrives → INSERT into DB → get auto-increment id=1000000 → encode(1000000) → "4c92a"
+```
+
+The Base62 encode algorithm is simple and deterministic:
+
+```
+BASE62 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+encode(id):
+    if id == 0: return "a"
+    result = []
+    while id > 0:
+        result.append(BASE62[id % 62])
+        id = id // 62
+    return reverse(result)
+
+Examples:
+  encode(1)         → "b"
+  encode(61)        → "9"
+  encode(62)        → "ba"
+  encode(1_000_000) → "4c92"
+  encode(62^7 - 1)  → "9999999"
+```
+
+Every auto-increment ID maps to exactly one code. No collisions. No retries. Codes are monotonically increasing, which also means the IDs are roughly time-sortable.
+
+**ID generator as a service:** At 1.2K writes/sec, a single MySQL auto-increment is fine. At 100K+ writes/sec, you'd shard the ID space using a Snowflake-style generator (timestamp + machine ID + sequence). This is a separate deep-dive; for this problem, MySQL auto-increment is the correct default answer.
+
+### Cache strategy
+
+The cache serves the redirect path. The pattern is **cache-aside (lazy loading)**:
+
+1. On `GET /{code}`, check Redis first
+2. On hit: return immediately (~0.5 ms total)
+3. On miss: query MySQL Replica, write result to Redis with a TTL, return to client
+
+**Do not write to the cache on creation** for auto-generated codes — the vast majority of URLs created are never accessed (link rot). Cache only what's actually requested (lazy population). For custom aliases, you can eagerly cache because they tend to be high-traffic vanity links.
+
+**Eviction policy:** Use LRU (`maxmemory-policy allkeys-lru`). Popular codes stay in cache; stale codes age out naturally.
+
+**TTL strategy:** Set Redis TTL to 24 hours by default. This is a *caching* TTL, not the URL's expiry TTL. If the URL has an `expires_at` set in the database that is sooner than 24 hours, cap the Redis TTL to `expires_at - now`. Never rely on cache TTL to enforce hard URL expiry — a cache miss (due to eviction) would resolve the live record from the DB and re-cache an expired URL. Expiry logic must live in the application layer reading from the DB column.
+
+**Cache key schema:** `url:{shortCode}` → `longUrl` (plain string value). Don't store the full URL record in Redis — only the long URL is needed in the hot path.
+
+### Custom aliases
+
+Custom aliases share the same `short_code` column as auto-generated codes. The uniqueness constraint on `short_code` prevents duplicates at the DB level, but you want to fail fast without hitting the database.
+
+**Reservation flow using Redis `SET NX`:**
+
+```
+Client requests alias "launch2026"
+  → SET NX "url:launch2026" <longUrl> EX 86400
+  → if returns 0: alias already exists → return 409
+  → if returns 1: reservation succeeded → INSERT into MySQL → return "launch2026"
+```
+
+`SET NX` (set if not exists) is atomic at the Redis level — no race condition between two concurrent requests for the same alias. The Redis entry acts as a fast reservation lock; the MySQL insert persists it durably.
+
+**Namespace separation:** Custom aliases can conflict with auto-generated codes. To prevent this, either (a) reject custom aliases that match Base62-encoded integers (check if `decode(alias)` is a valid integer), or (b) prefix auto-generated codes with a character not used in custom aliases. The simplest production approach is (a): validate that the alias is not a pure numeric Base62 sequence.
+
+## Java integration
+
+**Part A — Core URL shortener service:**
+
+```java
+package dev.pushkar.urlshortener;
+
+import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.Jedis;
+
+public final class UrlShortenerService {
+    private static final String BASE62 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    private static final int CODE_LENGTH = 7;
+    private static final int CACHE_TTL_SEC = 86_400; // 24h
+
+    private final JedisPool jedis;
+    private final UrlRepository repo;
+
+    public UrlShortenerService(JedisPool jedis, UrlRepository repo) {
+        this.jedis = jedis;
+        this.repo = repo;
+    }
+
+    public String shorten(String longUrl, String customAlias) {
+        if (customAlias != null && !customAlias.isBlank()) {
+            return reserveAlias(customAlias, longUrl);
+        }
+        long id = repo.insertAndReturnId(longUrl);
+        String code = encode(id);
+        cacheSet(code, longUrl);
+        return code;
+    }
+
+    public String resolve(String code) {
+        // cache-aside: check Redis first
+        try (Jedis j = jedis.getResource()) {
+            String cached = j.get("url:" + code);
+            if (cached != null) return cached;
+        }
+        String longUrl = repo.findByCode(code);
+        if (longUrl != null) cacheSet(code, longUrl);
+        return longUrl;
+    }
+
+    private String reserveAlias(String alias, String longUrl) {
+        try (Jedis j = jedis.getResource()) {
+            // SET NX — atomic idempotent reservation
+            long set = j.setnx("url:" + alias, longUrl);
+            if (set == 0) throw new AliasConflictException(alias);
+            j.expire("url:" + alias, CACHE_TTL_SEC);
+        }
+        repo.insertWithCode(alias, longUrl);
+        return alias;
+    }
+
+    private void cacheSet(String code, String longUrl) {
+        try (Jedis j = jedis.getResource()) {
+            j.setex("url:" + code, CACHE_TTL_SEC, longUrl);
+        }
+    }
+
+    static String encode(long id) {
+        if (id == 0) return String.valueOf(BASE62.charAt(0));
+        var sb = new StringBuilder();
+        while (id > 0) {
+            sb.append(BASE62.charAt((int)(id % 62)));
+            id /= 62;
+        }
+        return sb.reverse().toString();
+    }
+}
+```
+
+**Part B — Spring Boot controller:**
+
+```java
+@RestController
+@RequestMapping
+public class UrlController {
+    private final UrlShortenerService svc;
+
+    public UrlController(UrlShortenerService svc) { this.svc = svc; }
+
+    @PostMapping("/shorten")
+    public ResponseEntity<ShortenResponse> shorten(@RequestBody ShortenRequest req) {
+        String code = svc.shorten(req.longUrl(), req.customAlias());
+        return ResponseEntity.ok(new ShortenResponse(code));
+    }
+
+    @GetMapping("/{code}")
+    public ResponseEntity<Void> redirect(@PathVariable String code) {
+        String longUrl = svc.resolve(code);
+        if (longUrl == null) return ResponseEntity.notFound().build();
+        return ResponseEntity.status(HttpStatus.MOVED_PERMANENTLY)
+            .header(HttpHeaders.LOCATION, longUrl)
+            .build();
+    }
+
+    record ShortenRequest(String longUrl, String customAlias) {}
+    record ShortenResponse(String shortCode) {}
+}
+```
+
+The `resolve()` method is the hot path. The Redis `GET` is a single round-trip (~0.3 ms on a local cluster). The Spring controller adds negligible overhead — total redirect latency on a cache hit is well under 5 ms, comfortably within the 10 ms p99 SLA.
+
+For expiry enforcement, `repo.findByCode(code)` should include a check on `expires_at`:
+
+```java
+// In UrlRepository — check expiry in SQL, not application code
+// SELECT long_url FROM urls WHERE short_code = ? AND (expires_at IS NULL OR expires_at > NOW()) AND deleted_at IS NULL
+```
+
+If the URL is expired, return `null` from `findByCode`, and the controller returns `404`. A stricter implementation returns `410 Gone` to signal the resource existed but is permanently unavailable.
+
+## Tradeoffs
+
+<TradeoffTable title="Short code generation strategy comparison">
+
+| Approach | Pros | Cons | Pick when |
+|---|---|---|---|
+| MD5 hash (take first 7 chars) | Simple, no DB needed for generation | Collision risk, non-monotonic, non-deterministic collisions require retry loops | Prototype only |
+| Auto-increment ID + Base62 | Zero collisions, monotonic, sortable, simple implementation | Single-point ID generation (bottleneck at extreme scale) | **Default choice for most systems** |
+| UUID v4 + Base62 | Distributed, no coordination required | 128 bits → 22+ chars unless truncated; truncation reintroduces collision risk | Multi-region write, prototype |
+| Snowflake ID + Base62 | Time-sortable, fully distributed, no coordination | More complex to operate (requires ID generation fleet) | Write scale > 100K/sec |
+
+</TradeoffTable>
+
+<Pitfall title="Using MD5/SHA of the long URL as the short code">
+
+Truncating a hash to 7 characters maps a 128-bit (MD5) or 256-bit (SHA-256) space down to 7 characters of Base62, which is only 38 bits. The Birthday Problem gives a 50% collision probability at approximately $\sqrt{62^7} \approx 1.87$ million URLs — well within the write volume of any meaningful service.
+
+Beyond collisions, hashing the long URL also means submitting the same URL twice returns the same code, which prevents per-submission analytics. And handling collisions requires re-hashing with an appended salt and re-checking uniqueness — turning a supposedly O(1) operation into a retry loop with unpredictable latency.
+
+Generate a unique ID first, then encode it. The encoding is a pure math operation — no lookups, no retries, no collisions.
+
+</Pitfall>
+
+<Pitfall title="Relying on Redis TTL for URL expiry enforcement">
+
+Setting a Redis TTL equal to the URL's `expires_at` seems like a clean solution: the key disappears when the URL expires. But this breaks under two conditions.
+
+First, Redis can evict keys before their TTL expires under memory pressure (when `maxmemory-policy` is set to any `allkeys-*` variant). A cache miss after premature eviction would re-populate the cache from the database, resurrecting an expired URL.
+
+Second, the URL record still exists in MySQL after Redis evicts it. Any cache miss — eviction, cold start, Redis failover — hits MySQL, which happily returns the long URL regardless of expiry.
+
+Expiry logic belongs in the database query (`WHERE expires_at IS NULL OR expires_at > NOW()`) and the application layer. Use a scheduled background job (e.g., a Spring `@Scheduled` task running nightly) to delete or archive expired rows. Redis TTL is a caching optimization, not an expiry mechanism.
+
+</Pitfall>
+
+<Curveball question="What happens if the same long URL is submitted twice — do you return the same short code?">
+
+This is a deliberate design decision, not an implementation detail.
+
+If you return the same short code for duplicate long URLs, you need a reverse index: `long_url → short_code`. At 91 TB of URLs over 5 years, scanning for duplicates on every write is expensive. You'd need to hash the long URL and store it as a lookup key — which brings back the hashing collision problem for the index (not the short code).
+
+Most production URL shorteners deliberately return a new short code for each submission, even for duplicate long URLs. This gives each submission its own analytics identity: you can track which campaign link drove clicks vs. which was shared organically, even if both point to the same destination. Bitly's API explicitly works this way.
+
+If deduplication is required (e.g., to save storage), store a SHA-256 of the long URL as an indexed column, do a lookup before insert, and return the existing code on match. Accept the lookup cost on writes — writes are 100× less frequent than reads, so it's acceptable.
+
+</Curveball>
+
+<Curveball question="How would you add click analytics without adding p99 latency to the redirect path?">
+
+Never write analytics synchronously in the redirect handler. A synchronous `INSERT INTO click_events` adds a DB round-trip to every redirect — turning a sub-5 ms operation into a 15–30 ms one, and creating a write bottleneck at 116K events/sec.
+
+The pattern is **fire-and-forget via a message queue**:
+
+1. The redirect handler publishes a lightweight event to Kafka: `{ shortCode, timestamp, ip, userAgent, referrer }` — this is a single async Kafka producer call, adding < 0.1 ms to the redirect.
+2. A separate Analytics Writer service consumes from Kafka, batches events, and bulk-inserts into the Click Events table (or a column-oriented analytics store like ClickHouse or BigQuery for reporting).
+3. The redirect path never waits on analytics writes.
+
+The tradeoff is eventual consistency in analytics — click counts may lag behind reality by seconds. For marketing dashboards, this is always acceptable.
+
+</Curveball>
+
+<Curveball question="The service goes viral — you need 10x capacity in 4 hours. Walk me through the scaling steps.">
+
+Start with the bottleneck. At baseline, the read path is Redis → MySQL Replica. The write path is MySQL Primary → ID Generator.
+
+**Step 1 (immediate, < 30 min):** Scale app server instances horizontally — they're stateless. Auto-scaling groups on ECS or Kubernetes handle this. Each new instance connects to the existing Redis cluster and MySQL replicas.
+
+**Step 2 (< 1 hour):** Add MySQL read replicas. Each replica can serve a fraction of the 116K reads/sec that miss the cache. Add replicas and update the connection pool's replica list.
+
+**Step 3 (< 1 hour):** Scale the Redis cluster. Add shards to distribute the keyspace. Redis Cluster handles resharding online with `CLUSTER REBALANCE`. At 10× traffic, the 5.4 GB working set grows proportionally — add memory.
+
+**Step 4 (< 2 hours):** Enable CDN caching for the top 1% of short codes. Configure the CDN to cache 301 redirects with a short TTL (5 minutes). At viral scale, a handful of codes drive the majority of traffic — offloading these to the CDN edge removes them from your origin entirely.
+
+**Step 5 (< 4 hours):** If MySQL Primary write throughput is the bottleneck, deploy a Snowflake-style ID generator service to decouple ID generation from DB writes. Batch inserts with `INSERT INTO urls VALUES (...), (...), (...)` reduce per-row overhead significantly.
+
+The sequence matters: don't reach for DB sharding before exhausting stateless horizontal scaling and cache optimization — those are hours of effort vs. weeks.
+
+</Curveball>
+
+<RelatedQuestions items={[
+  { slug: "distributed-rate-limiter", title: "Design a Distributed Rate Limiter", difficulty: "mid" },
+  { slug: "design-a-cache", title: "Design a Cache (CDN / In-process / Distributed)", difficulty: "mid" },
+  { slug: "distributed-unique-id-generator", title: "Design a Distributed Unique ID Generator", difficulty: "mid" },
+]} />
+
+## Further reading
+
+- [Bitly Engineering Blog — Building a Billion-click Platform](https://word.bitly.com/post/29ensure) — Bitly's own retrospective on scaling their redirect infrastructure, including their move from a single DB to a sharded architecture
+- [System Design Interview — Alex Xu (Chapter 8: Design a URL Shortener)](https://bytebytego.com/courses/system-design-interview/design-a-url-shortener) — The canonical interview-prep treatment with detailed capacity estimation and component breakdown
+- [Base62 encoding explained — Wikipedia](https://en.wikipedia.org/wiki/Base62) — Formal definition of the Base62 alphabet and its use in URL-safe encoding
+- [Redis SET NX documentation](https://redis.io/docs/latest/commands/setnx/) — Official documentation for the atomic set-if-not-exists primitive used for alias reservation

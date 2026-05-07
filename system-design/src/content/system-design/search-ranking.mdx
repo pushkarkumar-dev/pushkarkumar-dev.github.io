@@ -1,0 +1,582 @@
+---
+title: "Design a Search Ranking System"
+slug: "search-ranking"
+category: "ai"
+difficulty: "staff"
+estimatedReadMinutes: 26
+tags: ["learning-to-rank", "BM25", "BERT", "two-stage", "neural-ranking", "feature-engineering", "NDCG"]
+companyFlavors: ["Google", "LinkedIn", "Amazon", "Airbnb", "Pinterest"]
+relatedQuestions: ["recommendation-engine", "vector-database", "google-search"]
+publishedAt: "2025-01-07"
+updatedAt: "2025-01-07"
+summary: "Design a production search ranking system with a two-stage pipeline: BM25 recall at scale followed by a neural re-ranker, trained on implicit click signals using Learning to Rank with NDCG loss."
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+
+<Bookmark slug="search-ranking" title="Design a Search Ranking System" />
+
+<Tldr>
+- Two-stage pipeline: BM25/inverted-index recall (retrieves top-1K candidates in under 30ms) followed by a neural re-ranker (scores top-1K in under 100ms) producing the final ranked results.
+- Learning to Rank (LTR): train a model to maximize NDCG using logged (query, document, relevance_label) tuples; relevance labels derived from click-through data and human editor judgments.
+- Position bias: clicks on position 1 are 10× more likely than position 10 even for equal relevance — debias training labels using IPS (Inverse Propensity Scoring) or controlled swap experiments.
+- Dense retrieval: a BERT-based bi-encoder produces query and document embeddings; ANN search in FAISS finds semantically similar documents not lexically matched by BM25.
+- Hybrid scoring: combine BM25 sparse score and dense semantic score using Reciprocal Rank Fusion (RRF) or a learned linear combination for best-of-both retrieval quality.
+</Tldr>
+
+Search ranking is Learning to Rank applied at internet scale. BM25 and inverted indexes get you to the right neighborhood — finding documents that contain the query terms. But whether the first result should be a Wikipedia overview, a tutorial, a product listing, or a news article requires understanding the user's intent and context. That's where Learning to Rank enters: a model trained on billions of implicit feedback signals (clicks, dwell time, skips) that learns to order candidates the way users actually find useful.
+
+## Clarifying Questions
+
+Before jumping into architecture, a senior engineer should clarify the exact problem shape. The answers change the design significantly.
+
+| Question | Why It Matters |
+|---|---|
+| What domain is this — web search, product search, job search, or enterprise document search? | Product search weights purchase signals; job search has two-sided matching; web search needs freshness for news. |
+| What is the query volume and latency SLA? | 10K QPS with p99 < 200ms drives very different infrastructure choices than 100 QPS with p99 < 2s. |
+| How large is the index — millions or billions of documents? | Billions of documents require distributed sharding, while millions can fit in a single Elasticsearch cluster. |
+| What query types must be supported — keyword, natural language, faceted filters? | Natural language queries require semantic/dense retrieval; faceted filters require structured field filtering. |
+| Is personalization required? | User-level personalization adds a real-time feature serving layer and changes training data requirements. |
+| Is multilingual support needed? | Multilingual search requires language-specific analyzers, cross-lingual embeddings, or separate indexes per language. |
+| What are the freshness requirements — breaking news or evergreen content? | Real-time news requires sub-second indexing pipelines; evergreen content can tolerate hourly crawl cycles. |
+| Are there diversity or fairness constraints? | Some domains require spreading results across domains, content types, or demographic groups. |
+
+For this design, we'll assume: web-scale product + document search, 10K QPS, < 200ms p99 end-to-end, 10 billion documents, personalization required, English-first with multilingual roadmap, freshness within 30 seconds for new documents, and diversity constraints on domain-level deduplication.
+
+## Functional Requirements
+
+- Accept keyword and natural language queries from end users via a REST API.
+- Retrieve relevant candidate documents from a large-scale index using BM25 and dense retrieval.
+- Re-rank the retrieved candidate set using an ML model that incorporates query features, document features, and user context features.
+- Personalize results based on the user's interaction history, preferences, and behavioral signals.
+- Return facets (category breakdowns), spell corrections for mistyped queries, and a snippet preview for each result.
+- Index new documents within 30 seconds of publication to meet freshness requirements.
+- Support A/B testing of competing ranking models with traffic splitting at the query level.
+- Provide an admin API for model deployment, rollback, and real-time metric monitoring.
+
+## Non-Functional Requirements
+
+- **Throughput**: 10,000 queries per second at peak load.
+- **Latency**: End-to-end search latency under 200ms at p99; BM25 recall under 30ms; neural re-ranking under 100ms.
+- **Index scale**: 10 billion documents across a distributed index.
+- **Freshness**: New documents indexed and searchable within 30 seconds of publication.
+- **Model retraining**: Full model retrain weekly; incremental daily updates using new click data.
+- **Availability**: 99.99% uptime; graceful degradation to BM25-only ranking if the GPU re-ranker is unavailable.
+- **Scalability**: Horizontal scaling of both the recall layer and re-ranking layer independently.
+- **Observability**: Per-query latency breakdown (recall time, feature fetch time, re-rank time), NDCG tracking over time, A/B test dashboards.
+
+<Capacity title="Search Ranking Capacity">
+
+**Concurrency at 10K QPS with 200ms budget:**
+
+$$\text{in-flight queries} = \text{QPS} \times \text{latency} = 10{,}000 \times 0.2 = 2{,}000$$
+
+We need infrastructure that can hold 2,000 queries in flight simultaneously across all pipeline stages.
+
+**BM25 Recall Layer (Elasticsearch):**
+
+With 10 billion documents distributed across 50 shards, each shard holds:
+
+$$\frac{10 \times 10^9}{50} = 200{,}000{,}000 \text{ docs/shard}$$
+
+At a BM25 scan rate of ~1M docs/second per shard, a full scan would take 200ms — too slow. In practice, inverted index lookups skip non-matching documents entirely. Assume each query touches ~5% of the index:
+
+$$\text{effective scan} = 200\text{M} \times 0.05 / 1\text{M docs/sec} \approx 10\text{ms per shard}$$
+
+With coordinator-level fan-out and per-shard caching for hot queries, this achieves the < 30ms target.
+
+**Neural Re-ranker (GPU inference):**
+
+Each query scores 1,000 candidates. With BERT-base at batch size 32:
+
+$$\text{batches per query} = \lceil 1000 / 32 \rceil = 32 \text{ batches}$$
+
+At 2,000 forward passes per GPU core per second:
+
+$$\text{GPU cores needed} = \frac{10{,}000 \text{ QPS} \times 1{,}000 \text{ candidates}}{32 \text{ batch size} \times 2{,}000 \text{ passes/core/sec}} \approx 156 \text{ GPU cores}$$
+
+This translates to roughly 20 A100 GPUs (8 cores each), with headroom for burst traffic.
+
+**Feature Serving:**
+
+Each query fetches features for 1,000 candidates, 20 features each at 50 bytes per feature:
+
+$$\text{data per query} = 1{,}000 \times 20 \times 50 = 1{,}000{,}000 \text{ bytes} = 1 \text{ MB}$$
+
+At 10K QPS:
+
+$$\text{feature read throughput} = 10{,}000 \times 1\text{MB} = 10\text{ GB/s}$$
+
+This requires a low-latency feature store (Redis cluster or Cassandra) with aggressive caching — document features rarely change and can be cached with a 5-minute TTL.
+
+**Ranking Quality Metric:**
+
+$$\text{NDCG@10} = \frac{DCG@10}{IDCG@10} \text{ where } DCG@k = \sum_{i=1}^{k} \frac{2^{rel_i} - 1}{\log_2(i+1)}$$
+
+$IDCG@k$ is the DCG of the ideal (perfect) ranking. NDCG = 1.0 is a perfect ranking; NDCG = 0.0 is the worst possible. Production systems typically target NDCG@10 > 0.85 for well-studied query categories.
+
+</Capacity>
+
+## API Design
+
+```text
+Search (public):
+GET /api/v1/search?q=machine+learning+tutorial&page=1&limit=10&userId=X
+  → {
+       results: [{ docId, title, url, snippet, score, rank }],
+       totalHits,
+       facets,
+       spellCorrection,
+       queryId
+     }
+
+Index (internal ingestion):
+POST /api/v1/index
+  body: { docId, content, metadata, publishedAt }
+  → { indexedAt, shardId }
+
+DELETE /api/v1/index/{docId}
+
+Model management (internal):
+POST /api/v1/ranking-models
+  body: { version, artifactUri, testNdcg, productionSplit }
+  → { modelId, status, deployedAt }
+
+GET /api/v1/ranking-models/{version}/metrics
+  → Online A/B test metrics vs. control
+```
+
+The `queryId` in the search response is critical — it links the search result set to downstream click events, enabling closed-loop training data collection without fragile session reconstruction.
+
+## Data Model
+
+The data model has three concerns: logging queries and clicks for training data, storing human relevance labels, and the Elasticsearch index schema for documents.
+
+```sql
+CREATE TABLE search_queries (
+    query_id        UUID PRIMARY KEY,
+    user_id         UUID,
+    query_text      VARCHAR(1000) NOT NULL,
+    result_count    INT,
+    latency_ms      INT,
+    model_version   VARCHAR(50),
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE click_events (
+    click_id        UUID PRIMARY KEY,
+    query_id        UUID REFERENCES search_queries(query_id),
+    doc_id          VARCHAR(200) NOT NULL,
+    click_position  INT NOT NULL,
+    dwell_time_ms   INT,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE relevance_labels (
+    query_text      VARCHAR(1000) NOT NULL,
+    doc_id          VARCHAR(200) NOT NULL,
+    label           INT NOT NULL,   -- 0=irrelevant, 1=relevant, 2=highly relevant, 3=perfect
+    label_source    VARCHAR(20) NOT NULL,   -- EDITOR, CLICK_DERIVED, PURCHASE
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (query_text, doc_id)
+);
+```
+
+The `click_events` table joins to `search_queries` via `query_id`, giving the training pipeline the position at which each click occurred — essential for IPS debiasing. `dwell_time_ms` distinguishes satisfied clicks (long dwell) from bounces (< 5 seconds), providing a higher-quality relevance signal than raw clicks.
+
+The Elasticsearch document index schema:
+
+```json
+{
+  "mappings": {
+    "properties": {
+      "doc_id":        { "type": "keyword" },
+      "title":         { "type": "text", "analyzer": "english" },
+      "content":       { "type": "text", "analyzer": "english" },
+      "embedding":     { "type": "dense_vector", "dims": 768 },
+      "published_at":  { "type": "date" },
+      "quality_score": { "type": "float" },
+      "category":      { "type": "keyword" }
+    }
+  }
+}
+```
+
+The `embedding` field stores the BERT-encoded document vector for hybrid dense+BM25 retrieval. In practice, for 10B documents, embeddings are stored in a dedicated FAISS cluster rather than Elasticsearch itself, because vector ANN search in Elasticsearch is not optimized for billion-scale retrieval. The Elasticsearch index handles BM25 recall; FAISS handles dense recall; the coordinator merges the two candidate sets.
+
+## Architecture Diagram
+
+<Mermaid diagram={`flowchart TD
+    A[User Query] --> B[Query Processor]
+    B --> B1[Spell Correction]
+    B --> B2[Query Expansion / Synonyms]
+    B --> B3[Intent Classifier]
+
+    B1 & B2 & B3 --> C[Recall Layer]
+
+    C --> D[BM25 via Elasticsearch<br/>50 shards, top-500]
+    C --> E[Dense Retrieval via FAISS<br/>bi-encoder embeddings, top-500]
+
+    D & E --> F[Merge + Deduplicate<br/>RRF fusion, top-1000]
+
+    F --> G[Feature Fetcher]
+    G --> G1[Document Features<br/>quality, recency, PageRank]
+    G --> G2[User Features<br/>history, preferences]
+    G --> G3[Query-Doc Features<br/>BM25 score, exact match]
+
+    G1 & G2 & G3 --> H[Neural Re-ranker<br/>LambdaMART + BERT, GPU]
+
+    H --> I[Post-Processing<br/>diversity, business rules]
+    I --> J[Ranked Results → User]
+
+    K[Click Events] --> L[Kafka]
+    L --> M[Training Data Pipeline<br/>IPS debiasing]
+    M --> N[Model Trainer<br/>LambdaMART, weekly]
+    N --> O[Model Registry]
+    O --> H
+
+    P[New Documents] --> Q[Indexing Pipeline<br/>< 30s freshness]
+    Q --> D
+    Q --> R[BERT Encoder<br/>offline batch]
+    R --> E
+`} />
+
+The architecture separates concerns cleanly: the recall layer is CPU-bound and horizontally scalable; the re-ranking layer is GPU-bound and separately scalable; the training pipeline is asynchronous and does not affect query serving latency. The model registry enables atomic model swaps with A/B traffic splitting.
+
+## Deep Dive 1: BM25 and Inverted Index Recall
+
+BM25 (Best Match 25) is the workhorse of lexical retrieval. It scores each document against a query based on term frequency (TF) and inverse document frequency (IDF), with two key enhancements over naive TF-IDF: TF saturation (a document with 100 occurrences of a term is not 10× more relevant than one with 10 occurrences) and document length normalization (short documents with high TF should not unfairly beat comprehensive documents).
+
+The BM25 scoring formula:
+
+$$\text{BM25}(q,d) = \sum_{t \in q} \text{IDF}(t) \cdot \frac{f(t,d) \cdot (k_1 + 1)}{f(t,d) + k_1 \cdot \left(1 - b + b \cdot \frac{|d|}{\text{avgdl}}\right)}$$
+
+where $k_1 = 1.2$ controls TF saturation (higher = slower saturation), $b = 0.75$ controls length normalization (1.0 = full normalization, 0 = none), $f(t,d)$ is the raw term frequency of term $t$ in document $d$, $|d|$ is document length in tokens, and $\text{avgdl}$ is the average document length across the corpus.
+
+The IDF component uses the formula:
+
+$$\text{IDF}(t) = \ln\left(\frac{N - n(t) + 0.5}{n(t) + 0.5} + 1\right)$$
+
+where $N$ is the total number of documents and $n(t)$ is the number of documents containing term $t$. High-frequency terms like "the" get near-zero IDF weight; rare domain-specific terms get high IDF weight, making them powerful discriminators.
+
+**Inverted index at scale**: For 10B documents, Elasticsearch distributes the index across 50 shards. A query fans out to all 50 shards in parallel; each shard uses its local inverted index to retrieve top-K BM25 results; the coordinator merges and takes the global top-K. This fan-out is completely parallelized — latency is bounded by the slowest shard, not the sum of all shards.
+
+**Query expansion**: Raw BM25 suffers from vocabulary mismatch — the user says "automobile" but documents say "car." Query expansion adds synonyms from a curated synonym graph or learned from co-click patterns. Example: "machine learning" expands to include "deep learning", "AI", "neural networks" as boosted terms with lower weight than the original query terms.
+
+**Spell correction**: A separate edit-distance index over the vocabulary catches typos before they reach BM25. "machien leraning" → "machine learning" with 95% confidence. The corrected query is used for retrieval; the original query is shown to the user with a "Did you mean?" prompt.
+
+**Caching**: Hot queries (top 1% account for 30–40% of traffic at many search properties) are cached at the recall layer. BM25 results for "iPhone 15 pro" are stable over minutes and can be cached with a 60-second TTL. Cache hit rates of 20–30% meaningfully reduce shard load.
+
+## Deep Dive 2: Dense Retrieval (Semantic Search)
+
+BM25 is fundamentally a lexical matching system: it finds documents that contain the query's exact terms (or stemmed variants). This creates a vocabulary mismatch problem. A query for "heart attack symptoms" will miss documents that say "myocardial infarction signs" even though the two phrases mean the same thing. Dense retrieval solves this by mapping both queries and documents into a shared semantic embedding space where meaning is proximity.
+
+**BERT bi-encoder architecture**: Two separate BERT encoders — one for queries, one for documents — each produce a 768-dimensional embedding vector. The encoders share weights or are trained separately with hard negatives. At query time, the query encoder runs live (approximately 20ms on a GPU). Document encoders run offline, in batch, storing the resulting vectors in a FAISS index.
+
+**Training the bi-encoder**: Contrastive loss with in-batch negatives. For a batch of (query, positive document) pairs, every other document in the batch serves as a hard negative. The loss function pushes the query embedding closer to its positive document and farther from negatives in the 768-dimensional space:
+
+$$\mathcal{L} = -\log \frac{e^{\text{sim}(q, d^+)/\tau}}{\sum_{j} e^{\text{sim}(q, d_j)/\tau}}$$
+
+where $\text{sim}$ is dot product or cosine similarity and $\tau$ is a temperature parameter. Hard negative mining — adding retrieved-but-not-clicked documents as negatives — significantly improves retrieval quality beyond random in-batch negatives.
+
+**FAISS index**: Facebook's FAISS library provides efficient approximate nearest neighbor (ANN) search. For 10B document embeddings at 768 dimensions × 4 bytes = approximately 30TB of raw vectors. FAISS's IVF-PQ (Inverted File with Product Quantization) compresses vectors to ~96 bytes each, reducing storage to ~1TB and enabling search in under 10ms with 95%+ recall compared to exact search.
+
+**Hybrid retrieval with Reciprocal Rank Fusion**: Running BM25 and FAISS in parallel and merging their results captures the best of both worlds. BM25 excels at exact-match queries and rare entity names; dense retrieval excels at semantic queries and paraphrase matching. Reciprocal Rank Fusion merges ranked lists without requiring score normalization:
+
+$$\text{RRF\_score}(d) = \frac{1}{\text{rank\_BM25}(d) + k} + \frac{1}{\text{rank\_FAISS}(d) + k}$$
+
+where $k = 60$ is a smoothing constant that prevents extremely high scores for rank-1 documents. A document ranked 1st in BM25 and 3rd in FAISS will score higher than one ranked 2nd in each — a sensible fusion heuristic. RRF is parameter-free and robust to score distribution differences between the two systems, making it the default choice before investing in a learned combination.
+
+## Deep Dive 3: Learning to Rank
+
+Learning to Rank (LTR) is the machine learning framework that takes a candidate set produced by recall and reorders it to maximize ranking quality metrics. The input is a set of (query, document, label) tuples; the output is a scoring function that assigns a real-valued relevance score to each (query, document) pair so that sorting by score produces the best possible ranking.
+
+**Three LTR paradigms:**
+
+**Pointwise**: Treat ranking as regression or classification. Predict a relevance score per (q, d) pair independently. Pro: simple to train and serve. Con: doesn't directly optimize ordering — two documents with scores 0.9 and 0.8 get the same ordering loss as 0.9 and 0.1, even though the relative score matters far more than the absolute value.
+
+**Pairwise**: Train to prefer the higher-relevance document over the lower-relevance one in each pair. For each query, generate all (more-relevant, less-relevant) document pairs and minimize a pairwise loss. LambdaRank extends this by weighting each pair's loss by the NDCG improvement that swapping the pair would achieve (ΔNDCG), effectively teaching the model to focus on mistakes that hurt the ranking metric the most.
+
+**Listwise**: Model the full ranked list jointly. LambdaMART combines LambdaRank's ΔNDCG-weighted gradients with gradient boosted trees (specifically XGBoost or LightGBM). It directly optimizes NDCG at the list level while benefiting from tree models' ability to handle mixed feature types, missing values, and complex interactions without feature engineering. LambdaMART remains the state-of-the-art production LTR algorithm at most search properties because it is fast to train (hours on CPU), interpretable (feature importances), and easy to update incrementally.
+
+**Feature engineering for LTR:**
+
+Query-level features:
+- Query length in tokens
+- Query frequency (how often this exact query appears in logs)
+- Query intent class (navigational / informational / transactional) from a classifier
+- Query contains brand name (boolean)
+- Query age (is this a trending or new query?)
+
+Document-level features:
+- BM25 score against the query (the primary lexical signal)
+- Document PageRank or authority score
+- Document recency (hours since publication)
+- Content quality score (from a classifier: ads ratio, readability, link count)
+- Document category match with query intent
+
+Query-document interaction features:
+- Exact query-in-title match (boolean and position)
+- Phrase match count in first 100 words
+- Semantic similarity score from the bi-encoder
+- Historical click-through rate for this (query, document) pair
+- Click-through rate for this query category × document category
+
+User personalization features:
+- User's historical click rate on this document type
+- User's embedding distance from this document's embedding
+- Whether the user has interacted with this document before
+- User's recent query history (encoded as an embedding or bag of intents)
+
+## Deep Dive 4: Position Bias and Label Debiasing
+
+Clicks are cheap to collect at scale but deeply biased. The two most damaging biases in search click data are:
+
+**Position bias**: Users scan search results from top to bottom and are far more likely to click position 1 than position 5 for equal-relevance results. In controlled experiments, the click rate on position 1 is typically 5–15× higher than on position 5. If you train a model on raw click data without correcting for this, the model learns that "documents that appear at the top get clicked" and will rank documents that happen to have been shown at position 1 higher — regardless of their actual relevance. This creates a feedback loop: biased model → biased rankings → biased clicks → even more biased model.
+
+**Selection bias**: Only documents shown to users receive click labels. The bottom 95% of the index is never shown and thus has no click labels at all. The training data is missing-not-at-random: the most relevant documents for rare queries may never appear in training data because the old ranking model never surfaced them.
+
+**Inverse Propensity Scoring (IPS)**: The standard debiasing technique. Define the propensity $P(\text{click} \mid \text{position}, \text{relevance})$ — the probability that a document at position $k$ gets clicked given that it is relevant. Under the observation model that clicks happen only for shown and relevant documents:
+
+$$\hat{\text{label}}(q, d) = \frac{\text{click}(q, d)}{P(\text{click} \mid \text{position})}$$
+
+Dividing by the propensity upweights clicks at low positions (where propensity is low) and downweights clicks at high positions (where propensity is high), producing an unbiased estimate of relevance from biased click data.
+
+**Estimating propensities from swap experiments**: To estimate $P(\text{click} \mid \text{position})$, randomly swap documents between positions 1 and 5 for a small fraction of traffic (0.1–1%). For equal-relevance documents, the ratio of observed click rates at position 1 vs. position 5 gives the propensity ratio. This requires a dedicated randomization layer in the serving stack and careful attribution to avoid contaminating the main ranking model's training signal.
+
+**Unbiased LambdaMART**: Apply IPS weights to the pairwise gradients. For a pair (relevant document at position 5, irrelevant document at position 1), the gradient for the relevant document is scaled up by $1/P(\text{click} \mid \text{position}=5)$. This requires careful hyperparameter tuning: high IPS weights for rare low-position clicks introduce high variance in the gradient estimates. Clipping propensities at a maximum value (e.g., cap at $1/P_{\min} = 10\times$) reduces variance at the cost of some bias.
+
+## Python Implementation
+
+### Part A: LTR Training Pipeline
+
+```python
+import numpy as np
+import lightgbm as lgb
+from dataclasses import dataclass
+from typing import List, Tuple
+
+@dataclass
+class RankingExample:
+    query_id: str
+    doc_id: str
+    features: List[float]
+    label: int           # 0=irrelevant, 1=relevant, 2=highly relevant
+    position: int        # for IPS debiasing
+    click: bool
+
+class LTRTrainingPipeline:
+    def __init__(self, propensity_scores: dict[int, float]):
+        self.propensities = propensity_scores  # {position: click_probability}
+        self.model = None
+
+    def prepare_training_data(self, examples: List[RankingExample]):
+        features = np.array([e.features for e in examples])
+        labels = np.array([e.label for e in examples])
+        weights = np.array([
+            1.0 / self.propensities.get(e.position, 0.1) if e.click else 1.0
+            for e in examples
+        ])
+        query_ids = [e.query_id for e in examples]
+        unique_queries = list(dict.fromkeys(query_ids))
+        group_sizes = [query_ids.count(qid) for qid in unique_queries]
+        return features, labels, weights, group_sizes
+
+    def train(self, examples: List[RankingExample],
+              val_examples: List[RankingExample]) -> lgb.Booster:
+        X, y, w, groups = self.prepare_training_data(examples)
+        X_val, y_val, _, groups_val = self.prepare_training_data(val_examples)
+
+        train_data = lgb.Dataset(X, label=y, weight=w, group=groups)
+        val_data = lgb.Dataset(X_val, label=y_val, group=groups_val)
+
+        params = {
+            "objective": "lambdarank",
+            "metric": "ndcg",
+            "ndcg_eval_at": [1, 5, 10],
+            "learning_rate": 0.05,
+            "num_leaves": 127,
+            "min_data_in_leaf": 20,
+            "label_gain": [0, 1, 3, 7],
+        }
+
+        self.model = lgb.train(
+            params, train_data,
+            valid_sets=[val_data],
+            num_boost_round=500,
+            callbacks=[lgb.early_stopping(50), lgb.log_evaluation(50)]
+        )
+        return self.model
+
+    def evaluate_ndcg(self, examples: List[RankingExample], k: int = 10) -> float:
+        X, y, _, groups = self.prepare_training_data(examples)
+        scores = self.model.predict(X)
+        ndcg_scores = []
+        idx = 0
+        for group_size in groups:
+            group_scores = scores[idx:idx+group_size]
+            group_labels = y[idx:idx+group_size]
+            ranked_labels = group_labels[np.argsort(group_scores)[::-1]]
+            ndcg_scores.append(self._ndcg(ranked_labels, k))
+            idx += group_size
+        return float(np.mean(ndcg_scores))
+
+    def _ndcg(self, labels: np.ndarray, k: int) -> float:
+        ideal = np.sort(labels)[::-1][:k]
+        actual = labels[:k]
+        dcg = sum((2**r - 1) / np.log2(i+2) for i, r in enumerate(actual))
+        idcg = sum((2**r - 1) / np.log2(i+2) for i, r in enumerate(ideal))
+        return dcg / idcg if idcg > 0 else 0.0
+```
+
+The `label_gain` parameter maps relevance grades (0, 1, 2, 3) to exponential gains (0, 1, 3, 7) matching the $2^{rel} - 1$ formula in NDCG. The IPS weight is applied only to click events — un-clicked impressions get weight 1.0 since they provide a negative signal unaffected by position bias.
+
+### Part B: Online Search Ranker
+
+```python
+import time
+import logging
+from typing import List, Dict, Any
+
+logger = logging.getLogger(__name__)
+
+class SearchRanker:
+    def __init__(self, bm25_client, faiss_index, ltr_model,
+                 feature_store, query_encoder):
+        self.bm25 = bm25_client
+        self.faiss = faiss_index
+        self.ltr = ltr_model
+        self.features = feature_store
+        self.encoder = query_encoder
+
+    def search(self, query: str, user_id: str, limit: int = 10) -> List[Dict]:
+        start = time.monotonic()
+
+        bm25_candidates = self.bm25.search(query, top_k=500)
+        query_emb = self.encoder.encode(query)
+        dense_candidates = self.faiss.search(query_emb, top_k=500)
+
+        candidates = self._rrf_merge(bm25_candidates, dense_candidates, top_k=100)
+
+        ranked = self._rerank(query, user_id, candidates)
+        ranked = self._apply_diversity(ranked, limit * 2)
+
+        latency_ms = int((time.monotonic() - start) * 1000)
+        logger.info("search query=%r user=%s hits=%d latency_ms=%d",
+                    query, user_id, len(ranked), latency_ms)
+        return ranked[:limit]
+
+    def _rrf_merge(self, bm25_results, dense_results, top_k: int, k: int = 60):
+        scores: dict[str, float] = {}
+        for rank, (doc_id, _) in enumerate(bm25_results):
+            scores[doc_id] = scores.get(doc_id, 0) + 1 / (rank + k)
+        for rank, (doc_id, _) in enumerate(dense_results):
+            scores[doc_id] = scores.get(doc_id, 0) + 1 / (rank + k)
+        return sorted(scores.keys(), key=lambda d: scores[d], reverse=True)[:top_k]
+
+    def _rerank(self, query: str, user_id: str, doc_ids: list) -> list:
+        feature_vectors = [
+            self.features.get_ltr_features(query, doc_id, user_id)
+            for doc_id in doc_ids
+        ]
+        import numpy as np
+        X = np.array(feature_vectors)
+        scores = self.ltr.predict(X)
+        ranked = sorted(zip(doc_ids, scores), key=lambda x: x[1], reverse=True)
+        return [{"doc_id": d, "score": float(s)} for d, s in ranked]
+
+    def _apply_diversity(self, results: list, limit: int) -> list:
+        seen_domains, output = set(), []
+        for item in results:
+            domain = item.get("domain", "")
+            if seen_domains.count(domain) < 3 if domain else True:
+                seen_domains.add(domain)
+                output.append(item)
+            if len(output) >= limit:
+                break
+        return output
+```
+
+In production, `bm25.search` and `faiss.search` run concurrently using `asyncio` or a thread pool — the sequential version shown above adds approximately 20–30ms of unnecessary serialization. The feature fetcher batches all 100 candidate lookups in a single Redis pipeline call to minimize round-trip overhead.
+
+<TradeoffTable title="Ranking Model Approaches">
+
+| Approach | Semantic Understanding | Latency | Compute Cost | Training Complexity | Production Use |
+|---|---|---|---|---|---|
+| BM25 only | None — pure lexical matching | < 30ms | Low (CPU only) | None — no training required | Baseline for all systems; still used in recall layer |
+| BM25 + gradient boosted LTR | Limited — via engineered features | < 50ms (CPU scoring) | Medium (CPU training weekly) | Moderate — feature engineering, IPS debiasing | Most e-commerce and enterprise search at mid-scale |
+| BM25 + neural re-ranker (BERT) | High — contextual representations | 50–150ms (GPU required) | High (GPU inference + training) | High — fine-tuning, negative mining, GPU infra | Web search, LinkedIn, sophisticated product search |
+| Hybrid (BM25 + dense + LTR) | Highest — lexical + semantic + behavioral | 100–200ms end-to-end | Very high (FAISS + GPU + feature store) | Very high — bi-encoder training, FAISS infra, full pipeline | Google, Bing, large-scale semantic search |
+
+</TradeoffTable>
+
+<Pitfall title="Training the ranking model directly on raw click data without debiasing">
+
+Clicks are contaminated by three distinct biases that compound each other. Position bias is the most severe: users click position 1 at a rate 10× higher than position 10 even when the two documents are equally relevant. Selection bias means only documents that were shown get click labels — the model has no training signal for the 99%+ of the index that never appears in results. Popularity bias means frequently-shown documents accumulate more clicks, reinforcing their high position, regardless of whether they are the most relevant documents for the query.
+
+A model trained on raw clicks without debiasing learns to reproduce these biases rather than learning relevance. The feedback loop is insidious: the biased model ranks popular, high-position documents higher → they get shown more → they get more clicks → the next model is even more biased. Within weeks, the model converges to ranking by historical exposure rather than relevance.
+
+IPS debiasing and swap experiments are not optional optimizations — they are required for the model to learn anything about relevance rather than exposure. Teams that skip debiasing often observe that their ranking model gives no measurable improvement over BM25 alone, because the model has learned to replicate the BM25 ranking (which determined positions, which determined clicks) rather than to improve on it.
+
+</Pitfall>
+
+<Pitfall title="Evaluating ranking quality with a single NDCG snapshot rather than online A/B testing">
+
+Offline NDCG computed on a held-out test set measures how well the model replicates past human judgment labels. This is a useful sanity check and fast iteration tool during development, but it is not a reliable proxy for what users actually find useful.
+
+The discrepancy arises from several sources. Editor-assigned labels reflect the editor's judgment of relevance, which may not match actual user intent. The held-out test set covers only queries that appeared in training data — novel queries (new trends, new products, misspellings) are not represented. And offline evaluation cannot capture the dynamic effects of a ranking change: a new model may surface different documents that are relevant but unfamiliar to users, temporarily depressing engagement before users learn to trust the new ranking.
+
+Production ranking teams routinely observe models that show +1–2% offline NDCG improvement but neutral or negative online engagement, and conversely, models that look neutral offline but drive meaningful online CTR improvements by better matching user intent on tail queries. Always run online A/B tests as the authoritative signal for ranking changes. Use offline NDCG only for fast iteration (cheap, no user exposure) and as a guardrail to catch regressions before shipping to any live traffic.
+
+</Pitfall>
+
+<Curveball title="A brand-new document is published. It has no clicks, no engagement history. How does it get ranked for relevant queries?">
+
+This is the classic cold-start problem applied to documents rather than users. The LTR model's most powerful features — historical click-through rate, dwell time, engagement signals — are all zero for a new document. Left untreated, new documents rank near the bottom of any query where they are retrieved, receiving no clicks, accumulating no engagement history, and permanently trapped in obscurity regardless of their actual quality.
+
+The solution is a content-only bootstrap phase: rank new documents using only content features (BM25 score, document quality score, heading structure, external link count) plus an explicit recency bonus. The recency bonus is a decaying function of document age — for example, a 2× score multiplier at publication that decays to 1× linearly over seven days. This gives new documents an initial visibility boost, after which they compete on the same behavioral signals as established documents.
+
+After the document accumulates a threshold of impressions (typically 50–200 depending on the query volume), the LTR model's behavioral features activate and the recency bonus is removed. At this point the document competes on equal footing.
+
+For critically time-sensitive content — breaking news, earnings announcements, product launches — editors can set an "instant boost" flag that overrides ranking and pins the document to a top position for a configurable duration (e.g., 2 hours). This is a deliberate rule-based override and not a model feature, which prevents it from contaminating the training signal.
+
+</Curveball>
+
+<Curveball title="How would you handle ranking for a query with clear navigational intent ('Facebook login') vs. informational intent ('how does machine learning work')?">
+
+Query intent is one of the most powerful features in a search system, and handling the extremes correctly requires different strategies rather than a single unified ranking function.
+
+The first step is query intent classification: train a 3-way classifier on historical queries labeled as navigational (user wants a specific URL), informational (user wants to learn something), or transactional (user wants to buy or do something). The classifier uses query text features, historical click patterns (navigational queries have very high CTR on position 1 because users find what they want immediately), and query reformulation patterns.
+
+For **navigational queries** like "Facebook login": surface the exact-match URL at position 1 as a rule-based override, bypassing the LTR score entirely. The user has a specific destination in mind — no amount of ML sophistication should re-rank them away from it. The rule is simple: if query intent = navigational AND an exact-match document exists with confidence > 0.9, pin it to position 1.
+
+For **informational queries** like "how does machine learning work": use the full LTR model with diversity constraints. Users exploring a topic benefit from multiple perspectives — a beginner tutorial, a technical overview, a video, an interactive notebook. The diversity layer should cap results from the same domain at 2–3 positions and ensure representation of multiple content formats (article, video, course).
+
+For **transactional queries** like "buy running shoes": blend organic editorial results with product listings, weight purchase conversion rate heavily in the training signal (a click that results in a purchase within 30 minutes is labeled 3 = perfect, versus a click with 5 seconds dwell = 0 = irrelevant), and surface facets (brand, size, price range) prominently to support the user's decision process.
+
+</Curveball>
+
+<Curveball title="You want to penalize low-quality or spammy documents. How do you prevent the ranking model from surfacing them even when they're textually relevant?">
+
+A document can score highly on BM25 (it contains all the query terms, repeated many times) and have clicks (from users who were tricked into clicking keyword-stuffed titles) while being genuinely low quality or spammy. A naive LTR model trained on this data will learn to surface spam, since its training signal is contaminated by the same spam that produced the clicks.
+
+The solution is a two-layer defense. The first layer is a **hard quality filter** applied before the candidate set is passed to the re-ranker. Train a document quality classifier offline using features that are difficult to game: site reputation (domain age, backlink quality from reputable sources), content-to-ads ratio, readability score (average sentence length, vocabulary richness), keyword density (is the keyword unnaturally repeated?), time-on-page from server logs, and exit rate. Documents scoring below a quality threshold are excluded from the candidate set entirely — they never reach the LTR model, so their BM25 scores are irrelevant.
+
+The second layer is **quality as an LTR feature**: include the quality score as an input feature to LambdaMART. This allows the model to learn that a borderline-quality document with high BM25 score should rank below a high-quality document with slightly lower BM25 score. This is more nuanced than the hard filter — it handles the gray zone between clearly spammy and clearly high-quality content.
+
+For adversarial spam, add a feedback loop: flag documents that receive high impressions but very low dwell time (< 5 seconds on a page that claims to be a comprehensive guide) as suspected spam. Queue them for manual review. Documents confirmed as spam are added to a blocklist and filtered before BM25 — they never touch the index.
+
+</Curveball>
+
+## Further Reading
+
+The theoretical foundation for modern LTR is Christopher Burges's 2010 paper "From RankNet to LambdaRank to LambdaMART: An Overview," which traces the development from pairwise ranking with neural nets through the gradient-boosted trees formulation that dominates production systems today. For neural re-ranking specifically, Rodrigo Nogueira and Kyunghyun Cho's 2019 paper "Passage Re-ranking with BERT" showed that fine-tuning BERT as a cross-encoder for the re-ranking stage dramatically outperforms BM25 alone on the MS MARCO benchmark, establishing the two-stage pipeline as the standard architecture. Dense retrieval at scale was formalized in Karpukhin et al.'s 2020 DPR (Dense Passage Retrieval) paper from Facebook AI, which demonstrated that bi-encoder models trained with in-batch negatives could match or exceed BM25 on open-domain QA retrieval tasks. Airbnb's engineering blog posts from 2018 ("Applying Deep Learning to Airbnb Search") and 2019 ("Managing Diversity in Airbnb Search") are essential practical reading — they document the full journey from a heuristic ranking formula to a neural ranking system in production, including the mistakes, the A/B test failures, and the diversity constraints that emerged from user research. Google's "Learning to Rank for Information Retrieval" survey by Liu (2009) remains the definitive theoretical treatment of the pointwise/pairwise/listwise taxonomy. For position bias and debiasing, Joachims et al.'s "Unbiased Learning-to-Rank with Biased Feedback" (2017) provides the IPS framework that is now standard practice at every major search property.
+
+<RelatedQuestions items={[{ slug: "recommendation-engine", title: "Design a Recommendation Engine", difficulty: "staff" }, { slug: "vector-database", title: "Design a Vector Database", difficulty: "staff" }, { slug: "google-search", title: "Design Google Search", difficulty: "staff" }]} />

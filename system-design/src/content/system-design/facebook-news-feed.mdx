@@ -1,0 +1,606 @@
+---
+title: "Design Facebook News Feed"
+slug: "facebook-news-feed"
+category: "social"
+difficulty: "staff"
+estimatedReadMinutes: 26
+tags: ["feed", "ml-ranking", "fan-out", "social-graph", "write-amplification", "edge-rank"]
+companyFlavors: ["Facebook/Meta", "LinkedIn", "Twitter/X"]
+prerequisites: ["twitter-timeline", "design-a-cache", "distributed-unique-id-generator"]
+relatedQuestions: ["twitter-timeline", "instagram", "linkedin-connections"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design Facebook's News Feed at 3 B MAU — from EdgeRank's original graph-walk model to modern ML ranking with thousands of signals. Tackle write amplification, story deduplication, and privacy-aware feed generation."
+javaPackages:
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+  - "org.springframework.boot:spring-boot-starter-data-redis:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "org.springframework.data:spring-data-cassandra:4.3.0"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="facebook-news-feed" title="Design Facebook News Feed" />
+
+<Tldr>
+- **Edge store, not post store**: Facebook stores `(actor, action, object)` edges — a "like" is an edge, a "comment" is an edge; the feed aggregates edges for a viewer rather than fetching posts directly
+- **Story aggregation**: raw edges are grouped into stories (e.g., "3 friends liked X") to collapse write amplification from O(edges) to O(stories) before fan-out begins
+- **ML ranking pipeline**: thousands of signals flow through a lightweight integrity/privacy filter pass, then candidate retrieval, then a two-tower neural scoring model, then re-ranking with diversity rules and ad injection
+- **Write amplification mitigation**: fan-out is capped at ~5,000 direct friends; pages and public posts with millions of followers use a fan-out-on-read hybrid; story deduplication reduces raw edge fan-out by 10–100×
+- **Privacy at every layer**: every feed read triggers a per-story permission check for the specific viewer; feed caches are viewer-scoped and can never be shared between two users, even users with identical friend graphs
+</Tldr>
+
+## The scale of the problem
+
+Facebook's News Feed is, by engineering mass, one of the hardest personalization systems ever built. At 3 billion monthly active users generating sessions multiple times per day, the feed must synthesize a ranked, personalized, privacy-safe window into a social graph with hundreds of billions of edges — and do it at under 300 ms p99 per feed read. The problem is not simply "fetch the latest 50 posts from your friends." It is: given a viewer with 500 friends, 200 page follows, and membership in 30 groups — each of which produces a continuous stream of edges (likes, comments, shares, posts, event RSVPs, reactions) — select, rank, deduplicate, privacy-filter, and return the 50 stories that maximize long-term engagement and user satisfaction, while ensuring that nothing a user marked as "friends only" leaks to someone outside that circle.
+
+When Facebook launched the News Feed in 2006, it used a relatively simple graph-walk model called EdgeRank, built on three factors: affinity (how close are you to the actor?), weight (what type of action is it — a photo post weights higher than a page like), and time decay (recent edges score higher). EdgeRank was elegant and interpretable, but it was fundamentally a handcrafted scoring function. By 2013, Facebook had replaced it with a gradient-boosted decision tree model trained on engagement labels. By 2016, deep learning entered the ranking stack. Today, Meta's feed ranking pipeline involves thousands of features, multiple neural network models, and a multi-objective optimization that balances click-through, video watch time, share intent, comment propensity, and longer-term signals like "did this post make you feel worse about using Facebook?" The evolution from EdgeRank to this modern system is a case study in how ML complexity compounds on top of distributed systems complexity, and why the News Feed remains a staff-level interview question — it has no simple answer.
+
+The data scale magnifies every design decision. Facebook processes over 100 billion social edges per day — likes, comments, reactions, shares, and posts. Each of these edges, in a naive fan-out model, triggers an update to the feed caches of every friend of the actor. With an average friend count of 250 and 100B edges per day, that is 25 trillion feed-cache update operations per day, or roughly 290 million per second. This is why write amplification is not an optimization problem — it is an existential architectural constraint. Any design that does not explicitly address fan-out cost will fail at Facebook's scale. The approaches that work — story aggregation, fan-out caps, hybrid read-write architectures — all involve accepting some tradeoff against freshness or read-time complexity in exchange for write-path tractability.
+
+## Clarifying questions
+
+Get these answers before drawing any architecture boxes. Each one collapses a significant portion of the design space.
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| What is the social graph model? | Bidirectional friends (symmetric follow), plus unidirectional follows for pages and groups | Bidirectional friends are capped at ~5,000; pages can have hundreds of millions of followers — these require completely different fan-out strategies |
+| Ranked or chronological feed? | Ranked ML feed with optional "Most Recent" toggle | ML ranking adds a multi-stage scoring pipeline, candidate retrieval, and feature serving infrastructure; chronological is just a sorted set |
+| What content types must the feed include? | Posts (text, photo, video), events, shares, group activity, ads | Each content type has different storage, ranking signals, and privacy semantics; ads require a separate injection layer with auction mechanics |
+| What is the privacy model? | Fine-grained: Public, Friends, Friends-of-Friends, specific friend lists, custom audiences, block lists | Privacy rules must be evaluated per story per viewer at read time — they cannot be pre-computed globally without a viewer context |
+| Do we need story aggregation? | Yes — "3 friends liked this post" collapses multiple edges into one story | Aggregation reduces both fan-out write volume and feed cognitive density; the aggregation window (typically 60s) affects freshness |
+| Does the feed include group content? | Yes — groups produce edges that must be fan-fanned out to group members | Group fan-out is different: it is bounded by group size, not friend count; large groups (100K+ members) need a separate pull-on-read path |
+| What is the ad frequency requirement? | 1 ad per N organic stories; exact N is a business decision | Ad injection must happen after organic ranking to preserve relevance; the auction runs at request time, not at fan-out time |
+| Geographic distribution? | Global — US, EMEA, APAC with region-local caches | Feed caches must be co-located with users; cross-region replication of TAO graph data adds consistency complexity |
+
+## Functional requirements
+
+- A user opens their feed and receives a ranked list of stories — posts, photos, videos, events, group activity, and shared content — personalized to their social graph and interest profile
+- Stories are aggregated: multiple friends performing the same action on the same object within a time window appear as a single story ("X and 4 others liked this")
+- The feed supports cursor-based pagination so users can scroll past the initial viewport without re-ranking the entire candidate set
+- Creating, editing, or deleting a post, like, comment, or share updates friends' feeds within a bounded time window (target: < 60 seconds for close friends)
+- Users can explicitly control their feed: snooze a person for 30 days, unfollow a page, prioritize a friend, hide a post type, or mark a story as "not interested"
+- Every story in the feed respects the privacy settings of the original post's author, evaluated at read time against the viewer's identity and relationship graph
+
+## Non-functional requirements
+
+- **Scale**: 3 billion MAU, with peak DAU approximately 2 billion
+- **Edge write throughput**: 100 billion edges per day (likes + comments + shares + posts + reactions + event RSVPs), roughly 1.16 million edges/second sustained
+- **Feed read latency**: p99 < 300 ms end-to-end, p50 < 80 ms; the feed is the first thing users see on app open — high latency directly translates to DAU loss
+- **Availability**: 99.99% (< 52 minutes downtime per year); feed unavailability during peak hours affects billions of users
+- **Data retention**: story data and edge data retained for 10 years; user-generated content must be retrievable for abuse investigations
+- **GDPR erasure**: when a user requests account deletion, their posts and edges must be removed from all friends' visible feeds within 30 days; metadata purged within 90 days
+
+<Capacity title="Facebook News Feed Capacity Estimates">
+
+**Edge write rate**
+
+$$
+\text{edge write rate} = \frac{100 \times 10^9 \text{ edges/day}}{86{,}400 \text{ s/day}} \approx 1.16 \text{ M edges/s}
+$$
+
+**Fan-out cost without aggregation**
+
+Average friend count is 250. If every edge triggers a fan-out to all friends:
+
+$$
+\text{fan-out ops/s} = 1.16 \text{ M edges/s} \times 250 \text{ friends} = 290 \text{ M feed-cache writes/s}
+$$
+
+This is why naive fan-out-on-every-edge is non-viable. Story aggregation (60-second tumbling window) reduces unique fan-out events by 10–100×, bringing the effective write rate to 3–30 M feed-cache writes/s — still enormous, but tractable with a distributed cache cluster.
+
+**Feed reads**
+
+$$
+\text{feed reads/s} = \frac{3 \times 10^9 \text{ MAU} \times 15 \text{ sessions/day} \times 5 \text{ feed-opens/session}}{86{,}400 \text{ s/day}} \approx 2.6 \text{ M reads/s}
+$$
+
+**Edge store size (10-year retention)**
+
+$$
+\text{edge store} = 100 \text{ B edges/day} \times 365 \times 10 \text{ years} \times 200 \text{ B/edge} \approx 73 \text{ PB}
+$$
+
+This is why Facebook built TAO — a custom distributed graph store on top of MySQL — rather than using an off-the-shelf graph database. At 73 PB, the storage tier must be horizontally partitioned with predictable access patterns, not a full graph traversal engine.
+
+**Candidate pool per feed read**
+
+Each feed read pulls the top 500 edge candidates from the viewer's social graph (friends, pages, groups) sorted by recency from TAO. These 500 candidates are privacy-filtered (some are removed), then scored by the ML ranker, then the top 50 are returned to the client with a cursor. The 500-candidate pool is the "recall" stage; the ML ranker is the "precision" stage.
+
+</Capacity>
+
+## API design
+
+The external API surface is intentionally narrow. The complexity lives inside the feed service, not in the contract.
+
+**GET /v2/feed**
+
+```http
+GET /v2/feed?viewer_id={id}&cursor={opaque_cursor}&count={count}
+Authorization: Bearer {jwt}
+
+Response 200:
+{
+  "stories": [ StoryObject ],
+  "next_cursor": "eyJ0cyI6MTcwNTM...",
+  "has_more": true,
+  "feed_session_id": "fs_abc123"
+}
+```
+
+The `cursor` is an opaque base64-encoded struct containing `{last_story_id, page_ts, ranking_session_hash}`. The `ranking_session_hash` ensures that within a single scroll session, the ranking model state is consistent — stories already seen are not re-ranked to the top. The `feed_session_id` is used to correlate implicit signals (scroll events, time-spent) back to a specific ranking run for training data.
+
+**POST /v2/edges**
+
+```http
+POST /v2/edges
+{
+  "actor_id": "123",
+  "edge_type": "LIKE",
+  "object_id": "456",
+  "object_type": "POST",
+  "privacy": { "audience": "FRIENDS" }
+}
+
+Response 202: { "edge_id": "e_789", "status": "queued" }
+```
+
+Returns 202 Accepted — the edge is durably queued in Kafka. The fan-out to friends' feed caches happens asynchronously. The actor sees their own action immediately (local optimistic update on the client); other users see it within the fan-out SLA window.
+
+**`DELETE /v2/edges/{edgeId}`**
+
+```http
+DELETE /v2/edges/e_789
+
+Response 202: { "status": "deletion_queued" }
+```
+
+Publishes a tombstone event to the `edge-deleted` Kafka topic. The fan-out service propagates the deletion to all affected feed caches. Deletion is eventually consistent — a deleted like may remain visible in caches for up to 60 seconds.
+
+**GET /v2/feed/settings**
+
+Returns the viewer's feed preferences: snoozed actors, prioritized friends, hidden post types, and active filter rules. Feed service reads these at ranking time to apply user-level re-ranking adjustments.
+
+**POST /v2/feed/signal**
+
+```http
+POST /v2/feed/signal
+{
+  "feed_session_id": "fs_abc123",
+  "story_id": "s_456",
+  "signal_type": "TIME_SPENT",
+  "duration_ms": 4200
+}
+```
+
+Implicit feedback signals — scroll depth, time-spent on a story, video watch percentage, "hide this post," "not interested" — are published to the `engagement-signals` Kafka topic and consumed by the ML training pipeline. This is the feedback loop that drives ranking model improvement.
+
+## Data model
+
+**edges table (TAO / Cassandra)**
+
+```sql
+CREATE TABLE edges (
+  id1          BIGINT,
+  edge_type    VARCHAR(32),
+  id2          BIGINT,
+  timestamp    BIGINT,
+  data         BLOB,
+  PRIMARY KEY ((id1, edge_type), timestamp, id2)
+) WITH CLUSTERING ORDER BY (timestamp DESC, id2 ASC)
+  AND default_time_to_live = 315360000;
+```
+
+Partitioned by `(id1, edge_type)` — all outgoing likes by user 123 live on the same partition. This makes "fetch all recent likes by actor 123" a single-partition scan. The downside: high-activity actors (pages with 100M followers) create hot partitions, mitigated by capping direct-fan-out at 5,000 and using pull-on-read for the remainder.
+
+**objects table (TAO)**
+
+```sql
+CREATE TABLE objects (
+  object_id    BIGINT PRIMARY KEY,
+  object_type  VARCHAR(32),
+  data         TEXT,
+  created_at   BIGINT,
+  updated_at   BIGINT,
+  owner_id     BIGINT,
+  privacy_json TEXT
+);
+```
+
+Object data (the actual post content, photo URLs, event details) is stored separately from the edge graph. TAO serves objects from an in-memory cache backed by MySQL. This separation allows the edge graph to be traversed without loading full object payloads until the final rendering step.
+
+**feed_cache (Redis)**
+
+```text
+Key:    feed:{viewerId}
+Type:   List (Redis List or Sorted Set scored by rank position)
+Value:  JSON-serialized StoryObject[]
+TTL:    300 seconds (5 minutes)
+```
+
+The cache stores the top 200 pre-ranked stories for the viewer. Cache keys are strictly viewer-scoped — two users with identical friend graphs cannot share a cache entry because privacy rules may produce different story sets for each viewer.
+
+**privacy_settings (MySQL)**
+
+```sql
+CREATE TABLE privacy_settings (
+  user_id        BIGINT NOT NULL,
+  setting_type   VARCHAR(64) NOT NULL,
+  value          TEXT,
+  updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id, setting_type)
+);
+```
+
+Stores friend lists, block lists, restricted lists, and per-post audience overrides. Read by the privacy filter at ranking time. Cached in a 30-second TTL L1 cache per feed service instance.
+
+**engagement_signals (Kafka + Cassandra)**
+
+```sql
+CREATE TABLE engagement_signals (
+  viewer_id     BIGINT,
+  story_id      BIGINT,
+  signal_type   VARCHAR(32),
+  duration_ms   INT,
+  event_ts      BIGINT,
+  feed_session  VARCHAR(64),
+  PRIMARY KEY ((viewer_id), event_ts, story_id)
+) WITH CLUSTERING ORDER BY (event_ts DESC);
+```
+
+Signals flow through a `engagement-signals` Kafka topic (retained 7 days) into Cassandra for training data materialization. The ML training pipeline reads Cassandra in batch; the online ranking model reads pre-computed features from a feature store, not raw signals.
+
+## Architecture
+
+<Mermaid caption="Facebook News Feed: write path (top) fans out edges through story aggregation; read path (bottom) pulls candidates from TAO, ranks, and serves from cache" diagram={`flowchart LR
+  subgraph WriteP["Write Path"]
+    EW["Edge Write\nPOST /v2/edges"] --> TAO["TAO\nEdge Store\nMySQL + Cache"]
+    EW --> KW["Kafka\nedge-created"]
+    KW --> AGG["Story Aggregator\n60s tumbling window\ndedup via Redis SETNX"]
+    AGG -->|"new story"| KS["Kafka\nstory-created"]
+    AGG -->|"update existing"| RU["Redis\nactor_list update"]
+    KS --> FO["Fan-out Service\ncap at 5K friends"]
+    FO --> RC["Redis Feed Cache\nfeed:{friendId}\nTTL 300s"]
+    FO --> PG["Pages Fan-out\npull-on-read\nfor gt5K followers"]
+  end
+  subgraph ReadP["Read Path"]
+    GF["GET /v2/feed"] --> FS["Feed Service"]
+    FS -->|"cache hit"| RH["Redis Cache\nfeed:{viewerId}"]
+    FS -->|"cache miss"| TAOR["TAO\ntop 500 edges\nfor viewer graph"]
+    TAOR --> PF["Privacy Filter\nper-story viewer check"]
+    PF --> ML["ML Ranker\ntwo-tower scoring\n500 → 50 stories"]
+    ML --> DD["Dedup + Diversity\nno two consecutive\nsame actor"]
+    DD --> AI["Ad Injection\nauction at read time"]
+    AI --> WC["Write to Cache\nfeed:{viewerId} TTL 300s"]
+    WC --> RS["Return FeedResponse\nstories + cursor"]
+  end`} />
+
+The write path and read path are deliberately decoupled. An edge write is acknowledged to the client as soon as it is durably written to TAO and published to Kafka — the fan-out to friends' caches is asynchronous. This decoupling means that under fan-out backpressure (e.g., a viral post), edge writes are never slowed down; instead, the fan-out lag increases and friends see the story slightly later. The read path, on the other hand, is fully synchronous but designed to almost always hit the Redis cache, which brings p99 latency under 300 ms even at 2.6M reads/s.
+
+## Deep dives
+
+### Edge store and TAO
+
+TAO (The Associations and Objects) is Facebook's custom graph data store, described in their 2013 USENIX ATC paper. It is not a graph database in the Neo4j sense — there is no traversal engine, no Cypher query language, no shortest-path algorithm. TAO is a horizontally sharded key-value cache sitting in front of MySQL, specialized for two operations: `assoc_get(id1, atype)` — "give me all associations of type atype originating from id1" — and `obj_get(oid)` — "give me the object with this ID."
+
+The reason Facebook did not use Neo4j or a similar graph database is pure volume. Neo4j's native graph storage uses index-free adjacency — each node contains direct physical pointers to its neighbors. At Facebook's scale, the social graph has ~500 billion edges. Storing physical adjacency pointers for 500B edges requires the entire graph to be traversable from RAM, or accept disk-seek overhead on every hop. Neither is viable. TAO's model is different: it assumes you know both endpoints of the edge (or at least the source node and edge type), so it reduces graph traversal to key-value lookups with a well-defined sharding scheme. Each TAO shard owns a range of id1 values; a lookup of `assoc_get(user_id=123, atype=LIKE)` routes to the shard owning id1=123 and returns the edge list from its MySQL backing store (or from the LRU cache layer in front of MySQL).
+
+TAO runs at two tiers: a leader tier (each leader talks directly to MySQL) and a follower tier (followers cache in front of the leader, handle the majority of reads). At peak, TAO handles over a billion operations per second across the follower tier. The MySQL backing store is sharded by id1 and replicated for durability. Writes go to the leader; the follower caches are invalidated asynchronously. This is a classic write-through cache with async invalidation, which means that in the brief window between a leader write and follower cache invalidation, a follower read may return a stale edge list — an accepted tradeoff for Facebook's use cases.
+
+The key insight for interviews: TAO's design is optimized for the access patterns of the social graph, not for arbitrary graph computation. You retrieve edges from a known source node; you do not traverse the graph breadth-first. The feed service knows which users to pull edges for (the viewer's friends, page follows, group memberships) — it fetches edge lists for those source nodes and merges them. It does not traverse the graph looking for friends-of-friends at query time.
+
+### Story aggregation and deduplication
+
+A raw edge event is atomic: user A liked post P. But the feed should not show 47 separate "X liked P," "Y liked P," "Z liked P" entries for the same post. Instead, it should show "A, B, and 45 others liked P" — a single aggregated story. The aggregation layer sits between the Kafka `edge-created` topic and the Fan-out Service.
+
+The aggregator consumes the `edge-created` topic and maintains a 60-second tumbling window keyed by `(object_id, edge_type)`. All edges touching the same object with the same action type within a 60-second window are candidates for aggregation into a single story. The story deduplication key is:
+
+```text
+dedup_key = SHA256(object_id + ":" + edge_type + ":" + window_start_epoch)
+```
+
+On receiving an edge event, the aggregator executes `SETNX story:{dedup_key} {story_id} EX 90` in Redis. If `SETNX` returns 1 (new key), this is a new story: publish a `story-created` event to Kafka and initialize the actor list in Redis. If `SETNX` returns 0 (key exists), this edge is an addition to an existing story: append the actor to the Redis actor list (`RPUSH story:{dedup_key}:actors {actor_id}`) and skip the Kafka publish. At the end of the 60-second window, the Fan-out Service reads the final actor list and materializes the aggregated story for fan-out.
+
+The deduplication reduces fan-out events by 10–100× depending on content virality. A post receiving 1,000 likes within a 60-second burst generates one story-created event, not 1,000. The Fan-out Service fans that single story out to the liker's friends once — not 1,000 times. Without this layer, the fan-out at Facebook's edge volume would be physically impossible.
+
+There is a subtlety: when the same post receives likes across multiple 60-second windows, the feed shows multiple stories? No — the feed service deduplicates at the viewer level: if story S (objectId=P, edgeType=LIKE) already appears in the viewer's cached feed from a previous window, the newer window's update either promotes the existing story or merges actor lists, depending on recency. This viewer-level dedup happens at the ranking stage, not the aggregation stage.
+
+### ML ranking pipeline
+
+The modern News Feed ranking pipeline has three stages, each with a specific recall/precision tradeoff:
+
+**Stage 1 — Candidate retrieval (recall):** The feed service queries TAO for the top 500 most-recent edges from the viewer's social graph: their 500 friends sorted by edge timestamp, their top 100 page follows by recency, their active group memberships. This retrieval is entirely recency-sorted — no ML here. The goal is recall: get all plausibly relevant content into the candidate set. 500 candidates is a target; the actual count varies by social graph size.
+
+**Stage 2 — Lightweight scoring (integrity and recall model):** The 500 candidates pass through a linear model with ~200 signals. This model has two jobs: (a) filter spam, integrity violations, and content the viewer has explicitly blocked, and (b) score candidates on broad engagement likelihood to prune from 500 to ~150 candidates before the expensive heavy model. The signals at this stage are precomputed (cached in a feature store) and the model is a gradient-boosted tree — inference is microseconds per candidate.
+
+**Stage 3 — Heavy scoring (precision model, two-tower neural net):** The top ~150 candidates from Stage 2 are scored by a deep neural network. The two-tower architecture encodes the viewer (their interest profile, recent engagement history, demographic signals, time-of-day context) and each story (content type, author affinity, engagement velocity, video length, past performance with similar viewers) into embedding vectors. The inner product of the viewer and story embeddings produces a relevance score. Thousands of signals are used at this stage: time-spent on similar content in the past 30 days, scroll-past rate on this author's content, comment sentiment on this post's reactions, video watch percentage for similar video lengths, friend-of-friend engagement signals, and dozens more.
+
+**Re-ranking:** The raw scores from Stage 3 are not served directly. A rule-based re-ranker applies: no two consecutive stories from the same actor (diversity), cap ad frequency (1 ad per 5 organic stories by default), apply user snooze rules (suppressed actors score zero), apply "prioritized friends" boost (stories from prioritized friends are surfaced earlier). Ad injection happens last — the ad auction runs at this point, bidding against a quality floor set by the organic story below which the ad would be inserted.
+
+The output of the ranking pipeline is a list of 50 stories with their positions, served to the client and written to Redis with a 300-second TTL.
+
+### Privacy-aware feed generation
+
+Privacy in News Feed is not a post-processing filter — it is a first-class dimension of the ranking pipeline. Every story in the candidate set carries a privacy envelope: the audience setting of the original post (Public, Friends, Friends-of-Friends, Custom Audience, specific friend lists). Before a story can be ranked or cached, the feed service must verify that the viewer is within the allowed audience for that specific story.
+
+The privacy evaluation is per-viewer, per-story, and happens at ranking time, not at fan-out time. This is the critical design choice that makes the system correct but expensive:
+
+1. At fan-out time, the Fan-out Service writes story references to the friend's feed cache without privacy evaluation. The story reference is a pointer (story_id + metadata), not a full resolved post. This allows the fan-out to be fast and stateless.
+2. At read time, the feed service resolves story references and runs privacy evaluation against the viewer's identity. It checks: Is the viewer in the author's friend list? Is the viewer blocked by the author? Has the viewer been added to a restricted list? Are the author's privacy settings for this post compatible with the viewer's relationship?
+
+The consequence is that you cannot share a feed cache between two users, even if they have identical friend graphs. Consider users Alice and Bob, both friends with Carol. Carol posted something with audience set to "Friends except Bob." Alice's feed cache will contain Carol's story. Bob's feed cache will not — the privacy filter removes it at read time. If you naively shared a cache keyed by social graph fingerprint, Bob would see Carol's post. The cache must be keyed strictly by `viewer_id`.
+
+The privacy check latency is optimized by: (a) caching the viewer's friend list and block list in the feed service's local memory with a 30-second TTL, (b) using a bloom filter to quickly determine "is viewer definitely NOT in this restricted list" before doing the full lookup, and (c) batching privacy checks for all 500 candidates in parallel via the TAO privacy service. The privacy check adds roughly 10–15 ms to a cache-miss feed load.
+
+### Write amplification mitigation
+
+The fan-out problem has four levers, and Facebook uses all of them:
+
+**Lever 1 — Friendship cap:** Direct Facebook friendships are capped at 5,000. This bounds the worst-case fan-out for a friend's post to 5,000 feed-cache updates. Pages (which can have hundreds of millions of followers) and celebrities do not use friend relationships — they use unidirectional follows. Pages do not get fan-out-on-write.
+
+**Lever 2 — Fan-out-on-read for high-follower entities:** When a user opens their feed, the feed service checks if they follow any pages. For each followed page, the feed service pulls the page's top-N recent posts directly from TAO at read time and merges them into the candidate set. There is no pre-fan-out for page content. This trades some read-time latency (one additional TAO lookup per followed page) for a dramatic reduction in write-path load. A page with 50 million followers posting once would otherwise trigger 50 million feed-cache writes — an instant thundering herd.
+
+**Lever 3 — Story aggregation (covered above):** Reduces fan-out events 10–100×.
+
+**Lever 4 — Viral content pull injection:** When a post goes viral — being shared by users who are not in the viewer's friend graph — the fan-out service cannot reach all potential recipients through friendship edges. Instead, a "trending content" service identifies viral posts (high share velocity, high engagement rate relative to author follower count) and injects them into feed candidates at read time from a separate pool. This allows non-friends' viral content to appear in the feed without any edge in the viewer's social graph. The injection happens at the candidate retrieval stage (Stage 1 of the ML pipeline), not through the fan-out write path.
+
+## Java integration
+
+### Part A — EdgeAggregatorService.java
+
+The aggregator consumes raw edge events from Kafka, applies a 60-second tumbling window deduplication, and publishes only unique story events for fan-out. Redis `SETNX` is the deduplication primitive.
+
+```java
+package com.facebook.feed.aggregation;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import java.time.Duration;
+import java.time.Instant;
+
+@Service
+public class EdgeAggregatorService {
+
+    private static final long WINDOW_SECONDS = 60L;
+    private static final long DEDUP_TTL_SECONDS = 90L;
+
+    private final StringRedisTemplate redis;
+    private final KafkaTemplate<String, StoryEvent> kafkaTemplate;
+
+    public EdgeAggregatorService(StringRedisTemplate redis,
+                                 KafkaTemplate<String, StoryEvent> kafkaTemplate) {
+        this.redis = redis;
+        this.kafkaTemplate = kafkaTemplate;
+    }
+
+    @KafkaListener(topics = "edge-created", groupId = "story-aggregator",
+                   concurrency = "12")
+    public void onEdgeCreated(ConsumerRecord<String, EdgeEvent> record) {
+        EdgeEvent edge = record.value();
+        StoryKey key = StoryKey.of(edge.objectId(), edge.edgeType(), currentWindowStart());
+        String dedupeKey = "story:" + key.hash();
+        String actorListKey = "story:" + key.hash() + ":actors";
+
+        Boolean isNew = redis.opsForValue()
+                .setIfAbsent(dedupeKey, key.storyId(), Duration.ofSeconds(DEDUP_TTL_SECONDS));
+
+        if (Boolean.TRUE.equals(isNew)) {
+            redis.opsForList().rightPush(actorListKey, String.valueOf(edge.actorId()));
+            redis.expire(actorListKey, Duration.ofSeconds(DEDUP_TTL_SECONDS));
+            StoryEvent storyEvent = new StoryEvent(
+                    key.storyId(), edge.objectId(), edge.edgeType(),
+                    edge.actorId(), currentWindowStart());
+            kafkaTemplate.send("story-created", key.storyId(), storyEvent);
+        } else {
+            redis.opsForList().rightPush(actorListKey, String.valueOf(edge.actorId()));
+        }
+    }
+
+    private long currentWindowStart() {
+        long nowSec = Instant.now().getEpochSecond();
+        return (nowSec / WINDOW_SECONDS) * WINDOW_SECONDS;
+    }
+
+    public record EdgeEvent(long actorId, String edgeType, long objectId) {}
+    public record StoryEvent(String storyId, long objectId, String edgeType,
+                             long primaryActorId, long windowStart) {}
+    public record StoryKey(long objectId, String edgeType, long windowStart, String storyId) {
+        public static StoryKey of(long objectId, String edgeType, long windowStart) {
+            String storyId = "s_" + objectId + "_" + edgeType + "_" + windowStart;
+            return new StoryKey(objectId, edgeType, windowStart, storyId);
+        }
+        public String hash() {
+            return Integer.toHexString((objectId + ":" + edgeType + ":" + windowStart).hashCode());
+        }
+    }
+}
+```
+
+### Part B — FeedController.java
+
+The feed controller handles authenticated feed reads with Redis cache-aside logic and cursor-based pagination. Cache misses delegate to `FeedRankingService` which runs the full TAO-pull + privacy-filter + ML-rank pipeline.
+
+```java
+package com.facebook.feed.api;
+
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import java.time.Duration;
+import java.util.Base64;
+import java.util.List;
+
+@RestController
+@RequestMapping("/v2")
+public class FeedController {
+
+    private static final int CACHE_TTL_SECONDS = 300;
+    private static final int DEFAULT_PAGE_SIZE = 50;
+
+    private final StringRedisTemplate redis;
+    private final FeedRankingService rankingService;
+    private final FeedSerializer serializer;
+    private final JwtService jwtService;
+
+    public FeedController(StringRedisTemplate redis, FeedRankingService rankingService,
+                          FeedSerializer serializer, JwtService jwtService) {
+        this.redis = redis;
+        this.rankingService = rankingService;
+        this.serializer = serializer;
+        this.jwtService = jwtService;
+    }
+
+    @GetMapping("/feed")
+    public ResponseEntity<FeedResponse> getFeed(
+            @RequestHeader("Authorization") String authHeader,
+            @RequestParam(defaultValue = "") String cursor,
+            @RequestParam(defaultValue = "50") int count) {
+
+        long viewerId = jwtService.extractViewerId(authHeader);
+        String cacheKey = "feed:" + viewerId;
+        String cached = redis.opsForValue().get(cacheKey);
+
+        List<StoryObject> stories;
+        if (cached != null) {
+            stories = serializer.deserializeList(cached);
+        } else {
+            stories = rankingService.computeFeed(viewerId);
+            redis.opsForValue().set(cacheKey, serializer.serializeList(stories),
+                    Duration.ofSeconds(CACHE_TTL_SECONDS));
+        }
+
+        FeedCursor decoded = cursor.isEmpty() ? FeedCursor.start() : FeedCursor.decode(cursor);
+        int fromIndex = decoded.offset();
+        int toIndex = Math.min(fromIndex + Math.min(count, DEFAULT_PAGE_SIZE), stories.size());
+        List<StoryObject> page = stories.subList(fromIndex, toIndex);
+        boolean hasMore = toIndex < stories.size();
+        String nextCursor = hasMore ? FeedCursor.encode(toIndex, viewerId) : null;
+
+        return ResponseEntity.ok(new FeedResponse(page, nextCursor, hasMore));
+    }
+
+    public record FeedResponse(List<StoryObject> stories, String nextCursor, boolean hasMore) {}
+    public record StoryObject(String storyId, String storyType, long objectId,
+                              List<Long> actorIds, double rankScore) {}
+    record FeedCursor(int offset, long viewerId) {
+        static FeedCursor start() { return new FeedCursor(0, 0); }
+        static FeedCursor decode(String b64) {
+            String[] parts = new String(Base64.getDecoder().decode(b64)).split(":");
+            return new FeedCursor(Integer.parseInt(parts[0]), Long.parseLong(parts[1]));
+        }
+        static String encode(int offset, long viewerId) {
+            return Base64.getEncoder().encodeToString((offset + ":" + viewerId).getBytes());
+        }
+    }
+}
+```
+
+<TradeoffTable title="Feed generation strategy comparison">
+
+| Approach | Write Cost | Read Latency | Privacy Safety | Freshness |
+|---|---|---|---|---|
+| Full fan-out-on-write (no story aggregation) | Extreme — 290M cache writes/s at 100B edges/day; crashes under viral load | Very low (p99 < 20ms, cache always warm) | Moderate — privacy must still be evaluated at read time | Excellent — feed updated within seconds of any edge |
+| Pure fan-out-on-read (no pre-computation) | Near zero — edges written to TAO only; no fan-out at all | High — every feed read does a full graph traversal + ML rank; p99 > 1s | Excellent — privacy evaluated fresh on every read | Excellent — reads always reflect the latest state |
+| Hybrid with story aggregation (Facebook's approach for friends) | Moderate — ~3–30M fan-out writes/s after 10–100× aggregation reduction; tractable with a Redis cluster | Low — cache hit p99 < 50ms; cache miss p99 < 300ms with TAO pull | Excellent — privacy evaluated per-viewer at ranking time; cache is viewer-scoped | Good — 60s aggregation window adds slight staleness; viral content injected at read time |
+| TAO + per-viewer pre-ranked cache (current Facebook architecture) | Moderate write + moderate ML serving cost (ranking runs on cache miss or TTL expiry) | Very low on cache hit (p99 < 30ms); moderate on miss (< 300ms) | Excellent — cache key includes viewer_id; no shared cache | Good — 5-minute TTL means feed may be up to 5 minutes stale between full re-ranks; push invalidation on high-priority events |
+
+</TradeoffTable>
+
+<Pitfall title="Caching feed results without the viewer's privacy context">
+
+A shared feed cache keyed by social graph fingerprint or friend-set hash seems attractive — if two users have the same friends, why recompute? The answer is that privacy settings are per-author per-post per-viewer, not per-friend-set. Carol can configure a post to be visible to "Friends except Bob." Alice and Bob both follow Carol; Alice's feed includes Carol's post; Bob's feed excludes it. A shared cache entry would show Bob a post he is not allowed to see.
+
+The correct invariant is: **the feed cache key must include the viewer_id, and the cache must never be shared across viewer identities.** This means a user with 5,000 friends who all see different subsets of a privacy-filtered story graph requires 5,000 independent cache entries — not one. The cache size estimate must account for this. At 3B MAU with 200 stories per cached feed at ~2 KB per story: `3B × 200 × 2KB = 1.2 PB` total feed cache. In practice, only a fraction of users have an active cached feed at any moment (DAU/MAU ~0.65 × 1-hour active window fraction), but this calculation shows why Facebook's cache infrastructure is measured in petabytes, not terabytes.
+
+</Pitfall>
+
+<Pitfall title="Fan-out on every raw edge without story aggregation">
+
+Consider a post that receives 10,000 likes in one minute — not uncommon for a celebrity's public post shared to friends. Without story aggregation, each like triggers a fan-out event. Each liker has an average of 250 friends. That is `10,000 × 250 = 2.5M` feed-cache update operations in one minute, from a single post, a single minute's worth of likes. Now multiply by the number of posts receiving simultaneous viral engagement across 3B users.
+
+Story aggregation is not an optional optimization — it is a structural requirement. Without it, the fan-out service becomes the bottleneck and write amplification makes the system non-functional at scale. The 60-second tumbling window is a deliberate engineering tradeoff: it introduces up to 60 seconds of aggregation latency (a user may not see a story appear in their feed until the window closes) in exchange for a 10–100× reduction in fan-out volume. The window size is tunable: shorter windows mean fresher feeds but higher fan-out cost; longer windows mean more aggregation efficiency but staleness.
+
+Additionally, naive fan-out without deduplication causes another problem: if the same story is fanned out multiple times (due to Kafka consumer retries or aggregation window overlaps), it appears multiple times in the viewer's feed. The Redis `SETNX` dedup key at the story level is the guard against this. Do not omit it.
+
+</Pitfall>
+
+<Curveball question="A GDPR erasure request comes in — the user wants all their posts, likes, and comments deleted from all friends' feeds within 30 days. Walk through the deletion cascade.">
+
+GDPR Article 17 requires erasure of personal data within a reasonable timeframe. For a social network, "erasure" means: the user's edges (likes, comments, reactions) and objects (posts, photos, events they created) must disappear from storage and from all cached views. Here is the cascade:
+
+**Step 1 — Edge tombstoning (immediate):** On erasure request receipt, publish a `user-erasure-requested` event to Kafka. An Erasure Worker consumes this and writes tombstone records to TAO for all edges where `id1 = user_id`. TAO tombstones are propagated to all TAO caches within minutes via cache invalidation. The user's edges stop being returned by `assoc_get` calls immediately after the tombstone propagates.
+
+**Step 2 — Feed cache invalidation (within minutes):** The Erasure Worker publishes `feed-invalidate` events for all friends of the deleted user. The Fan-out Service reads each friend's friend list (from TAO, before the tombstone takes effect — this requires a snapshot of the social graph taken before deletion) and publishes invalidation events to each friend's feed cache. Redis `DEL feed:{friendId}` is executed for each friend. On the next feed load, those friends get a fresh cache miss path that excludes the deleted user's edges.
+
+**Step 3 — Object deletion (within days):** Posts and photos created by the user are marked as `deleted=true` in the objects table (soft delete). The object content (photo bytes, post text) is queued for physical deletion from blob storage. TAO object lookups for these IDs return 404 after the soft delete. The feed service, encountering a 404 during story resolution, silently drops the story from the feed.
+
+**Step 4 — Storage purge (within 30 days):** A background purge job runs nightly and physically deletes soft-deleted objects from MySQL (via replication lag-aware deletion that ensures all replicas have caught up), from Cassandra edge storage (using delete markers with TTL), from blob storage (S3/Haystack deletion), and from ML training datasets (differential privacy or direct removal depending on the dataset). Audit trails confirming purge completion are retained for legal defense.
+
+**Step 5 — Verification:** A post-erasure audit job runs 30 days after the request and samples TAO, MySQL replicas, Cassandra, and the ML feature store to verify no personal data remains. Failures trigger an incident and manual review.
+
+The 30-day window is not laziness — it accounts for replication lag on hundreds of MySQL replicas, Cassandra tombstone propagation, and the time needed to safely remove data from ML training pipelines without corrupting model checkpoints.
+
+</Curveball>
+
+<Curveball question="A viral post gets 10M shares in 4 hours — how does your fan-out system avoid melting down, and how do you ensure the post still appears in feeds of non-friends who follow sharers?">
+
+A post receiving 10M shares in 4 hours is roughly 700 shares per second. Each share is an edge. Each share actor has ~250 friends. Naive fan-out would require `700 × 250 = 175,000` feed-cache updates per second for shares alone, sustained for 4 hours. This is a large but not catastrophic number — the issue is that viral spikes are correlated with other high-engagement signals that simultaneously drive likes and comments, amplifying the fan-out 5–10× further. Real-world spikes can hit 1–2M fan-out writes per second.
+
+**Mitigation 1 — Story aggregation caps the spike:** The aggregator groups all shares within a 60-second window into a single story event. 700 shares/s × 60s = 42,000 shares become one story event per minute. That story fans out once to each unique friend across those 42,000 sharers (deduplicated by friend overlap). The fan-out work is bounded by the number of unique friends of sharers, not the number of shares.
+
+**Mitigation 2 — Backpressure on the Fan-out Service:** The Fan-out Service uses a Kafka consumer with explicit rate limiting per partition (`max.poll.records = 100`, `fetch.min.bytes` tuned for throughput). When Redis write throughput becomes the bottleneck, the Kafka consumer lag increases rather than causing OOM or cascade failure. Operations monitors the consumer lag and autoscales fan-out service instances horizontally. Redis write throughput can be increased by adding shards to the Redis Cluster — adding shards during a viral event is a 5-minute operation with Redis Cluster.
+
+**Mitigation 3 — Viral content injection at read time:** For non-friends who follow sharers several degrees removed, the friend-based fan-out never reaches them. The "trending content" service independently monitors share velocity across the social graph and maintains a `trending:{regionId}` sorted set in Redis, scored by share velocity. When a post's share velocity exceeds a configurable threshold (e.g., 100 shares/s within a geographic cluster), it is added to the trending pool. At read time, the feed service's Stage 1 candidate retrieval appends the top 10 items from the viewer's `trending:{regionId}` pool to the 500 friend-based candidates. The ML ranker then scores these viral candidates alongside friend-based content — if the viral post is sufficiently relevant, it surfaces in the final 50. This is how viral content from non-friends appears in your feed without any fan-out edge in your social graph.
+
+</Curveball>
+
+<Curveball question="Meta wants to add 'Feed Transparency' — a user can see exactly why each story appeared in their feed (which signals drove the ranking). How do you instrument the ranking pipeline to support this without exposing model weights?">
+
+Feed transparency is a regulatory and user-trust requirement. GDPR Article 22 grants users the right to "meaningful information about the logic involved" in automated decisions affecting them. The challenge is exposing this information in a human-readable, auditable form without revealing proprietary model architecture or enabling adversarial gaming of the ranking signals.
+
+**Approach: Structured explanation logging at rank time**
+
+At the end of Stage 3 (heavy scoring), the ML ranker produces not just a score but a scored feature attribution vector. You run SHAP (SHapley Additive exPlanations) or an approximation of it against the two-tower model to produce a top-K feature attributions for each ranked story. These attributions identify which signal categories contributed most to the story's rank, without revealing exact feature values or model weights.
+
+```text
+Story rank attribution for story_id=s_456:
+  1. "You frequently engage with content from this author" — 34% contribution
+  2. "3 of your close friends interacted with this" — 28% contribution
+  3. "You watch videos similar to this type" — 18% contribution
+  4. "High engagement from people with similar interests" — 12% contribution
+  5. Other signals — 8% contribution
+```
+
+The attribution categories are human-readable labels mapped from signal groups (not individual features). The exact feature value ("you watched 14 similar videos in the past 7 days") is not exposed — only the category label ("You frequently engage with content from this author"). This protects against adversarial reverse-engineering of the model while satisfying the regulatory requirement.
+
+**Storage:** Log the top-5 attribution labels and their percentage contributions alongside the ranked story event in Cassandra (`rank_explanations` table, keyed by `(viewer_id, story_id, rank_session_id)`). TTL 90 days. When the user requests "Why am I seeing this?", the feed service does a `SELECT` from this table — no re-ranking required. The explanation was captured at rank time.
+
+**Privacy of the explanation:** The attribution labels must themselves be privacy-safe. "3 of your close friends liked this" is fine. "Your friend Alice, who is in your 'Close Friends' list, liked this" would reveal the composition of a private friend list to the user (Alice may not know she is in a "Close Friends" list). Generalise all actor-specific attributions to count-based or relationship-type-based labels.
+
+**Model weight protection:** The attribution percentage values are post-hoc approximations, not exact weight readouts. You can add small calibrated noise (differential privacy) to the percentages before logging. The signal category labels are curated by a human policy team — they map from model feature namespaces to human-readable strings through a controlled lookup table that the policy team maintains. Engineers cannot add new signal categories without policy review.
+
+</Curveball>
+
+## Further reading
+
+- Bakshy E., Messing S., Adamic L. — "Exposure to ideologically diverse news and opinion on Facebook" (Science, 2015) — the foundational paper on News Feed algorithmic filtering and its effects on information diversity, directly prompted regulatory and product scrutiny of feed ranking
+- Bronson N. et al. — "TAO: Facebook's Distributed Data Store for the Social Graph" (USENIX ATC 2013) — the primary technical reference for the graph store underlying News Feed; covers the leader/follower cache architecture, consistency model, and association query semantics
+- Facebook Engineering Blog — "The Anatomy of Facebook" — describes the social graph scale and the role of TAO and Memcached in serving billions of reads per second
+- Facebook Engineering Blog — "How Facebook News Feed Works" — product-level description of ranking philosophy, EdgeRank history, and the shift to ML-driven personalization; useful for grounding the technical architecture in product intent
+- Goodfellow I. et al. — "Deep Learning" (MIT Press) — Chapter 20 covers recommender systems and the theoretical basis for two-tower retrieval architectures used in modern feed ranking
+
+<RelatedQuestions items={[
+  { slug: "twitter-timeline", title: "Design Twitter's Home Timeline", difficulty: "senior" },
+  { slug: "instagram", title: "Design Instagram", difficulty: "senior" },
+  { slug: "linkedin-connections", title: "Design LinkedIn Connections", difficulty: "senior" },
+]} />

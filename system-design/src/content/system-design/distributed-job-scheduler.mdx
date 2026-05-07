@@ -1,0 +1,547 @@
+---
+title: "Design a Distributed Job Scheduler"
+slug: "distributed-job-scheduler"
+category: "infra"
+difficulty: "senior"
+estimatedReadMinutes: 21
+tags: ["cron", "leader-election", "exactly-once", "dag", "quartz", "kafka", "idempotency", "backfill"]
+companyFlavors: ["Quartz Scheduler", "Airflow", "AWS EventBridge", "Databricks Workflows", "LinkedIn Azkaban"]
+prerequisites: ["distributed-locking-service"]
+relatedQuestions: ["distributed-locking-service", "distributed-logging-system", "metrics-monitoring"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Design a distributed cron-like scheduler that triggers millions of jobs per day with exactly-once semantics, survives node failures without missed or duplicate triggers, and supports DAG-based workflows — covering leader election, idempotency, and backfill strategies."
+javaPackages: ["org.quartz-scheduler:quartz:2.3.2", "org.springframework.boot:spring-boot-starter:3.3.0", "org.springframework.kafka:spring-kafka:3.2.0", "redis.clients:jedis:5.1.3"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="distributed-job-scheduler" title="Design a Distributed Job Scheduler" />
+
+<Tldr>
+- Exactly-once trigger is harder than exactly-once execution: the scheduler must fire each job once, but the job itself must also be idempotent (at-least-once execution with idempotency keys)
+- Leader election (via distributed lock or etcd) decides which scheduler node is the "trigger master" — followers stay warm, elect a new leader if the current leader fails within TTL
+- Use a sorted set (Redis ZSET or a priority queue backed by a DB) to store next-fire-time; poll the head of the queue every second
+- Missed trigger recovery: on leader startup, scan for jobs whose `last_triggered_at` is older than expected (`now - max(schedule_interval, 5 min)`) and trigger them
+- Backfill: if a job was missed for N windows, trigger N times with the correct logical timestamps — not N times with `now`
+</Tldr>
+
+## Why distributed scheduling is hard
+
+A cron daemon on a single machine is disarmingly simple: a process wakes up every minute, checks which jobs match the current time, and `fork`/`exec`s them. Distribute that same responsibility across a fleet of scheduler nodes and three failure modes appear almost immediately. The first is double triggering. If two nodes both believe they are the active scheduler — because a network partition briefly hid the leader from followers — both poll the job queue at the same second and fire the same job twice. For a job that sends a payment confirmation email, double triggering means a customer receives the same email twice. For a job that debits an account, it means money disappears twice. Exactly-once trigger is not a nice-to-have; it is a correctness requirement.
+
+The second failure mode is missed triggering. A scheduler node polls the job queue at 02:00:00, finds a batch job due, and crashes before it can record that the trigger was dispatched. When a new leader takes over, it sees that the job's `last_triggered_at` is still 01:00:00 from the previous hour. If the recovery logic is naive — only look for jobs overdue by more than one interval — it may fire the 02:00:00 job immediately, or it may skip it entirely if the code assumes "the previous leader must have fired it." Both outcomes are wrong, and the correct answer requires a careful definition of what "missed" means and what recovery should do.
+
+The third failure mode is thundering herd. If ten thousand jobs are all configured to run at exactly 00:00:00 — a common pattern in data engineering pipelines where every job runs "at midnight" — the scheduler must dispatch ten thousand trigger events within one second. Worker pools, message brokers, callback servers, and databases all feel this load simultaneously. Without rate limiting or jitter, this spike routinely saturates systems sized for average load rather than peak. A well-designed scheduler must defend against its own schedule being a denial-of-service vector against the rest of the infrastructure.
+
+## Clarifying questions
+
+| Question | Ideal answer | Why it matters |
+|---|---|---|
+| Cron-only, or also one-time and event-triggered jobs? | All three — cron, one-shot at a specific epoch, and jobs triggered by an upstream event or DAG edge | Cron is a time-based concern; event-triggered jobs need a different dispatch path (Kafka consumer rather than time-queue poller) |
+| Volume: how many jobs, how frequent is the most common interval? | 10M scheduled jobs; most run hourly or daily, some run every minute | Drives ZSET sizing, worker pool throughput, and the shape of the thundering herd problem |
+| Execution model: HTTP callback or worker pulls from a queue? | Both — some jobs are HTTP webhooks, others push a message to Kafka for a worker pool to consume | Shapes the delivery layer; HTTP callbacks are synchronous and require retry logic; Kafka provides natural backpressure and durability |
+| Exactly-once execution or at-least-once? | At-least-once execution with idempotency keys — true exactly-once execution across a distributed system is prohibitively expensive | Callers must implement idempotency on their side; the scheduler's job is exactly-once trigger, not exactly-once execution |
+| DAG dependencies — can job B depend on job A succeeding? | Yes, for data pipeline use cases | Requires a DAG resolver layer on top of the scheduler, event-driven fan-out rather than pure time-based triggering |
+| Long-running jobs — hours — with heartbeat and liveness tracking? | Yes — some ML training jobs or ETL pipelines run for hours | Scheduler must track job execution state, not just fire-and-forget; liveness timeout and automatic retry/alerting are required |
+| Backfill requirements when a job is missed? | Yes — if a scheduler outage causes missed windows, replay with correct logical timestamps | Backfill is fundamentally different from "run it again now"; logical timestamps must match the window, not the wall clock at recovery time |
+| Multi-tenant — each customer has their own schedules? | Yes, eventually — start single-tenant, design the data model for tenant isolation from day one | Affects rate limiting per tenant, quota enforcement, and blast radius isolation |
+
+## Functional requirements
+
+- Register and unregister jobs by cron expression, one-time schedule, or event trigger; each job has a callback URL or a Kafka topic target
+- Trigger registered jobs within ±5 seconds of their scheduled time; fire missed triggers on recovery with correct logical timestamps
+- Support HTTP callbacks (POST with JSON payload and idempotency key header) and queue-based triggers (publish a message to a configured Kafka topic)
+- Persist trigger history — every execution's triggered-at, status, attempt count, and result payload — queryable by job ID
+- Support DAG-style dependencies: job B waits for job A's execution to reach `SUCCEEDED` status before being eligible to trigger
+- Pause and resume individual jobs without deleting them; paused jobs accumulate no missed-trigger debt
+
+## Non-functional requirements
+
+- **Scale**: 10M scheduled jobs; 100K triggers per minute at peak (top-of-the-hour spike)
+- **Trigger latency**: p99 < 5 seconds from scheduled time to trigger dispatched; p99 < 15 seconds for the worker to begin execution
+- **Exactly-once trigger**: at most 1 duplicate trigger per 1M triggers under normal operation; recovery scenarios allow a brief window of at-most-once semantics that converges to exactly-once
+- **Fault tolerance**: survive scheduler leader failover in < 30 seconds with no missed triggers for jobs scheduled more than 30 seconds into the future
+- **Availability**: 99.9% uptime for the scheduling plane; the execution plane (worker pool) can have per-job retry semantics
+- **Storage**: 10 GB for job definitions (fits on a Postgres primary), 8.6 TB/year for trigger history (append-only, partition by month, archive to cold storage after 90 days)
+
+## Capacity estimation
+
+<Capacity title="Back-of-envelope: 10M jobs, 100K triggers/min peak, 60-day history">
+
+**Average trigger throughput**
+
+With 10M jobs averaging a 1-hour interval:
+
+$$
+\text{avg triggers/sec} = \frac{10{,}000{,}000 \text{ jobs}}{3{,}600 \text{ sec/hr}} \approx 2{,}778 \text{ triggers/sec}
+$$
+
+This is manageable for a Kafka-backed worker pool. The real challenge is the peak.
+
+**Top-of-the-hour spike**
+
+If 10% of jobs are scheduled at the top of the hour (a conservative estimate for data pipelines):
+
+$$
+\text{peak triggers} = 10{,}000{,}000 \times 0.10 = 1{,}000{,}000 \text{ jobs in 60 seconds}
+$$
+
+$$
+\text{peak rate} = \frac{1{,}000{,}000}{60} \approx 16{,}667 \text{ triggers/sec for 60 seconds}
+$$
+
+This is a 6× surge over average. Worker pools must be sized for peak or use autoscaling backed by Kafka consumer lag metrics.
+
+**Redis ZSET memory**
+
+The `job-queue` ZSET stores one entry per active job: job ID (UUID string, ~36 bytes) plus the score (8 bytes epoch milliseconds), plus Redis overhead (~50 bytes per entry):
+
+$$
+\text{ZSET RAM} = 10{,}000{,}000 \times 94\text{ B} \approx 940\text{ MB}
+$$
+
+This fits comfortably in a single Redis primary with a replica. No sharding required at 10M jobs.
+
+**Job history storage**
+
+Each trigger execution record is approximately 1 KB (job ID, timestamps, status, result payload):
+
+$$
+\text{history/year} = 100{,}000 \text{ triggers/min} \times 60 \text{ min/hr} \times 24 \text{ hr/day} \times 365 \text{ days} \times 1\text{ KB}
+$$
+
+$$
+= 100{,}000 \times 525{,}600 \times 1{,}024\text{ B} \approx 52.6\text{ TB/year}
+$$
+
+At 60-day retention with monthly partitioning and tiered storage, the hot-tier footprint is:
+
+$$
+\text{hot-tier} = \frac{52.6\text{ TB}}{365} \times 60 \approx 8.6\text{ TB}
+$$
+
+Partition `job_executions` by `triggered_at` month in Postgres; archive partitions older than 60 days to S3 in Parquet format for analytical queries.
+
+</Capacity>
+
+## API design
+
+```
+POST   /jobs
+Body:  { name: "payment-reconciliation", cronExpression: "0 2 * * *",
+         callbackUrl: "https://payments.internal/reconcile",
+         maxRetries: 3, timeoutSec: 300, tags: ["finance", "critical"] }
+Response 201: { jobId: "j_01HX...", nextFireAt: "2026-05-08T02:00:00Z" }
+
+DELETE /jobs/{jobId}
+Response 204: job unregistered; no future triggers will fire
+
+GET    /jobs/{jobId}/history
+Params: limit=50, cursor=<opaque pagination token>
+Response 200: { executions: [...], nextCursor: "..." }
+
+POST   /jobs/{jobId}/trigger
+Body:  { logicalTimestamp: "2026-05-07T02:00:00Z" }  // optional; defaults to now
+Response 202: { executionId: "e_01HY..." }
+
+PUT    /jobs/{jobId}/pause
+Response 200: { status: "PAUSED" }
+
+PUT    /jobs/{jobId}/resume
+Response 200: { status: "ACTIVE", nextFireAt: "2026-05-08T02:00:00Z" }
+```
+
+The `logicalTimestamp` field on the manual trigger endpoint is critical for backfill. When replaying missed windows, callers pass the correct logical time so that the callback receives the exact window boundaries it would have received during normal operation — not the current wall clock time.
+
+## Data model
+
+**`jobs` table (Postgres)**
+
+```sql
+CREATE TABLE jobs (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name             TEXT NOT NULL,
+  cron_expression  TEXT,                   -- NULL for one-time jobs
+  fire_at          TIMESTAMPTZ,            -- NULL for recurring; set for one-time
+  callback_url     TEXT,                   -- NULL if kafka_topic is set
+  kafka_topic      TEXT,                   -- NULL if callback_url is set
+  status           TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE | PAUSED | DELETED
+  last_triggered_at TIMESTAMPTZ,
+  next_fire_at     TIMESTAMPTZ NOT NULL,
+  claim_id         UUID,                   -- set while a trigger is in-flight; NULL otherwise
+  max_retries      INT NOT NULL DEFAULT 3,
+  timeout_sec      INT NOT NULL DEFAULT 60,
+  tenant_id        UUID NOT NULL,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_jobs_next_fire ON jobs (next_fire_at) WHERE status = 'ACTIVE';
+```
+
+**`job_executions` table (Postgres, partitioned by month)**
+
+```sql
+CREATE TABLE job_executions (
+  execution_id     UUID NOT NULL DEFAULT gen_random_uuid(),
+  job_id           UUID NOT NULL REFERENCES jobs(id),
+  triggered_at     TIMESTAMPTZ NOT NULL,   -- logical timestamp, not wall-clock fire time
+  status           TEXT NOT NULL DEFAULT 'PENDING',  -- PENDING | RUNNING | SUCCEEDED | FAILED
+  started_at       TIMESTAMPTZ,
+  completed_at     TIMESTAMPTZ,
+  result_payload   JSONB,
+  attempt          INT NOT NULL DEFAULT 1,
+  PRIMARY KEY (execution_id, triggered_at)
+) PARTITION BY RANGE (triggered_at);
+```
+
+**Redis ZSET `job-queue`**
+
+```
+ZADD job-queue <next_fire_epoch_ms> <jobId>
+```
+
+The ZSET is the scheduler's working memory. The Postgres `jobs` table is the source of truth. On leader startup, the ZSET is rebuilt from Postgres — this reconciliation also covers missed triggers by finding jobs with `next_fire_at < now` and either triggering them immediately or adding them to the missed-trigger backfill queue.
+
+## High-level architecture
+
+<Mermaid caption="Distributed job scheduler: leader polls Redis ZSET, claims jobs via Postgres, dispatches to Kafka, workers execute and report back" diagram={`graph LR
+  DB[(Jobs DB\nPostgres)] --> Scheduler[Scheduler Leader\nPolls ZSET every 1s]
+  Redis[(Redis ZSET\nnext-fire-time)] --> Scheduler
+  Scheduler --> Lock[Distributed Lock\netcd / Redis NX]
+  Scheduler --> Kafka[Kafka\njob-triggers topic]
+  Kafka --> Workers[Worker Pool\nExecutes callbacks]
+  Workers --> DB
+  Workers --> Metrics[Metrics &\nAlerting]
+  Followers[Scheduler Followers\nStay warm] --> Lock`} />
+
+The scheduler cluster runs multiple nodes. Only the leader — the node holding the distributed lock — polls the ZSET and dispatches triggers. Followers maintain warm state: they have the Postgres connection pool ready and a local copy of the ZSET in memory, so leader promotion is fast. When the leader crashes, the etcd TTL expires (15 seconds), a follower acquires the lock, scans for missed triggers, and resumes polling — all within the 30-second failover budget.
+
+Kafka decouples the scheduling plane from the execution plane. The leader publishes a trigger message to the `job-triggers` topic; Kafka persists it durably. Workers consume from the topic at their own pace, providing natural backpressure during the peak-load spike. A Kafka consumer group per job type allows independent scaling of HTTP-callback workers vs. batch-execution workers.
+
+## Deep dives
+
+### Leader election and failover
+
+The leader election mechanism is a distributed lock on a well-known key (e.g., `scheduler/leader`) in etcd or Redis. Only the lock holder is permitted to poll the job queue and emit trigger events. Followers campaign continuously: each follower periodically calls `tryLock`, backs off exponentially on failure, and transitions to leader the moment the lock becomes available.
+
+The heartbeat interval is 5 seconds; the TTL is 15 seconds. This gives the leader three missed heartbeats before the lock expires — enough to survive transient network blips without falsely revoking leadership. On failover, the new leader acquires the lock within 15 seconds and immediately runs the missed-trigger recovery routine before resuming normal polling. The recovery scan looks for all `ACTIVE` jobs where:
+
+```sql
+next_fire_at < now()
+  OR (last_triggered_at IS NULL AND created_at < now() - INTERVAL '5 minutes')
+```
+
+Each missed job is either triggered immediately (if it is still within a configurable catch-up window, e.g., 1 hour) or marked with a `SKIPPED` execution record (if too far in the past and the job owner has opted out of backfill).
+
+For multi-datacenter deployments, run a scheduler cluster per region and coordinate using a global distributed lock (etcd with geo-replication or a consensus service co-located with the primary database). Active-active scheduling across regions without global coordination is unsound — it reintroduces double-trigger risk.
+
+### The exactly-once trigger problem
+
+This is the central correctness challenge, and the place where most interview answers fall short. The naive implementation — poll the ZSET, find a due job, fire the callback, update `next_fire_at` — has a crash window between "fire" and "update". A leader that crashes after firing but before updating will cause the new leader to re-fire the same job.
+
+The correct pattern is claim-before-fire:
+
+1. `ZRANGEBYSCORE job-queue 0 <now_ms> LIMIT 0 100` — find up to 100 jobs due for firing
+2. For each job, attempt an atomic claim in Postgres:
+   ```sql
+   UPDATE jobs
+   SET    claim_id = :newClaimId
+   WHERE  id = :jobId
+     AND  next_fire_at <= now()
+     AND  claim_id IS NULL
+     AND  status = 'ACTIVE'
+   ```
+3. If `rowsUpdated == 0`, another scheduler node (or a previous execution of this leader before a crash and recovery) already claimed this job. Skip it — do not fire.
+4. If `rowsUpdated == 1`, this node owns the trigger. Insert a `PENDING` execution record, then publish the trigger message to Kafka.
+5. After Kafka `send()` completes (with `acks=all` for durability), update the job:
+   ```sql
+   UPDATE jobs
+   SET    last_triggered_at = :logicalTimestamp,
+          next_fire_at      = :nextCronTick,
+          claim_id          = NULL
+   WHERE  id = :jobId AND claim_id = :claimId
+   ```
+
+The `claim_id` column acts as an optimistic lock token. A crash between steps 4 and 5 leaves the claim in place. On recovery, the new leader sees the stale `claim_id` and treats it as a stuck trigger — after a configurable claim timeout (e.g., 2× the job's `timeout_sec`), it either re-fires the job or marks the execution as `FAILED` depending on the job's `max_retries` configuration.
+
+Even with this pattern, workers must implement idempotency. The idempotency key is `jobId + ":" + logicalTimestampEpochMs`. If a worker receives the same trigger message twice (Kafka at-least-once delivery), it checks a Redis key or a database row for this idempotency key before executing the callback. If the key exists, the execution is a duplicate and is discarded. This two-layer approach — exactly-once trigger via claim-before-fire, at-least-once delivery with idempotency keys at the worker — is the production-correct architecture.
+
+### Thundering herd
+
+The 00:00:00 spike is not a theoretical concern. In production data engineering environments, 80–90% of daily batch jobs are configured to run at midnight, because data engineers set `0 0 * * *` as a default and never revisit it. A scheduler that simply dispatches all due jobs simultaneously will generate a trigger burst that can overwhelm Kafka producers, exhaust Postgres connection pools, and cause Kafka consumer lag to spike for minutes.
+
+Three mitigations work together:
+
+**Jitter at registration time.** When a job is registered with a non-time-critical schedule (tagged `batch` or `analytics`), compute `next_fire_at` as the cron-scheduled time plus a random offset uniformly distributed over `[0, 300]` seconds. A job nominally scheduled for 00:00:00 might actually fire at 00:02:47. Across 1M jobs, this spreads the spike over a 5-minute ramp rather than a 1-second cliff. Critical jobs (tagged `finance`, `sla`) are exempt from jitter.
+
+**Kafka as a rate-limiting buffer.** The scheduler's job is to publish to Kafka, not to execute the callbacks. Publishing 16,667 trigger messages per second to Kafka is sustainable — Kafka is designed for exactly this throughput. Workers consume at their own pace, bounded by their pool size and the rate limits of upstream systems. Kafka consumer lag becomes the observable metric for worker backlog, feeding autoscaling decisions.
+
+**Priority tiers.** The `job-triggers` Kafka topic is partitioned by priority tier, not just by job ID. Critical jobs go to a high-priority partition consumed by a dedicated worker pool that is never throttled. Batch jobs go to a standard partition. During a spike, the high-priority pool continues processing at full speed while the batch pool may lag — which is operationally acceptable for batch analytics but not for payment reconciliation.
+
+### Backfill semantics
+
+Backfill is one of the most nuanced parts of a job scheduler design, and candidates typically conflate it with simple retry. The distinction: retry means "run the job again because the last execution failed." Backfill means "run the job N times with the correct historical logical timestamps because the scheduler was unavailable and N windows were missed."
+
+Consider a job that generates an hourly usage report for each customer. If the scheduler is down from 02:00 to 06:00, four hourly windows are missed. The correct backfill behavior is:
+
+- Trigger the job with logical timestamp `02:00:00` — the worker generates the 01:00–02:00 report
+- Trigger the job with logical timestamp `03:00:00` — the worker generates the 02:00–03:00 report
+- Trigger the job with logical timestamp `04:00:00` — the worker generates the 03:00–04:00 report
+- Trigger the job with logical timestamp `05:00:00` — the worker generates the 04:00–05:00 report
+
+The wall-clock fire time is the recovery time (06:00), but the logical timestamp in each trigger message matches the window. Workers use the logical timestamp, not the fire time, to determine what data to process. This distinction is what separates a correct backfill from a job that runs four times and generates the same output four times.
+
+For non-idempotent jobs — sending a customer notification, charging a payment method — backfill semantics are deliberately restricted. These jobs should be configured with `backfill: SKIP_MISSED` so that recovery fires the job once for the current window and creates `SKIPPED` execution records for the missed windows. No notification should be sent for missed windows retroactively.
+
+This configuration is per-job and should be exposed as a first-class field in the job registration API: `missedTriggerPolicy: BACKFILL | SKIP_MISSED | FIRE_ONCE_LATEST`. Engineers registering jobs must explicitly choose a policy, forcing them to reason about what their job does during missed windows.
+
+## Java integration
+
+### Part A — Quartz-based scheduler with idempotency
+
+```java
+package dev.pushkar.scheduler;
+
+import org.quartz.*;
+import org.quartz.impl.StdSchedulerFactory;
+import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.Jedis;
+import org.springframework.stereotype.Component;
+import java.net.URI;
+import java.net.http.*;
+import java.util.Properties;
+import java.util.UUID;
+
+@Component
+public class DistributedCronScheduler {
+
+    private final Scheduler quartzScheduler;
+    private final JedisPool jedis;
+    private final JobRepository jobRepo;
+
+    public DistributedCronScheduler(JedisPool jedis, JobRepository jobRepo) throws SchedulerException {
+        this.jedis = jedis;
+        this.jobRepo = jobRepo;
+
+        // Quartz with JDBCJobStore for cluster-safe scheduling.
+        // JDBCJobStore uses DB row-level locking to ensure only one node fires each trigger.
+        Properties props = new Properties();
+        props.setProperty("org.quartz.jobStore.class",
+            "org.quartz.impl.jdbcjobstore.JobStoreTX");
+        props.setProperty("org.quartz.jobStore.isClustered", "true");
+        props.setProperty("org.quartz.scheduler.instanceId", "AUTO");
+        props.setProperty("org.quartz.jobStore.clusterCheckinInterval", "5000");
+
+        this.quartzScheduler = new StdSchedulerFactory(props).getScheduler();
+        this.quartzScheduler.start();
+    }
+
+    public String schedule(String name, String cronExpression, String callbackUrl)
+            throws SchedulerException {
+        String jobId = UUID.randomUUID().toString();
+
+        JobDetail detail = JobBuilder.newJob(CallbackJob.class)
+            .withIdentity(jobId)
+            .usingJobData("callbackUrl", callbackUrl)
+            .usingJobData("jobId", jobId)
+            .storeDurably()
+            .build();
+
+        CronTrigger trigger = TriggerBuilder.newTrigger()
+            .withIdentity(jobId + "-trigger")
+            .withSchedule(CronScheduleBuilder.cronSchedule(cronExpression)
+                .withMisfireHandlingInstructionFireAndProceed())
+            .build();
+
+        quartzScheduler.scheduleJob(detail, trigger);
+        return jobId;
+    }
+
+    public void triggerNow(String jobId) throws SchedulerException {
+        quartzScheduler.triggerJob(new JobKey(jobId));
+    }
+
+    public void pause(String jobId) throws SchedulerException {
+        quartzScheduler.pauseJob(new JobKey(jobId));
+    }
+
+    public void resume(String jobId) throws SchedulerException {
+        quartzScheduler.resumeJob(new JobKey(jobId));
+    }
+}
+
+public class CallbackJob implements Job {
+
+    private static final org.slf4j.Logger log =
+        org.slf4j.LoggerFactory.getLogger(CallbackJob.class);
+
+    @Override
+    public void execute(JobExecutionContext ctx) throws JobExecutionException {
+        String callbackUrl = ctx.getMergedJobDataMap().getString("callbackUrl");
+        String jobId       = ctx.getMergedJobDataMap().getString("jobId");
+
+        // Idempotency key: jobId + logical fire time (the scheduled time, not the actual fire time).
+        // Two trigger deliveries for the same window produce the same key.
+        String idempotencyKey = jobId + ":"
+            + ctx.getScheduledFireTime().toInstant().toEpochMilli();
+
+        triggerWithIdempotency(callbackUrl, idempotencyKey);
+    }
+
+    private void triggerWithIdempotency(String url, String key) {
+        HttpClient.newHttpClient().sendAsync(
+            HttpRequest.newBuilder(URI.create(url))
+                .header("Idempotency-Key", key)
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .build(),
+            HttpResponse.BodyHandlers.discarding()
+        ).thenAccept(resp -> {
+            if (resp.statusCode() >= 400) {
+                log.warn("Callback {} returned HTTP {}; idempotency-key={}", url, resp.statusCode(), key);
+            }
+        }).exceptionally(e -> {
+            log.error("Callback failed: url={} key={} error={}", url, key, e.getMessage());
+            return null;
+        });
+    }
+}
+```
+
+### Part B — Spring Boot job management API
+
+```java
+package dev.pushkar.scheduler;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import java.util.List;
+
+@RestController
+@RequestMapping("/jobs")
+public class JobController {
+
+    private final DistributedCronScheduler scheduler;
+    private final JobRepository repo;
+
+    public JobController(DistributedCronScheduler scheduler, JobRepository repo) {
+        this.scheduler = scheduler;
+        this.repo = repo;
+    }
+
+    @PostMapping
+    public ResponseEntity<JobResponse> createJob(@RequestBody CreateJobRequest req) throws Exception {
+        String jobId = scheduler.schedule(req.name(), req.cronExpression(), req.callbackUrl());
+        repo.save(new JobRecord(jobId, req.name(), req.cronExpression(), req.callbackUrl()));
+        return ResponseEntity.status(HttpStatus.CREATED).body(new JobResponse(jobId));
+    }
+
+    @DeleteMapping("/{jobId}")
+    public ResponseEntity<Void> deleteJob(@PathVariable String jobId) throws Exception {
+        scheduler.pause(jobId);    // pause first so no trigger fires during deletion
+        repo.markDeleted(jobId);
+        return ResponseEntity.noContent().build();
+    }
+
+    @PostMapping("/{jobId}/trigger")
+    public ResponseEntity<TriggerResponse> manualTrigger(
+            @PathVariable String jobId,
+            @RequestBody(required = false) ManualTriggerRequest req) throws Exception {
+        scheduler.triggerNow(jobId);
+        String executionId = repo.insertPendingExecution(jobId,
+            req != null ? req.logicalTimestamp() : java.time.Instant.now());
+        return ResponseEntity.accepted().body(new TriggerResponse(executionId));
+    }
+
+    @GetMapping("/{jobId}/history")
+    public List<ExecutionRecord> history(
+            @PathVariable String jobId,
+            @RequestParam(defaultValue = "50") int limit) {
+        return repo.findExecutionHistory(jobId, limit);
+    }
+
+    @PutMapping("/{jobId}/pause")
+    public ResponseEntity<StatusResponse> pause(@PathVariable String jobId) throws Exception {
+        scheduler.pause(jobId);
+        repo.updateStatus(jobId, "PAUSED");
+        return ResponseEntity.ok(new StatusResponse("PAUSED"));
+    }
+
+    @PutMapping("/{jobId}/resume")
+    public ResponseEntity<StatusResponse> resume(@PathVariable String jobId) throws Exception {
+        scheduler.resume(jobId);
+        repo.updateStatus(jobId, "ACTIVE");
+        return ResponseEntity.ok(new StatusResponse("ACTIVE"));
+    }
+
+    record CreateJobRequest(String name, String cronExpression, String callbackUrl) {}
+    record ManualTriggerRequest(java.time.Instant logicalTimestamp) {}
+    record JobResponse(String jobId) {}
+    record TriggerResponse(String executionId) {}
+    record StatusResponse(String status) {}
+}
+```
+
+<TradeoffTable title="Trigger delivery mode comparison">
+
+| Mode | Latency | Reliability | Decoupling | Best for |
+|---|---|---|---|---|
+| HTTP callback (sync) | Low | Medium — retry required on failure | Tight | Simple webhooks, low-volume, latency-sensitive triggers |
+| Kafka message | Medium | High — durable, replayable, at-least-once | Loose | Worker pools, fan-out, high-volume triggers, backpressure |
+| Database poll (worker pulls) | Higher — poll interval adds latency | High — transactional, no message loss | Medium | Long-running batch jobs, jobs requiring transactional coordination |
+| gRPC stream | Very low | Medium — stream reconnect on failure | Tight | Real-time coordination, streaming DAG progress events |
+
+</TradeoffTable>
+
+<Pitfall title="Running a cron job on every node without a distributed lock">
+
+Using `cron.schedule(every_second)` or a Spring `@Scheduled` annotation in a multi-node deployment without a distributed lock means every node fires the job independently. With 10 nodes and a job scheduled every minute, you get 10 executions per minute instead of 1. This is the most common production incident with job schedulers deployed inside horizontally scaled microservices. The fix is either a distributed lock gating execution (acquire before running, skip if not acquired) or a clustered job store like Quartz's `JDBCJobStore`, which uses database-level row locking so that exactly one node in the cluster claims each trigger — other nodes see the row as locked and skip it.
+
+</Pitfall>
+
+<Pitfall title="Midnight thundering herd from uniform cron schedules">
+
+A poor scheduling convention puts 90% of jobs at exactly `0 0 * * *`. When that second arrives, every job becomes due simultaneously, causing a massive spike that overloads workers, saturates Kafka producers, and exhausts database connection pools. The fix is randomized jitter at registration time for batch and non-time-critical jobs. Compute a random offset `jitter = random(0, 300)` seconds and add it to the scheduled time: `next_fire = scheduled_time + jitter`. Across 1M batch jobs nominally at midnight, this spreads the load over a 5-minute ramp-up, eliminating the spike entirely. Expose a `schedulePriority` field in the job API — `CRITICAL` jobs get no jitter, `BATCH` jobs get up to 5 minutes of jitter by default.
+
+</Pitfall>
+
+<Curveball question="Your scheduler leader crashes at exactly 23:59:58, two seconds before the midnight batch triggers. The new leader is elected at 00:00:05. Did any of the midnight jobs miss? How does your missed-trigger recovery handle the midnight spike?">
+
+Yes — the midnight jobs are technically missed. Their `next_fire_at` is `00:00:00` but the new leader does not begin polling until `00:00:05`. The jobs are overdue by 5 seconds, which is within the ±5 second SLA for trigger latency, so this is not a violation of functional requirements. The new leader's first action after acquiring the lock is to run the missed-trigger scan: `SELECT * FROM jobs WHERE next_fire_at <= now() AND status = 'ACTIVE' AND claim_id IS NULL`. This returns all midnight jobs in one query. The leader then dispatches them immediately, serially claiming and publishing in batches of 100. The latency for the last job in the batch depends on throughput — at 16,667/sec publish capacity, 1M jobs take 60 seconds to fully dispatch. Jobs are ordered by `next_fire_at` DESC so the most overdue fire first. The result: all midnight jobs are triggered within 60–65 seconds of midnight rather than within 5 seconds. For batch analytics this is acceptable; for SLA-critical jobs, those should be tagged `CRITICAL` and given a dedicated leader thread that processes them ahead of the batch queue.
+
+</Curveball>
+
+<Curveball question="A customer creates 1M scheduled jobs all set to trigger at 08:00:00 AM. Your ZSET has 1M entries with the same score. How does your system handle this, and what do you tell the customer?">
+
+At the ZSET level, 1M entries with the same score is legal — Redis sorts ties by lexicographic order of the member (the job ID). `ZRANGEBYSCORE` will return all 1M entries when the score matches, but the `LIMIT` clause in `ZRANGEBYSCORE job-queue 0 &lt;08:00:00_ms> LIMIT 0 100` ensures the leader processes them in batches of 100 without loading all 1M into memory. The scheduling plane survives. The execution plane does not — dispatching 1M HTTP callbacks at 08:00:00 will overwhelm any reasonable worker pool and saturate downstream services. What you tell the customer: this pattern violates the tenant rate limit of N triggers per minute (set during onboarding), and the system will automatically apply jitter across the scheduled window. Offer them a `schedulingWindow` parameter: rather than triggering all 1M jobs at exactly 08:00:00, the scheduler spreads them uniformly over a configurable window (e.g., 08:00 to 08:30). The customer gets all jobs triggered within the window; their downstream services see a steady rate rather than a spike. Implement this as a per-tenant throttle enforced at the Kafka producer level with a token bucket, and surface the consumer lag as a metric on the tenant dashboard.
+
+</Curveball>
+
+<Curveball question="Job A and Job B are both configured to run at 02:00:00. Job B depends on Job A's output. Job A takes 45 minutes. How do you model this dependency without polling?">
+
+Schedule Job A at 02:00:00 normally. Do not schedule Job B as a cron job at all — instead, model the dependency as a DAG edge. When Job A completes successfully, it writes a `SUCCEEDED` event to a Kafka topic (`job-completions`). A DAG resolver service consumes this topic, evaluates the dependency graph, and determines whether all of Job B's upstream dependencies (just Job A in this case) are satisfied. If yes, it calls `POST /jobs/job-b/trigger` with the logical timestamp of the workflow run (02:00:00). Job B starts at approximately 02:45:00 after Job A finishes. No polling is required — the trigger is event-driven. The DAG state is stored in a `job_dag_edges` table (`upstream_job_id`, `downstream_job_id`, `run_date`) and a `dag_execution_state` table tracking which upstream jobs have completed for a given workflow run. The resolver is idempotent: re-processing the same `SUCCEEDED` event checks the current state before triggering and skips if Job B already has a `PENDING` or later execution for that logical timestamp. For multi-level DAGs, the resolver evaluates all downstream dependencies each time a node completes, fanning out to any newly eligible nodes — this is the core of how Apache Airflow's scheduler and Databricks Workflows handle task dependencies.
+
+</Curveball>
+
+<RelatedQuestions items={[
+  { slug: "distributed-locking-service", title: "Design a Distributed Locking Service", difficulty: "staff" },
+  { slug: "distributed-logging-system", title: "Design a Distributed Logging System", difficulty: "senior" },
+  { slug: "metrics-monitoring", title: "Design a Metrics & Monitoring System", difficulty: "senior" },
+]} />
+
+## Further reading
+
+- [Quartz Scheduler documentation — clustering and JDBCJobStore](http://www.quartz-scheduler.org/documentation/quartz-2.3.0/configuration/ConfigJDBCJobStoreClustering.html) — Reference configuration for Quartz cluster mode, including the database schema required for distributed trigger coordination and the misfire handling policies that govern missed-trigger behavior
+- [LinkedIn Azkaban — design and open-source release](https://engineering.linkedin.com/blog/2015/04/open-sourcing-azkaban) — LinkedIn's workflow scheduler for Hadoop jobs, covering the DAG execution model, retry semantics, and the operational challenges of running thousands of daily workflows across a large engineering organization
+- [AWS EventBridge Scheduler — architecture overview](https://docs.aws.amazon.com/scheduler/latest/UserGuide/what-is-scheduler.html) — AWS's managed distributed scheduler offering, documenting exactly-once scheduling guarantees, flexible time windows for jitter, and the at-least-once delivery model with customer-side idempotency requirements
+- [Reliable Cron across the planet (Google SRE blog)](https://sre.google/sre-book/distributed-periodic-scheduling/) — Google SRE's treatment of distributed cron, covering the Chubby-based leader election model, missed-job detection, and the tradeoffs between at-most-once and at-least-once trigger semantics at planetary scale

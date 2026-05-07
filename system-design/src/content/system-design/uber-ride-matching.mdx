@@ -1,0 +1,672 @@
+---
+title: "Design Uber Ride Matching"
+slug: "uber-ride-matching"
+category: "commerce"
+difficulty: "senior"
+estimatedReadMinutes: 24
+tags: ["geospatial", "matching", "location-tracking", "surge-pricing", "geohash", "real-time", "dispatch"]
+companyFlavors: ["Uber", "Lyft", "DoorDash", "Grab"]
+prerequisites: ["yelp-nearby-places", "consistent-hashing", "design-a-cache"]
+relatedQuestions: ["doordash", "airbnb", "stripe-payment-gateway"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design Uber's ride matching system: real-time driver location ingestion at 1M updates/second, geohash-based nearest driver lookup, matching algorithm, surge pricing via supply-demand imbalance, and the trip state machine from request to payment."
+javaPackages:
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+  - "org.springframework.boot:spring-boot-starter-websocket:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "org.springframework.data:spring-data-jpa:3.3.0"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="uber-ride-matching" title="Design Uber Ride Matching" />
+
+<Tldr>
+- **Driver location at 250K updates/second**: every active driver sends a GPS ping every 4 seconds via a persistent WebSocket; the Location Service writes each update as `GEOADD drivers:{city} lng lat driver_id` into a Redis geo sorted set — 5M active drivers ÷ 4s = 1.25M updates/s peak, sharded across city-keyed Redis clusters.
+- **ETA-ranked matching, not distance-ranked**: a rider request triggers `GEORADIUS drivers:{city} pickup_lng pickup_lat 5 km ASC COUNT 20`, then filters for `AVAILABLE` drivers, calls the ETA service for each candidate, sorts by ETA ascending, and offers the trip to each driver in turn via WebSocket — driver has 15 seconds to accept before the next candidate is tried.
+- **Trip state machine with Kafka-driven transitions**: SEARCHING → DRIVER\_ACCEPTED → DRIVER\_EN\_ROUTE → DRIVER\_ARRIVED → TRIP\_IN\_PROGRESS → COMPLETED (with CANCELLED reachable from SEARCHING or DRIVER\_ACCEPTED); every transition is a Redis write plus a Kafka event on `trip-status-changed`, which triggers downstream consumers for payment, notifications, and fraud detection.
+- **Surge pricing per geohash-6 cell every 60 seconds**: the Surge Engine computes `surge_multiplier = max(1.0, min(8.0, 1 + k × ln(demand/supply)))` for each geohash cell, writes results to `HSET surge:{city} geohash6 multiplier`, and riders see the locked-in multiplier at trip confirm time — not at trip completion.
+- **Real-time rider tracking via Kafka fan-out**: after match, the rider's WebSocket subscribes to a trip-scoped channel; every driver location update is published to Kafka `driver-location`, consumed by the Trip Tracking Service filtered by `driver_id`, and pushed to the rider's WebSocket every 4 seconds with bearing and speed for smooth client-side dead reckoning.
+</Tldr>
+
+## The scale of the problem
+
+Uber operates in 130+ countries, runs more than 25 million trips per day, and at any given moment has roughly 5 million active drivers with their GPS chips pinging a backend every 4 seconds. That translates to a sustained write rate of roughly 1.25 million location update events per second — not a batch job, not an occasional query, but a firehose of small writes that must be indexed in a way that allows sub-millisecond geospatial queries. No relational database with a B-tree index was designed for this workload. A traditional `SELECT * FROM drivers WHERE ST_Distance(location, pickup) < 5000 ORDER BY ST_Distance(location, pickup) LIMIT 20` query against a PostgreSQL table with 5 million rows, each being updated every 4 seconds, would be catastrophically expensive: the lock contention alone on `UPDATE drivers SET lat=?, lng=? WHERE id=?` across 1.25M rows/second would saturate any single database node. The first architectural insight is that driver location is not a durable record requiring ACID semantics — it is a continuously refreshed ephemeral position that belongs in a purpose-built in-memory data structure.
+
+The second dimension of difficulty is the matching algorithm itself. Finding the nearest driver sounds like a geometry problem, but the correct objective function is minimizing rider wait time, not minimizing straight-line distance. A driver 800 meters away through a park with no road access is useless. A driver 1.5 kilometers away on a direct arterial road with light traffic might arrive in 90 seconds. This means that after the geospatial index narrows the candidate set, you need ETA estimates — real routing computations that account for road network topology and current traffic — for each candidate. At 289 new trip requests per second (25M/day ÷ 86,400), with 20 candidates each requiring an ETA call, you need 5,780 ETA computations per second sustained. Those ETA calls cannot all be cold calls to the Google Maps API or an internal routing engine — caching ETA results keyed by (origin\_geohash6, destination\_geohash6) with a 30-second TTL is not optional; it is load-critical.
+
+The third dimension is the operational reality that Uber's business model lives or dies on matching speed and reliability. Riders who wait more than 5 minutes cancel. Drivers who sit idle for 10 minutes go offline. The surge pricing mechanism exists precisely to dynamically rebalance supply and demand — but surge computation itself requires per-cell supply and demand aggregation across 100,000+ geohash cells in real time. Designing all three subsystems — location ingestion, matching, and surge — to work together coherently, without introducing cross-system coupling that creates single points of failure, is the actual engineering challenge.
+
+## Clarifying questions
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| Which ride types are in scope? | Focus on UberX (single rider, standard vehicle); mention Pool and Black as extensions | Pool requires multi-rider matching logic; Black requires vehicle-class filtering — UberX is the simplest complete case |
+| Single city or global? | Design for a single city (e.g., San Francisco); then describe how to extend to global with per-city sharding | Global scope changes Redis topology from one sorted set per city to potentially S2/H3 cell sharding |
+| What is the matching algorithm? | Nearest available driver by ETA to pickup, not raw distance | Determines whether ETA computation is in the hot path (it is) or a post-processing step |
+| Do drivers set zone preferences? | Yes — drivers can set a preferred operating zone; this filters the candidate set before ETA ranking | Zone preference is a boolean filter on the candidate list, not a geospatial constraint — cheap to apply |
+| Is UberPool (shared rides) in scope? | Out of scope for this design; mention as an extension | Pool requires tracking multiple in-progress bookings per trip and trajectory similarity matching |
+| Does the rider see real-time driver location? | Yes — from DRIVER\_ACCEPTED through TRIP\_IN\_PROGRESS, rider's app shows driver position updated every 4 seconds | Adds a real-time fan-out requirement: each driver update must reach the matched rider's WebSocket |
+| What is the cancellation policy? | Rider can cancel for free within 2 minutes of match; after DRIVER\_EN\_ROUTE for 2+ minutes, a $5 fee applies | The trip state machine must record matched\_at timestamp and the payment service must check cancellation timing |
+| How is payment handled? | Card on file; auto-charged on COMPLETED state transition; no cash flows through the system | Payment is a downstream consumer of the `trip-status-changed` Kafka event — clean separation of concerns |
+
+## Functional requirements
+
+- Riders can request a trip by providing pickup and dropoff coordinates; the system returns an estimated fare, ETA, and surge multiplier before the rider confirms.
+- Active drivers send GPS location updates every 4 seconds; the system maintains a real-time geospatial index of available drivers per city.
+- When a rider confirms a trip, the Matching Service finds the best available driver by ETA, offers the trip via push notification, and repeats the offer to the next candidate if the driver declines or does not respond within 15 seconds.
+- After a match, both the rider and driver receive real-time location updates via WebSocket for the duration of the trip (EN\_ROUTE through COMPLETED).
+- On trip completion, the system computes the final fare (base rate × distance × time × surge multiplier locked at confirmation) and charges the rider's card on file.
+- Surge pricing is computed per geohash cell every 60 seconds based on local supply-demand imbalance and surfaced to riders before confirmation.
+
+## Non-functional requirements
+
+- **Trip volume**: 25 million trips per day; peak ~2× average = ~578 new trip requests per second at peak.
+- **Driver fleet**: 5 million active drivers globally; approximately 500K active in a single large metro area at peak.
+- **Location write throughput**: 1.25 million GPS updates per second globally (5M drivers × 1 update/4s).
+- **Match latency**: p99 < 5 seconds from rider confirmation to driver acceptance (end-to-end, including ETA ranking).
+- **Driver location freshness**: a driver's displayed position must be no older than 10 seconds at any time.
+- **Availability**: 99.99% for the trip request and booking paths (~52 minutes downtime per year); location ingestion can tolerate brief degradation with client-side retry.
+- **Location history retention**: 30 days for audit, fraud investigation, and route quality analysis; stored in Cassandra with TTL.
+- **Consistency model**: eventual consistency is acceptable for driver location (stale by up to 10s); trip state transitions require strong consistency (Redis with write-through to PostgreSQL).
+
+<Capacity title="Uber Ride Matching Capacity Estimates">
+
+**Driver location writes**
+
+5M active drivers, each pinging every 4 seconds:
+
+$$\frac{5{,}000{,}000}{4} = 1{,}250{,}000 \text{ updates/s}$$
+
+Each Redis `GEOADD` command is O(log N). A single Redis node handles approximately 200K geo write ops/second. Required Redis location nodes:
+
+$$\lceil 1{,}250{,}000 / 200{,}000 \rceil = 7 \text{ Redis nodes}$$
+
+With 3× replication for HA: 21 total Redis location instances, sharded by city.
+
+**Matching query load**
+
+$$\frac{25{,}000{,}000 \text{ trips/day}}{86{,}400 \text{ s/day}} \approx 289 \text{ trip requests/s (average)}$$
+
+Peak (2× average): ~578 new trip requests/s. Each request triggers one `GEORADIUS` query returning 20 candidates. With 20 candidates × ETA computation:
+
+$$578 \times 20 = 11{,}560 \text{ ETA computations/s (peak)}$$
+
+With a 30-second ETA cache keyed by (origin\_geohash6, destination\_geohash6), cache hit rate is approximately 60–70%, reducing live ETA API calls to roughly $11{,}560 \times 0.35 \approx 4{,}046 \text{ live ETA calls/s}$.
+
+**Trip state writes**
+
+25M trips/day × 7 state transitions each:
+
+$$\frac{25{,}000{,}000 \times 7}{86{,}400} \approx 2{,}025 \text{ Redis state writes/s}$$
+
+Trivially handled by a single Redis node; PostgreSQL async write-behind at the same rate is well within capacity for a standard instance.
+
+**Surge computation**
+
+Assume 1,000 geohash-6 cells per city × 100 cities = 100,000 active cells; recomputed every 60 seconds:
+
+$$\frac{100{,}000}{60} \approx 1{,}667 \text{ surge updates/s}$$
+
+Each update is a Redis `HSET surge:{city} geohash6 multiplier` — negligible load.
+
+**Location storage footprint**
+
+Active driver positions in Redis: 5M drivers × 1 geo entry (24 bytes for the sorted set member: geohash score 8B + driver\_id string ~16B):
+
+$$5{,}000{,}000 \times 24 \approx 120 \text{ MB}$$
+
+Trivially small — a single 8GB Redis instance could hold all active driver positions globally. Sharding by city is for write throughput, not storage.
+
+**Location history in Cassandra**
+
+Each driver generates 1 location record every 4 seconds; stored for 30 days:
+
+$$5{,}000{,}000 \times \frac{86{,}400}{4} \times 30 \approx 3.24 \times 10^{12} \text{ rows}$$
+
+At 64 bytes per row (driver\_id, timestamp, lat, lng, bearing, speed): $3.24 \times 10^{12} \times 64 \approx 207 \text{ TB}$ raw. With Cassandra replication factor 3: ~621 TB total. Appropriate for a 100-node Cassandra cluster at ~6 TB per node.
+
+</Capacity>
+
+## API design
+
+The system exposes two API surfaces: a WebSocket protocol for real-time bidirectional communication (driver location updates, trip offers, rider tracking), and a REST API for request-response operations (trip creation, status polling, manual status changes).
+
+**Driver WebSocket protocol**
+
+Drivers maintain a persistent WebSocket to the Location Service gateway. The driver app connects on app foreground and disconnects on background. The connection carries:
+
+```json
+{
+  "type": "LOCATION_UPDATE",
+  "driver_id": "drv_a1b2c3d4",
+  "lat": 37.7749,
+  "lng": -122.4194,
+  "bearing": 142.5,
+  "speed_kmh": 35.2,
+  "status": "AVAILABLE",
+  "timestamp_ms": 1705359000000
+}
+```
+
+The server responds with acknowledgement and any pending trip offers:
+
+```json
+{
+  "type": "TRIP_OFFER",
+  "trip_id": "trp_x9y8z7w6",
+  "pickup": { "lat": 37.7751, "lng": -122.4183, "address": "Market St & 5th St" },
+  "dropoff": { "lat": 37.7849, "lng": -122.4094, "address": "Union Square" },
+  "estimated_fare_cents": 1240,
+  "pickup_eta_seconds": 180,
+  "offer_expires_at_ms": 1705359015000
+}
+```
+
+**Driver REST endpoints**
+
+```text
+PUT  /api/v1/drivers/{driver_id}/status
+     Body: { "status": "AVAILABLE" | "ON_TRIP" | "OFFLINE" }
+     Auth: Bearer driver JWT
+     Response: 204 No Content
+
+POST /api/v1/drivers/{driver_id}/trips/{trip_id}/accept
+     Response: 200 { "trip": { "id", "rider_name", "pickup", "dropoff" } }
+
+POST /api/v1/drivers/{driver_id}/trips/{trip_id}/decline
+     Response: 204 No Content
+```
+
+**Rider REST endpoints**
+
+```text
+POST /api/v1/trips
+     Body: {
+       "pickup_lat": 37.7749, "pickup_lng": -122.4194,
+       "dropoff_lat": 37.7849, "dropoff_lng": -122.4094,
+       "ride_type": "UBERX"
+     }
+     Response: 201 {
+       "trip_id": "trp_x9y8z7w6",
+       "status": "PENDING",
+       "pickup_eta_seconds": 240,
+       "price_estimate_cents": 1240,
+       "price_estimate_high_cents": 1580,
+       "surge_multiplier": 1.4,
+       "valid_until_ms": 1705359060000
+     }
+
+POST /api/v1/trips/{trip_id}/confirm
+     Response: 202 { "status": "SEARCHING" }
+
+GET  /api/v1/trips/{trip_id}/status
+     Response: 200 {
+       "status": "DRIVER_EN_ROUTE",
+       "driver": { "id", "name", "vehicle", "rating", "photo_url" },
+       "driver_location": { "lat": 37.7751, "lng": -122.4183, "bearing": 90.0 },
+       "pickup_eta_seconds": 95
+     }
+
+POST /api/v1/trips/{trip_id}/cancel
+     Response: 200 { "cancellation_fee_cents": 500 }
+```
+
+**Rider WebSocket (trip tracking)**
+
+After driver acceptance, the rider's app opens a WebSocket to the Trip Tracking Service at `wss://tracking.uber.com/trips/{trip_id}`. The service streams driver position updates:
+
+```json
+{
+  "type": "DRIVER_LOCATION",
+  "lat": 37.7752,
+  "lng": -122.4180,
+  "bearing": 92.3,
+  "speed_kmh": 28.1,
+  "pickup_eta_seconds": 87,
+  "timestamp_ms": 1705359004000
+}
+```
+
+## Data model
+
+**driver\_locations — Redis Geo Sorted Set (one per city)**
+
+```text
+Key:    drivers:{city_id}          e.g. drivers:san_francisco
+Type:   Redis Geo Sorted Set
+Ops:    GEOADD drivers:san_francisco -122.4194 37.7749 drv_a1b2c3d4
+        GEORADIUS drivers:san_francisco -122.4194 37.7749 5 km ASC COUNT 20
+        GEOPOS drivers:san_francisco drv_a1b2c3d4
+TTL:    Members expire passively; driver goes OFFLINE → ZREM
+```
+
+**driver\_status — Redis Hash (one key per driver)**
+
+```text
+Key:    driver:{driver_id}         e.g. driver:drv_a1b2c3d4
+Fields: status          AVAILABLE | ON_TRIP | OFFLINE
+        current_trip_id trp_x9y8z7w6 (null if AVAILABLE)
+        vehicle_type    UBERX | BLACK | SUV
+        last_seen_ms    1705359000000
+        zone_pref       downtown_sf  (optional)
+TTL:    3600s — driver auto-expires to OFFLINE if no heartbeat
+```
+
+**trips — PostgreSQL**
+
+```sql
+CREATE TABLE trips (
+    trip_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    rider_id            UUID NOT NULL,
+    driver_id           UUID,
+    pickup_lat          DOUBLE PRECISION NOT NULL,
+    pickup_lng          DOUBLE PRECISION NOT NULL,
+    dropoff_lat         DOUBLE PRECISION NOT NULL,
+    dropoff_lng         DOUBLE PRECISION NOT NULL,
+    city_id             VARCHAR(64) NOT NULL,
+    status              VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+    ride_type           VARCHAR(16) NOT NULL DEFAULT 'UBERX',
+    surge_multiplier    NUMERIC(4,2) NOT NULL DEFAULT 1.0,
+    estimated_price_cents   INTEGER,
+    final_price_cents       INTEGER,
+    pickup_geohash6     VARCHAR(6),
+    requested_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    matched_at          TIMESTAMPTZ,
+    driver_arrived_at   TIMESTAMPTZ,
+    trip_started_at     TIMESTAMPTZ,
+    completed_at        TIMESTAMPTZ,
+    cancelled_at        TIMESTAMPTZ
+);
+
+CREATE INDEX ON trips (rider_id, requested_at DESC);
+CREATE INDEX ON trips (driver_id, requested_at DESC);
+CREATE INDEX ON trips (status, city_id) WHERE status IN ('SEARCHING', 'DRIVER_ACCEPTED');
+```
+
+**trip\_state — Redis (hot path)**
+
+```text
+Key:    trip:{trip_id}             e.g. trip:trp_x9y8z7w6
+Type:   Redis Hash
+Fields: status          SEARCHING | DRIVER_ACCEPTED | DRIVER_EN_ROUTE | ...
+        driver_id       drv_a1b2c3d4
+        driver_lat      37.7751
+        driver_lng      -122.4183
+        driver_bearing  92.3
+        matched_at_ms   1705359000000
+TTL:    7200s (2 hours — covers longest possible trip + buffer)
+```
+
+**surge\_map — Redis Hash (one per city)**
+
+```text
+Key:    surge:{city_id}            e.g. surge:san_francisco
+Type:   Redis Hash
+Fields: {geohash6} => {surge_multiplier_float}
+        e.g. "9q8yy0" => "1.8"
+            "9q8yy1" => "1.2"
+TTL:    None (updated in-place every 60s by SurgeEngine)
+```
+
+**location\_history — Cassandra**
+
+```sql
+CREATE TABLE location_history (
+    driver_id       UUID,
+    date_bucket     DATE,
+    recorded_at     TIMESTAMP,
+    lat             DOUBLE,
+    lng             DOUBLE,
+    bearing         FLOAT,
+    speed_kmh       FLOAT,
+    trip_id         UUID,
+    PRIMARY KEY ((driver_id, date_bucket), recorded_at)
+) WITH CLUSTERING ORDER BY (recorded_at DESC)
+  AND default_time_to_live = 2592000;
+```
+
+The partition key is `(driver_id, date_bucket)` where `date_bucket` is the UTC date (`2025-01-15`). This bounds partition size to approximately 21,600 rows per driver per day (86,400s / 4s interval). Queries for a driver's recent history are narrow single-partition reads. TTL = 2,592,000 seconds = 30 days.
+
+## Architecture diagrams
+
+**Flow A: Rider requests a trip and gets matched**
+
+<Mermaid diagram={`flowchart TD
+  A[Rider App] -->|POST /trips| B[Trip Service]
+  B -->|Read HGET surge city geohash6| C[(Redis Surge Map)]
+  C -->|surge_multiplier| B
+  B -->|INSERT trip status=PENDING| D[(PostgreSQL)]
+  B -->|Return TripEstimate| A
+  A -->|POST /trips/:id/confirm| B
+  B -->|HSET trip:id status=SEARCHING| E[(Redis Trip State)]
+  B -->|Publish find-match event| F[Kafka]
+  F -->|Consume| G[Matching Service]
+  G -->|GEORADIUS drivers:city 5km ASC 20| H[(Redis Geo - Drivers)]
+  H -->|candidate driver_ids| G
+  G -->|HMGET driver:id status| I[(Redis Driver Status)]
+  I -->|AVAILABLE drivers| G
+  G -->|ETA for each candidate| J[ETA Service]
+  J -->|cached or live routing| K[(ETA Cache Redis)]
+  G -->|rank by ETA ascending| G
+  G -->|WebSocket push TRIP_OFFER| L[Driver App]
+  L -->|POST accept within 15s| G
+  G -->|HSET trip:id status=DRIVER_ACCEPTED| E
+  G -->|HSET driver:id status=ON_TRIP| I
+  G -->|Publish trip-status-changed| F
+  G -->|Notify rider via WebSocket| A`} />
+
+**Flow B: Driver location update and rider real-time tracking**
+
+<Mermaid diagram={`flowchart LR
+  A[Driver App] -->|WebSocket LOCATION_UPDATE every 4s| B[Location Service]
+  B -->|GEOADD drivers:city lng lat driver_id| C[(Redis Geo - Drivers)]
+  B -->|HSET driver:id last_seen_ms lat lng| D[(Redis Driver Status)]
+  B -->|Publish driver-location event| E[Kafka topic: driver-location]
+  E -->|Async consumer| F[Location History Writer]
+  F -->|INSERT into Cassandra| G[(Cassandra location_history)]
+  E -->|Filter by driver_id if ON_TRIP| H[Trip Tracking Service]
+  H -->|WebSocket push DRIVER_LOCATION| I[Rider App]
+  H -->|Recalculate pickup ETA| J[ETA Service]
+  J -->|Updated pickup_eta_seconds| H
+  H -->|Push updated ETA to rider| I`} />
+
+## Deep dives
+
+### Geospatial driver lookup: Redis GEORADIUS internals
+
+Redis Geo commands are built on top of the sorted set data structure. When you call `GEOADD drivers:san_francisco -122.4194 37.7749 drv_a1b2c3d4`, Redis encodes the longitude and latitude into a 52-bit geohash integer using an interleaved bit encoding (alternating longitude bits and latitude bits, similar to a Z-order curve). This 52-bit integer becomes the score of the sorted set member. The precision of this encoding corresponds to approximately ±0.6mm at the equator — far more precise than any GPS reading, making precision loss irrelevant.
+
+`GEORADIUS drivers:san_francisco -122.4194 37.7749 5 km ASC COUNT 20` works by computing the geohash bounding box for the 5km radius, converting it to a score range in the sorted set, performing a sorted set range scan (O(log M + N) where M is total elements and N is results), and then filtering the raw candidates by actual Haversine distance to eliminate false positives from the bounding box. The `ASC COUNT 20` modifier returns only the 20 nearest candidates, stopping the scan early. For a city with 50,000 active drivers, a 5km radius at typical urban driver density returns 20–50 candidates in under 1 millisecond.
+
+The sharding strategy is critical: one Redis geo sorted set per city (not one global set). A global sorted set with 5 million members is not a performance problem for Redis — sorted sets are O(log N) — but it creates an operational problem: a single node becomes the hot key for all global matching traffic. City-level sharding distributes write load (location updates) and read load (GEORADIUS queries) across the fleet proportionally to each city's driver density. The mapping from rider pickup coordinates to city is a fast point-in-polygon lookup against a pre-cached set of city bounding polygons stored in application memory.
+
+`GEORADIUS` was deprecated in Redis 6.2 in favor of `GEOSEARCH` / `GEOSEARCHSTORE`, which support both BYRADIUS and BYBOX queries and do not require passing the center coordinates separately. The semantics are equivalent; production code should use `GEOSEARCH drivers:san_francisco FROMLONLAT -122.4194 37.7749 BYRADIUS 5 km ASC COUNT 20 WITHCOORD WITHDIST`.
+
+### Matching algorithm: ETA over distance
+
+The ranking step after `GEORADIUS` is where naive systems fail. Raw geographic distance (Haversine formula) is O(1) to compute and requires no external call, but it produces poor matches in dense urban environments where road network topology dominates travel time. Consider three scenarios:
+
+1. Driver A: 800m away, but separated from the pickup by a river with no nearby bridge — actual ETA: 12 minutes.
+2. Driver B: 1.4km away on the same side of the river, direct route — actual ETA: 3 minutes.
+3. Driver C: 2.1km away, currently stuck behind an accident — actual ETA: 9 minutes.
+
+Distance-based ranking selects A. ETA-based ranking selects B. The difference in rider wait time is nearly 10 minutes — the difference between a retained customer and a cancelled trip.
+
+ETA computation at scale requires caching. The routing service (Google Maps Platform, Here Maps, or Uber's own H3-based OSRM instance) returns travel time for a (origin, destination) pair accounting for current traffic. At the geohash-6 level (~1.2km × 0.6km cells), the ETA for any origin within the same geohash-6 to any destination within the same geohash-6 varies by at most 30–60 seconds in dense urban areas — acceptable approximation error for ranking purposes. Caching at geohash-6 granularity with a 30-second TTL reduces ETA API calls from 14,500/s to approximately 4,000–5,000/s cold-cache calls, which is manageable.
+
+The offer flow is strictly sequential per trip, not parallel. Offering the same trip to multiple drivers simultaneously and accepting the first response is appealing but creates a multi-party commitment problem: two drivers head toward the same pickup, one gets cancelled. This wastes driver time and damages driver trust. Sequential offering with a 15-second timeout per driver maintains clean commitment semantics. The 15-second window is long enough for a driver to glance at their phone and tap Accept; rejections (tap Decline) process in under 1 second. A typical trip matches within 1–3 driver offers — the sequential cost is low in practice.
+
+### Surge pricing: the supply-demand engine
+
+Surge pricing is Uber's mechanism for equilibrating supply and demand in real time. The core computation runs in the Surge Engine service every 60 seconds for each active geohash-6 cell:
+
+```text
+demand  = count of SEARCHING trips in cell
+        + EWMA(new_trip_requests in cell, last 3 minutes)
+supply  = count of AVAILABLE drivers in cell (from Redis GEORADIUS)
+ratio   = demand / max(supply, 1)
+
+if ratio <= 1.25:
+    surge_multiplier = 1.0
+else:
+    surge_multiplier = max(1.0, min(8.0, 1.0 + k × ln(ratio)))
+    where k ≈ 2.3 (calibrated empirically per city)
+```
+
+The `ln(ratio)` formulation gives a smooth, sub-linear response: doubling demand relative to supply does not double the surge (that would be brutal for riders and cause demand collapse). The `min(8.0, ...)` cap prevents runaway pricing during catastrophic supply shortfalls (natural disasters, stadium events, New Year's Eve).
+
+Surge is displayed to riders before trip confirmation. The rider sees "Surge: 1.8×" on the price estimate screen. If they confirm, the surge multiplier is locked into the `trips.surge_multiplier` column — they pay `estimated_base_price × 1.8` regardless of whether surge drops during the trip. This price lock is essential for rider trust: no one wants to confirm a trip at 1.8× and discover the final charge was 2.4× because surge spiked during their ride.
+
+The Surge Engine reads demand from Kafka (count `trip-status-changed` events with status=SEARCHING by pickup\_geohash6) and reads supply from Redis (`GEORADIUS` on the `drivers:{city}` set filtered by status=AVAILABLE). Publishing results to `surge:{city}` Redis Hash takes under 1ms per cell. Riders' price estimate endpoint reads surge with `HGET surge:{city} {pickup_geohash6}` — a single O(1) Redis command in the hot path.
+
+### Trip state machine: transitions, storage, and downstream effects
+
+The trip state machine is the source of truth for where a trip is in its lifecycle. Every state is a named string stored in Redis (`HSET trip:{trip_id} status {state}`) and asynchronously persisted to PostgreSQL. Every transition publishes a Kafka event on the `trip-status-changed` topic with payload `{trip_id, old_status, new_status, timestamp_ms, driver_id, rider_id}`. Kafka consumers for each event type:
+
+```text
+SEARCHING        → Kafka → Matching Service (begin driver search)
+DRIVER_ACCEPTED  → Kafka → Notification Service (push to rider: "Driver found!")
+                 → Kafka → Trip Tracking Service (begin streaming driver location to rider)
+DRIVER_EN_ROUTE  → Kafka → ETA Service (begin recalculating pickup ETA every 30s)
+DRIVER_ARRIVED   → Kafka → Notification Service (push to rider: "Your driver is here")
+TRIP_IN_PROGRESS → Kafka → Fraud Detection (begin route verification)
+                 → Kafka → ETA Service (switch to dropoff ETA)
+COMPLETED        → Kafka → Payment Service (charge rider: final_price_cents)
+                 → Kafka → Rating Service (send post-trip rating prompt)
+                 → Kafka → Driver Status Service (set driver AVAILABLE)
+CANCELLED        → Kafka → Payment Service (charge cancellation fee if applicable)
+                 → Kafka → Driver Status Service (set driver AVAILABLE)
+                 → Kafka → Matching Service (remove trip from active search)
+```
+
+The cancellation fee computation is state-aware: the Payment Service consumer reads `trips.matched_at` from PostgreSQL. If the current time minus `matched_at` is less than 120 seconds, no fee is charged. If the trip is in DRIVER\_EN\_ROUTE status and the elapsed time since match exceeds 120 seconds, the $5 cancellation fee is applied. This requires the Payment Service to have access to the full trip record, not just the Kafka event — it reads from PostgreSQL directly for cancellation handling.
+
+### Real-time driver tracking for riders
+
+After the trip transitions to DRIVER\_ACCEPTED, the rider's app opens a WebSocket to `wss://tracking.uber.com/trips/{trip_id}`. The Trip Tracking Service manages these connections and subscribes to the Kafka `driver-location` topic. Kafka consumers in the Trip Tracking Service filter messages by `driver_id` (extracted from `driver:{driver_id}` status hash after looking up which driver is assigned to each active trip). This filtering is implemented as a Kafka Streams application that joins a stream of location updates with a table of active trip assignments — not a naive O(N) scan.
+
+Client-side dead reckoning smooths the 4-second update interval: the rider app receives `{lat, lng, bearing, speed_kmh}` and renders the driver marker moving smoothly at `speed_kmh` along the `bearing` heading between updates. When the next update arrives, the app snaps to the actual position if the dead-reckoned position has drifted more than 50 meters; otherwise it interpolates smoothly. This creates a fluid animation from 4-second server updates without requiring 60Hz push events.
+
+During TRIP\_IN\_PROGRESS, the driver's location stream feeds a second consumer: the Fraud Detection Service. This service validates that the driver's GPS trace is consistent with a plausible road network route. Detour detection (driver is taking a longer route than the optimal path) and speed anomalies (GPS shows 300 km/h in a city) are flagged for human review. GPS spoofing detection compares the driver's phone GPS with network-based location triangulation — a significant discrepancy between the two triggers an alert.
+
+## Java integration
+
+### Part A — MatchingService.java
+
+```java
+package com.uber.dispatch.matching;
+
+import io.lettuce.core.GeoArgs;
+import io.lettuce.core.GeoWithin;
+import io.lettuce.core.api.sync.RedisCommands;
+import org.springframework.stereotype.Service;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+@Service
+public class MatchingService {
+
+    private final RedisCommands<String, String> redis;
+    private final EtaService etaService;
+    private final DriverNotificationService driverNotifier;
+
+    private static final double SEARCH_RADIUS_KM = 5.0;
+    private static final int MAX_CANDIDATES = 20;
+    private static final long OFFER_TIMEOUT_MS = 15_000;
+
+    public MatchingService(RedisCommands<String, String> redis,
+                           EtaService etaService,
+                           DriverNotificationService driverNotifier) {
+        this.redis = redis;
+        this.etaService = etaService;
+        this.driverNotifier = driverNotifier;
+    }
+
+    public Optional<String> matchDriver(String tripId, double pickupLat,
+                                        double pickupLng, String city) {
+        String geoKey = "drivers:" + city;
+        GeoArgs args = new GeoArgs()
+                .withCoordinates()
+                .sortAscending()
+                .count(MAX_CANDIDATES);
+
+        List<GeoWithin<String>> candidates =
+            redis.georadius(geoKey, pickupLng, pickupLat, SEARCH_RADIUS_KM,
+                            GeoArgs.Unit.km, args);
+
+        List<String> availableIds = candidates.stream()
+            .map(GeoWithin::getMember)
+            .filter(id -> "AVAILABLE".equals(
+                redis.hget("driver:" + id, "status")))
+            .collect(Collectors.toList());
+
+        record Candidate(String driverId, long etaSeconds) {}
+
+        List<Candidate> ranked = availableIds.stream().map(id -> {
+            double dLat = Double.parseDouble(
+                redis.hget("driver:" + id, "last_lat"));
+            double dLng = Double.parseDouble(
+                redis.hget("driver:" + id, "last_lng"));
+            long eta = etaService.getEtaCached(
+                pickupLat, pickupLng, dLat, dLng);
+            return new Candidate(id, eta);
+        }).sorted(Comparator.comparingLong(Candidate::etaSeconds))
+          .collect(Collectors.toList());
+
+        for (Candidate c : ranked) {
+            driverNotifier.offerTrip(c.driverId(), tripId);
+            String responseKey = "offer-response:" + tripId + ":" + c.driverId();
+            long deadline = System.currentTimeMillis() + OFFER_TIMEOUT_MS;
+            while (System.currentTimeMillis() < deadline) {
+                String response = redis.get(responseKey);
+                if ("ACCEPTED".equals(response)) {
+                    redis.hset("driver:" + c.driverId(), "status", "ON_TRIP");
+                    redis.hset("driver:" + c.driverId(), "current_trip_id", tripId);
+                    redis.del(responseKey);
+                    return Optional.of(c.driverId());
+                }
+                if ("DECLINED".equals(response)) {
+                    redis.del(responseKey);
+                    break;
+                }
+                try { TimeUnit.MILLISECONDS.sleep(200); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }
+        }
+        return Optional.empty();
+    }
+}
+```
+
+### Part B — TripController.java
+
+```java
+package com.uber.dispatch.api;
+
+import com.uber.dispatch.matching.MatchingService;
+import com.uber.dispatch.model.*;
+import io.lettuce.core.api.sync.RedisCommands;
+import org.springframework.http.ResponseEntity;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/v1/trips")
+public class TripController {
+
+    private final RedisCommands<String, String> redis;
+    private final TripRepository tripRepository;
+    private final KafkaTemplate<String, Object> kafka;
+    private final SurgeService surgeService;
+    private final EtaService etaService;
+
+    public TripController(RedisCommands<String, String> redis,
+                          TripRepository tripRepository,
+                          KafkaTemplate<String, Object> kafka,
+                          SurgeService surgeService,
+                          EtaService etaService) {
+        this.redis = redis; this.tripRepository = tripRepository;
+        this.kafka = kafka; this.surgeService = surgeService;
+        this.etaService = etaService;
+    }
+
+    @PostMapping
+    public ResponseEntity<TripEstimate> createTrip(@RequestBody TripRequest req) {
+        String geohash6 = Geohash.encode(req.pickupLat(), req.pickupLng(), 6);
+        double surge = surgeService.getSurge(req.cityId(), geohash6);
+        long etaSec = etaService.getEtaCached(
+            req.pickupLat(), req.pickupLng(), req.dropoffLat(), req.dropoffLng());
+        int basePrice = PriceCalculator.estimate(req, etaSec);
+        Trip trip = tripRepository.save(Trip.pending(req, surge, basePrice));
+        return ResponseEntity.status(201).body(
+            new TripEstimate(trip.id(), "PENDING", etaSec,
+                             (long)(basePrice * surge), surge));
+    }
+
+    @PostMapping("/{tripId}/confirm")
+    public ResponseEntity<Void> confirmTrip(@PathVariable String tripId) {
+        redis.hset("trip:" + tripId, "status", "SEARCHING");
+        kafka.send("find-match", tripId, new FindMatchEvent(tripId));
+        return ResponseEntity.accepted().build();
+    }
+
+    @GetMapping("/{tripId}/status")
+    public ResponseEntity<TripStatusResponse> getStatus(@PathVariable String tripId) {
+        Map<String, String> state = redis.hgetall("trip:" + tripId);
+        if (state.isEmpty()) return ResponseEntity.notFound().build();
+        return ResponseEntity.ok(TripStatusResponse.from(state));
+    }
+
+    @PostMapping("/{tripId}/complete")
+    public ResponseEntity<Void> completeTrip(@PathVariable String tripId) {
+        redis.hset("trip:" + tripId, "status", "COMPLETED");
+        kafka.send("trip-status-changed",
+            tripId, new TripStatusEvent(tripId, "TRIP_IN_PROGRESS", "COMPLETED"));
+        return ResponseEntity.ok().build();
+    }
+}
+```
+
+## Approach comparison
+
+<TradeoffTable>
+
+| Approach | Location Update Throughput | Match Latency | ETA Accuracy | Surge Granularity |
+|---|---|---|---|---|
+| **PostGIS (PostgreSQL)** | ~10K updates/s — row-level UPDATE locks contend badly at scale; not suitable for 1M+ updates/s | ~200–500ms — spatial index (GiST/BRIN) scans are disk-bound; worse under concurrent writes | High — PostGIS supports pgRouting for true road-network distance queries | Cell-level aggregation with GROUP BY + ST\_Geohash; query is slow under load |
+| **In-memory geohash grid (custom)** | ~1M+ updates/s — hash map update is O(1), no contention if sharded by geohash prefix | ~1–5ms — O(1) lookup into geohash cell + neighbor cells; no sorted query needed | Low — candidates come from fixed geohash cells, not radius; cell boundaries cause edge discontinuities | Natural — one counter per cell; O(1) read/write; refreshed every 60s easily |
+| **Redis GEORADIUS** | ~200K ops/s per node, 7 nodes for 1.25M/s — GEOADD is O(log N), no write contention across keys | ~1–5ms — sorted set range scan with early termination; COUNT 20 limit keeps scan tight | Medium — distance-ranked only; ETA requires additional routing call per candidate | Good — GEORADIUS by cell prefix + HSET surge map; O(1) surge reads; proven at Uber's scale |
+| **Redis GEORADIUS + H3 hexagonal grid** | Same Redis throughput as above; H3 adds a lookup table for cell-to-Redis-key mapping | ~1–5ms for GEORADIUS + O(1) H3 cell lookup; effectively equivalent | High — H3 cells have equal-area property eliminating polar distortion; better for edge cases near geohash boundaries | Excellent — H3 cell hierarchy (resolution 7 = ~5km² cells) allows multi-resolution surge computation; Uber's production approach |
+
+</TradeoffTable>
+
+<Pitfall>
+**Ranking driver candidates by straight-line (Haversine) distance instead of ETA.** This is the most common interview mistake and the most consequential in production. Haversine distance is O(1) per candidate and requires no external calls, making it tempting as a "fast" approach. In practice, road networks in dense urban areas are not Euclidean: bridges, highways, one-way streets, and congestion mean that the closest driver by straight-line distance can easily be the slowest driver to arrive. The fix is to add an ETA ranking step after GEORADIUS candidate retrieval: batch-call the ETA service for all candidates, sort by ETA ascending, and offer in that order. The computational cost (14K ETA calls/s at peak) is manageable with a geohash-6-keyed cache with 30-second TTL. Never skip this step in the design.
+</Pitfall>
+
+<Pitfall>
+**Storing all driver locations in a single global Redis geo sorted set.** A `GEORADIUS` query against a sorted set with 5 million members is not catastrophically slow — Redis handles large sorted sets well — but it creates a single hot-key bottleneck: all 1.25 million location writes per second and all 578 matching queries per second hit the same key. Redis is single-threaded per command; a single key serializes all operations against it. A 5M-member GEOADD at 1.25M/s leaves roughly 800ns per command on a modern Redis node — marginal. The correct partition is by city (or metropolitan area): `drivers:san_francisco`, `drivers:new_york`, etc. The routing layer maps a rider's pickup coordinates to a city using a fast in-memory point-in-polygon lookup. This distributes write load proportionally to driver density per city and eliminates the global hot key.
+</Pitfall>
+
+<Curveball>
+**"A city-wide power outage ends and 200,000 people all request Ubers simultaneously in the same 2-minute window. How do your matching service and surge pricing handle the supply-demand shock?"**
+
+This is a thundering herd on both the write path (200K trip creation requests in 120 seconds ≈ 1,667 trips/s, roughly 3× normal peak) and the surge computation path. The immediate failures to anticipate: the Trip Service's PostgreSQL write path hits connection pool exhaustion; the Matching Service's Kafka consumer group is overwhelmed with `find-match` events; the Surge Engine's 60-second cadence is too slow to react to the spike — the first surge computation after the outage ends will see demand/supply ratios of 10:1 or more in some cells.
+
+The mitigations: first, the Trip Service must implement request queuing with back-pressure — accept requests into Kafka immediately (fast write), return 202 Accepted, and process them from the queue at a sustainable rate rather than trying to synchronously insert 1,667 rows/second into PostgreSQL. Second, the Surge Engine should detect rapid demand spikes and shorten its recomputation cadence from 60s to 10s during high-volatility periods — a simple EWMA derivative trigger. Third, surge should cap the effective demand increase used in the surge formula during catastrophic events to prevent the multiplier from immediately jumping to 8×, which would cause massive demand collapse and leave drivers idle anyway. Fourth, the Matching Service's ETA cache becomes critical: under 3× normal load, cold ETA calls would overwhelm the routing service — the 30s TTL cache absorbs most of the load since many riders in the same disrupted area are requesting trips to similar destinations. Explicit shed-load circuit breakers on the ETA service prevent cascading failure.
+</Curveball>
+
+<Curveball>
+**"A driver's GPS is being spoofed — they appear at the pickup location but are actually 10km away. How do you detect GPS fraud and protect riders?"**
+
+GPS spoofing in ride-sharing typically involves a driver using a fake GPS app to appear closer to high-demand areas (farming surge multiplier, accepting trips they appear to be near) or, more seriously, faking arrival at pickup to trigger the wait-timer cancellation fee. Detection approaches operate at multiple layers. First, compare the driver's GPS-reported position with the network-based position (cell tower triangulation, WiFi positioning) reported by the operating system — a discrepancy of more than 200–300 meters is suspicious; more than 500 meters is a strong fraud signal. Second, apply a physics-based velocity filter on the location history: if a driver's GPS shows them jumping from 3km away to 0 meters away in 4 seconds (the update interval), the implied speed is 2,700 km/h — flag immediately. Third, cross-validate with accelerometer data: if the phone's GPS says the driver is stationary at the pickup but the accelerometer shows motion consistent with 50km/h travel, the GPS is spoofed. Fourth, cross-reference the accepted trip's pickup ETA (computed at match time from actual road network routing) against the actual elapsed time to DRIVER\_ARRIVED status — if a driver was 8 minutes away at match time but reports arrival in 45 seconds, investigate. On detection, the trip is flagged, the driver's account is suspended pending review, and the rider is offered a free re-match with another driver. Repeat offenders are permanently deactivated.
+</Curveball>
+
+<Curveball>
+**"Design UberPool (shared rides): two riders traveling in similar directions are matched in the same car. How does this change your matching algorithm, pricing, and trip state machine?"**
+
+UberPool is the most algorithmically complex part of Uber's product. The core change is that a driver's vehicle state is no longer binary (available vs. on\_trip) but tracks a structured itinerary: an ordered list of up to 4 waypoints (2 pickups + 2 dropoffs) with ETA to each. The matching algorithm changes fundamentally: instead of finding the nearest available driver to a single rider, Pool must find drivers whose existing itinerary can absorb a new rider with minimal detour to both the existing and new riders. This requires computing the "insertion cost" of adding the new pickup/dropoff into the driver's existing route — a vehicle routing problem (VRP) variant that is NP-hard in general but tractable for the 2-rider, 4-waypoint case via enumeration of the 3 possible insertion orderings. The pricing model changes: each rider's fare is computed as a discounted solo fare based on their pickup-to-dropoff straight-line distance, with the discount reflecting the shared cost assumption (typically 20–40% cheaper than UberX). Surge is applied to the Pool base fare independently. The trip state machine gains new states: `SECOND_RIDER_MATCHED` (Pool driver picks up first rider; second rider is already confirmed but not yet in vehicle), `FIRST_DROPOFF` (first rider exits; driver continues to second dropoff). Both riders have separate trip records in PostgreSQL; the driver has a single itinerary record linking both trip IDs. The real-time tracking complexity doubles: two riders each receive independent location streams with their own ETA to pickup and dropoff. The Matching Service must hold a distributed lock (Redis `SET NX`) on the driver's vehicle ID during the Pool matching window to prevent concurrent Pool matches from double-booking a seat.
+</Curveball>
+
+## Further reading
+
+- **Uber Engineering Blog: "Engineering Uber's Self-Serving Geofencing Platform"** — covers how Uber manages geospatial boundaries (surge zones, airport queues, city boundaries) at global scale using H3 hexagonal indexing.
+- **H3: Uber's Hexagonal Hierarchical Geospatial Indexing System** — open-source library at github.com/uber/h3; explains the equal-area hexagonal grid that underlies Uber's production geospatial infrastructure and why hexagons outperform square geohash grids for nearest-neighbor queries.
+- **Uber Engineering Blog: "Real Time Messaging at Uber"** — describes the WebSocket fleet architecture that handles driver-to-server and server-to-rider real-time communication at Uber's scale, including the move from polling to persistent connections and the impact on driver location freshness.
+- **"The Mathematics of Surge Pricing" — Uber Engineering Blog** — the original technical post describing the demand/supply model, the logarithmic surge function, and the calibration methodology Uber used to tune surge multipliers per city to balance supply incentives against demand elasticity.
+
+<RelatedQuestions items={[
+  { slug: "doordash", title: "Design DoorDash", difficulty: "senior" },
+  { slug: "airbnb", title: "Design Airbnb", difficulty: "senior" },
+  { slug: "stripe-payment-gateway", title: "Design Stripe's Payment Gateway", difficulty: "staff" },
+]} />

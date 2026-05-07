@@ -1,0 +1,601 @@
+---
+title: "Design a Vector Database"
+slug: "vector-database"
+category: "ai"
+difficulty: "staff"
+estimatedReadMinutes: 26
+tags: ["HNSW", "IVF", "ANN", "embedding", "similarity-search", "RAG", "faiss"]
+companyFlavors: ["Pinecone", "Weaviate", "Qdrant", "Chroma", "pgvector"]
+relatedQuestions: ["recommendation-engine", "ml-inference-pipeline", "search-engine"]
+publishedAt: "2025-01-07"
+updatedAt: "2025-01-07"
+summary: "Build a distributed approximate nearest neighbor search system over dense embedding vectors using HNSW indexing, support CRUD operations with immediate consistency, and scale to billions of vectors with sub-10ms query latency."
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+
+<Bookmark slug="vector-database" title="Design a Vector Database" />
+
+<Tldr>
+- **HNSW is the production standard**: Hierarchical Navigable Small World graphs deliver O(log N) query time, O(N log N) build time, and the best recall-vs-latency trade-off among all ANN algorithms — tune `M` (graph connectivity, typically 16–32) and `efSearch` (beam width, typically 64–256) to dial in the recall-latency operating point you need.
+- **Shard by collection, fan out all shards**: each shard holds a complete HNSW index for a subset of vectors; at query time the coordinator fans out to all N shards in parallel, each returns local top-K candidates, and the coordinator merges them into a global top-K — sharding is by random assignment, not by embedding space.
+- **Metadata filtering must be pre-filter, not post-filter**: evaluate metadata predicates against an inverted index first to get a candidate ID set, then constrain ANN search to that set; post-filtering after ANN search destroys recall guarantees when the filter selectivity is low.
+- **HNSW supports soft-delete only**: mark deleted vectors in a Bloom filter and exclude them during search traversal; when the deleted fraction exceeds ~20%, trigger a full index compaction that rebuilds the graph without deleted entries.
+- **Distance metric choice is non-negotiable**: cosine similarity for text embeddings (normalize vectors to unit length so cosine reduces to dot product), Euclidean (L2) for image embeddings, dot product for recommendation inner-product models — mixing metrics causes silently wrong results.
+</Tldr>
+
+Vector databases are the infrastructure layer of the LLM era. Every Retrieval-Augmented Generation (RAG) system, semantic search product, and embedding-based recommendation engine depends on finding the approximate nearest neighbors of a query vector among billions of stored vectors in under 10 milliseconds. The core challenge is that exact nearest neighbor search is O(N × D) per query — completely infeasible at scale — requiring approximate algorithms that trade a small recall loss for orders-of-magnitude latency improvement.
+
+The reason vector databases exist as a distinct product category rather than a feature bolted onto PostgreSQL or Elasticsearch is that embedding vectors have mathematical structure that traditional indexes cannot exploit. A B-tree over float32 values indexes individual dimensions in isolation, which is useless for high-dimensional similarity. An LSH (Locality-Sensitive Hashing) index approximates similarity by random projections, but degrades badly above 200 dimensions. HNSW (Hierarchical Navigable Small World) graphs were the algorithmic breakthrough that made production vector search practical: they achieve 97%+ recall at sub-millisecond latency for millions of 768-dimensional vectors on commodity hardware, and they support online insertions — a property that earlier graph-based indexes lacked.
+
+This design covers the full engineering surface: the HNSW index data structure, distributed sharding across a cluster, the write path with soft-deletes and compaction, metadata pre-filtering via inverted index, hybrid dense+sparse search, and multi-tenant namespace isolation. The reference numbers are grounded in real production data: Pinecone's public architecture posts, Faiss benchmarks from Meta, and the ANN Benchmarks suite.
+
+## Clarifying Questions
+
+Before committing to any design decision, surface the constraints that will determine the architecture:
+
+| Question | Candidate Answers | Why It Matters |
+|---|---|---|
+| What is the embedding dimension? | 128 (lightweight), 256 (efficient), 768 (BERT-base), 1536 (OpenAI Ada-002) | Memory per vector scales linearly with dimension; 1536-dim vectors consume 2× the RAM and index build time of 768-dim |
+| How many vectors total? | 10M (single machine), 100M (small cluster), 1B (large distributed cluster), 10B (very large) | Determines sharding factor — a 1B × 768-dim HNSW index requires ~3TB RAM before quantization |
+| What is the query QPS target? | 100, 1K, 10K, 100K | Drives horizontal scaling of query nodes and cache strategy |
+| What is the query latency SLA? | < 100ms (lenient), < 10ms p99 (typical production), < 1ms (real-time recommendation) | < 1ms rules out distributed fan-out; you need everything in RAM on a single node |
+| What metadata filter complexity is needed? | No filters, simple equality (category = X), range filters (price > Y), compound (A AND B OR C) | Compound filters require a more sophisticated inverted index or a full query planner |
+| What is the write volume? | Mostly static (bulk import once), low write (< 1K/s), high write (> 10K/s) | High write throughput requires a write-buffer tier to amortize HNSW insertion overhead |
+| What distance metric? | Cosine (text), L2 Euclidean (image), dot product (recommendation) | Metric is baked into the HNSW index at construction time and cannot be changed without rebuilding |
+| Multi-tenancy requirements? | Single tenant, namespace isolation (shared hardware), dedicated hardware per customer | Namespace isolation affects query routing, resource quotas, and data encryption key management |
+| What is the recall requirement? | 90%, 95%, 99% | Higher recall requires larger `efSearch` beam width, which trades away latency |
+| Is hybrid search (dense + BM25 sparse) required? | No, dense-only; yes, hybrid | Hybrid search requires a parallel sparse index (Elasticsearch or Lucene) and score fusion at query time |
+
+For this design: 1 billion vectors at 768 dimensions, 10K QPS, p99 < 10ms, Recall@10 > 95%, metadata equality and range filters, moderate write volume (< 10K upserts/sec), cosine similarity, multi-tenant namespace isolation.
+
+## Functional Requirements
+
+**Vector upsert**: insert or update a vector by ID within a named collection. Each vector carries a JSON metadata payload — arbitrary key-value pairs used for filtering. Upsert is idempotent: if the vector ID already exists, overwrite the vector values and metadata atomically.
+
+**Nearest-neighbor query**: given a query vector, return the top-K most similar vectors by distance metric. The query may include a metadata filter predicate — only vectors matching the filter participate in the ANN search. Return vector IDs, similarity scores, and optionally the metadata and raw vector values.
+
+**Vector delete by ID**: logically remove one or more vectors from a collection. Deleted vectors must not appear in query results. Physical removal from the HNSW graph is deferred to periodic compaction.
+
+**Batch import**: load millions of vectors from an external source (S3, GCS, HDFS) without hitting the online write path. A batch import job reads from the source URI, builds a bulk HNSW index offline (using Faiss IVF-PQ for efficiency), then installs the finished index into the serving tier.
+
+**Namespace / collection isolation**: each collection is an independent namespace with its own HNSW index, metadata store, distance metric, and dimension. Queries against collection A never touch collection B's index. This is the foundation for multi-tenancy.
+
+**Hybrid search**: combine dense vector similarity with sparse BM25 keyword retrieval. Run both searches in parallel, normalize scores, and combine via Reciprocal Rank Fusion (RRF) or a weighted linear sum.
+
+**Index statistics API**: expose per-collection metrics — total vector count, index size on disk, index build status, recall estimate from a held-out probe set.
+
+## Non-Functional Requirements
+
+- **Scale**: 1 billion vectors per collection, 768 dimensions, up to 10 collections in production.
+- **Query latency**: p99 < 10ms end-to-end at 10K QPS, measured from first byte of request to last byte of response.
+- **Recall**: Recall@10 > 95% — at least 9.5 of the true top-10 nearest neighbors appear in the returned results, verified by periodic ground-truth evaluation against a brute-force reference.
+- **Write latency**: vector upsert acknowledged within 100ms; the HNSW index update may be asynchronous (the vector is queryable within 500ms).
+- **Availability**: 99.99% (< 52 minutes downtime per year) achieved via replication (primary + 2 replicas per shard) and automatic failover.
+- **Durability**: zero data loss on node failure. Writes are persisted to a write-ahead log before the upsert is acknowledged.
+- **Consistency**: read-your-writes within a session. Cross-session consistency is eventual (< 500ms propagation lag to replicas).
+
+<Capacity title="Vector Database Capacity">
+
+**Raw vector storage:**
+
+$$\text{raw storage} = 1\text{B vectors} \times 768\text{ dims} \times 4\text{ B (float32)} = 3\text{ TB}$$
+
+**HNSW index overhead** — the graph edges roughly double the storage requirement. Each node stores $M = 16$ edge pointers per layer on layer 0 and $M/2$ pointers on upper layers. Empirically HNSW adds ~1.5× overhead over raw vectors:
+
+$$\text{HNSW total} \approx 3\text{ TB} \times 1.5 = 4.5\text{ TB}$$
+
+**Memory per vector in HNSW:**
+
+$$\text{memory per vector (HNSW)} = D \times 4\text{B} + M \times 4\text{B} \approx 768 \times 4 + 16 \times 4 = 3.1\text{ KB}$$
+
+where $D$ is the embedding dimension and $M$ is the HNSW graph connectivity parameter (default 16).
+
+**With int8 scalar quantization** — compress each float32 (4 bytes) to int8 (1 byte) with a per-dimension calibration table:
+
+$$\text{quantized vector} = 768\text{ B per vector} \Rightarrow 768\text{ GB raw}$$
+$$\text{with HNSW overhead} \approx 768\text{ GB} \times 1.5 = 1.15\text{ TB total}$$
+
+At 1.15 TB total index size and 80 GB RAM per server (high-memory EC2 r6i.2xlarge): $\lceil 1150 / 80 \rceil = 15$ servers to hold the full index in RAM.
+
+**Query throughput:** HNSW search over 768-dim vectors with $\text{efSearch} = 64$ takes approximately 2ms per query on a single modern CPU core (from Faiss benchmarks). This gives:
+
+$$\text{QPS per core} = \frac{1000\text{ ms}}{2\text{ ms}} = 500\text{ QPS/core}$$
+
+$$\text{cores for }10\text{K QPS} = \frac{10{,}000}{500} = 20\text{ cores} \Rightarrow 5\text{ query servers} \times 4\text{ dedicated search cores}$$
+
+**Index build time** for 1B vectors — HNSW insertion is $O(\log N \times M)$ per vector. At $N = 10^9$, $\log_2(N) \approx 30$ steps, and 1 µs per step:
+
+$$\text{build time} = 10^9 \times 30 \times 1\text{ µs} = 30 \times 10^6\text{ s} \div 3600 \approx 8.3\text{ hours (single-threaded)}$$
+
+In practice, use Faiss IVF-PQ for offline batch builds (parallelizes across CPUs) and reserve HNSW for online incremental updates.
+
+**Network fan-out cost per query** at N = 20 shards, each returning top-50 candidates:
+
+$$\text{merge candidates} = 20 \times 50 = 1{,}000 \text{ vectors per query}$$
+$$\text{merge payload} = 1{,}000 \times (8\text{ B ID} + 4\text{ B score}) = 12\text{ KB per query}$$
+
+At 10K QPS: $10{,}000 \times 12\text{ KB} = 120\text{ MB/s}$ coordinator ingress — well within network capacity.
+
+</Capacity>
+
+## API Design
+
+```text
+Upsert:
+POST /api/v1/collections/{collectionId}/vectors
+  body: { vectors: [{ id, values: [float], metadata: {} }] }
+  → { upserted: N }
+
+Query:
+POST /api/v1/collections/{collectionId}/query
+  body: { vector: [float], topK: 10, filter: { category: "sports" },
+          includeMetadata: true, includeValues: false }
+  → { matches: [{ id, score, metadata }] }
+
+Delete:
+DELETE /api/v1/collections/{collectionId}/vectors
+  body: { ids: [str] }
+  → { deleted: N }
+
+Fetch by ID:
+GET /api/v1/collections/{collectionId}/vectors/{id}
+  → { id, values, metadata }
+
+Batch import:
+POST /api/v1/collections/{collectionId}/import
+  body: { sourceUri: "s3://..." }
+  → { jobId }
+
+Check import status:
+GET /api/v1/collections/{collectionId}/import/{jobId}
+  → { status: "running|complete|failed", vectorsLoaded, totalVectors }
+
+Collection stats:
+GET /api/v1/collections/{collectionId}/stats
+  → { vectorCount, indexSizeBytes, dimensionality, metric, recallEstimate }
+```
+
+The API is REST over HTTPS. Vector arrays are sent as JSON float arrays in the request body. For bulk upsert performance, the API accepts up to 1,000 vectors per batch request and uses HTTP/2 multiplexing to amortize connection overhead. Query requests use POST (not GET) because the request body can exceed URL length limits for high-dimensional vectors.
+
+Authentication is via API key passed in the `Authorization: Bearer <key>` header. Rate limiting is enforced at the router tier on a per-collection basis with configurable QPS quotas — this is the primary resource isolation mechanism for multi-tenant deployments.
+
+## Data Model
+
+Relational metadata (stored in PostgreSQL):
+
+```sql
+CREATE TABLE collections (
+    collection_id   UUID PRIMARY KEY,
+    name            VARCHAR(200) UNIQUE NOT NULL,
+    dimension       INT NOT NULL,
+    metric          VARCHAR(20) NOT NULL,   -- cosine, euclidean, dot_product
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE vector_metadata (
+    collection_id   UUID NOT NULL,
+    vector_id       VARCHAR(200) NOT NULL,
+    metadata        JSONB NOT NULL,
+    is_deleted      BOOLEAN DEFAULT false,
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (collection_id, vector_id)
+);
+
+CREATE TABLE shard_assignments (
+    collection_id   UUID NOT NULL,
+    shard_id        INT NOT NULL,
+    node_id         VARCHAR(100) NOT NULL,
+    vector_count    BIGINT DEFAULT 0,
+    PRIMARY KEY (collection_id, shard_id)
+);
+```
+
+On-disk layout per shard (binary files, not relational):
+
+```text
+/data/shards/{shardId}/
+  hnsw.index     — HNSW graph structure (binary, mmap'd into RAM)
+  vectors.bin    — raw float32 vectors (mmap'd, 768 × 4 bytes per vector)
+  metadata.lmdb  — vector_id → JSON metadata (LMDB B-tree key-value)
+  deleted.bloom  — Bloom filter of soft-deleted vector IDs
+  wal.log        — write-ahead log for crash recovery
+```
+
+The HNSW index file and vectors.bin are memory-mapped. This means the OS page cache backs the index — on a cold start, the kernel pages in the index incrementally as queries arrive rather than loading 80 GB upfront. A warmup job pre-touches the full index on startup to avoid cold-start latency spikes.
+
+LMDB (Lightning Memory-Mapped Database) is chosen for metadata because it provides ACID transactions, supports cursor-based range scans (needed for range filter pre-computation), and has zero copy overhead for reads — the data is returned as a pointer into the mmap'd file rather than a buffer copy.
+
+## Architecture
+
+<Mermaid diagram={`flowchart TD
+    Client([Client])
+    Router[API Router\nconsistent hash by collectionId]
+    Auth[Auth & Rate\nLimit Service]
+    WriteQueue[Write Queue\nKafka]
+    Coordinator[Query Coordinator\nfan-out + merge]
+    MetaStore[(Metadata Store\nPostgreSQL + inverted index)]
+
+    Shard0[Shard Node 0\nHNSW index]
+    Shard1[Shard Node 1\nHNSW index]
+    ShardN[Shard Node N\nHNSW index]
+
+    BatchImport[Batch Import Worker\nFaiss IVF-PQ offline build]
+    S3[(Object Store\nS3 / GCS)]
+
+    Client -->|HTTPS| Auth
+    Auth --> Router
+    Router -->|write path| WriteQueue
+    WriteQueue -->|async| Shard0
+    WriteQueue -->|async| Shard1
+    WriteQueue -->|async| ShardN
+
+    Router -->|query path| Coordinator
+    Coordinator -->|metadata pre-filter| MetaStore
+    MetaStore -->|allowed ID set| Coordinator
+    Coordinator -->|parallel ANN fan-out| Shard0
+    Coordinator -->|parallel ANN fan-out| Shard1
+    Coordinator -->|parallel ANN fan-out| ShardN
+    Shard0 -->|local top-K| Coordinator
+    Shard1 -->|local top-K| Coordinator
+    ShardN -->|local top-K| Coordinator
+    Coordinator -->|global top-K| Client
+
+    S3 --> BatchImport
+    BatchImport -->|install finished index| Shard0
+    BatchImport -->|install finished index| Shard1
+`} />
+
+**Read path**: A query request arrives at the API Router, which authenticates the API key, enforces rate limits, and routes the request to the Query Coordinator responsible for the target collection. If a metadata filter is present, the Coordinator consults the Metadata Store to pre-compute the set of allowed vector IDs. The Coordinator then fans out the ANN search to all N shards in parallel, passing the allowed ID set as a constraint. Each shard performs HNSW search within its local index and returns its local top-K. The Coordinator merges all results by score and returns the global top-K to the client.
+
+**Write path**: An upsert request arrives at the Router and is published to a Kafka partition keyed by `(collection_id, vector_id % num_shards)`. The shard node consumes from Kafka, updates the HNSW index (online insertion), writes metadata to LMDB, and appends an entry to the write-ahead log. The upsert is acknowledged when the WAL write completes — the HNSW insertion happens inline but could be deferred to a background thread for higher write throughput.
+
+## Deep Dive: HNSW Index
+
+HNSW (Hierarchical Navigable Small World) builds a multi-layer proximity graph where each layer is a progressively coarser navigable small world graph:
+
+**Layer structure:**
+- **Layer 0 (bottom)**: contains all N vectors. Each node is connected to its M nearest neighbors (M is the `M` parameter, typically 16–32). The graph has the small-world property: diameter is O(log N), so you can navigate between any two nodes in O(log N) hops.
+- **Layer 1**: contains a random ~1/e fraction (~37%) of vectors. Same connectivity structure but fewer nodes — enables long-range jumps.
+- **Layer L (top)**: contains ~1/e^L of total vectors. Typically 4–6 layers for 1M vectors, 6–8 layers for 1B vectors.
+
+**Query algorithm:**
+1. Enter the graph at the single entry point node on the top layer.
+2. Greedily traverse to whichever neighbor is closer to the query vector (by the configured distance metric).
+3. When no neighbor is closer than the current node (local minimum), descend to the next layer and continue from the same node.
+4. On layer 0, switch from greedy search to beam search: maintain a priority queue of `efSearch` candidates, expand the best unexplored candidate, add its neighbors to the queue, repeat until the queue is exhausted.
+5. Return the top-K nodes by distance from the priority queue.
+
+The beam search on layer 0 is where recall is won or lost. A larger `efSearch` explores more of the graph, finds more true nearest neighbors, but takes longer. The recall-latency curve is convex — there are diminishing returns to increasing `efSearch` beyond ~256.
+
+**Key parameters and their trade-offs:**
+
+- `M` (graph connectivity, default 16): higher M means more edges per node → better recall (more paths to explore), more memory (M × 4 bytes per node per layer), slower build (more edges to insert). For 768-dim text embeddings, M=16 is a good default; for very high-recall requirements, try M=32.
+- `efConstruction` (beam width during index build, default 200): higher → better index quality (edges connect to truly nearest neighbors) → slower build. Does not affect query performance directly, only index quality.
+- `efSearch` (beam width during query, default 64): the primary runtime lever. At efSearch=64, a 768-dim 1M-vector HNSW index achieves ~97% Recall@10 at ~1ms latency. At efSearch=256, recall rises to ~99.5% at ~4ms. Choose based on your SLA.
+
+**Layer 0 memory layout** — vectors.bin stores raw float32 vectors in row-major layout. The HNSW graph adjacency lists are stored separately in hnsw.index, which contains for each node its integer ID and a sorted list of neighbor integer IDs. Integer IDs are mapped to vector IDs via a compact int→string dictionary persisted to LMDB. This separation allows SIMD-optimized distance computation against vectors.bin while the graph traversal operates on integer adjacency lists — a cache-friendly layout that is the key to HNSW's performance.
+
+**Recall degradation under distribution shift**: HNSW was built by inserting vectors in their original distribution. If your embedding model changes (new model, fine-tuning), the distribution shifts and the graph structure no longer reflects nearest-neighbor relationships under the new metric. The index must be fully rebuilt — there is no incremental fix for model updates.
+
+## Deep Dive: Metadata Filtering
+
+Metadata filtering is the most commonly misunderstood part of vector database design. The naive approach — run ANN search first, then discard results that don't match the filter — has a subtle but catastrophic failure mode.
+
+**Why post-filtering fails:**
+
+Suppose 5% of your 1B vectors have `category = "sports"`. You want the top-10 nearest neighbors among sports vectors. ANN search returns its approximate top-K from the full index. To get 10 results that pass the 5% selectivity filter, you need to retrieve ~200 candidates. But HNSW's recall guarantee is relative to the full index — it guarantees 95% recall over the top-200 from all 1B vectors, not from the filtered 50M sports vectors. The 10 true nearest sports neighbors may not be in HNSW's top-200 overall. Empirically, Recall@10 drops to 30–50% under this post-filtering pattern with low-selectivity filters. The problem worsens as filter selectivity decreases.
+
+**Correct approach — pre-filtering with inverted index:**
+
+1. Evaluate the metadata filter against an inverted index to retrieve the set of matching vector IDs.
+2. Pass this allowed ID set as a constraint to the HNSW search — only traverse graph nodes whose integer ID maps to an allowed vector ID.
+3. For hnswlib, this is implemented via a custom filter function passed to `knn_query` that returns True/False per candidate node.
+
+The challenge is that HNSW traversal skips disallowed nodes, which can create "dead ends" in the graph where the search terminates prematurely. With very small allowed sets (< 1,000 matching vectors), HNSW traversal becomes inefficient — the graph was built for the full distribution, not for sparse subsets.
+
+**Adaptive strategy by filter selectivity:**
+
+- **Large result set (> 10% of index)**: use constrained HNSW traversal. Recall is high because the allowed set is dense in the graph.
+- **Medium result set (1K–10% of index)**: use constrained HNSW with a larger `efSearch` multiplier to compensate for graph sparsity.
+- **Small result set (< 1K matching IDs)**: abandon HNSW entirely and do brute-force L2/cosine search over the filtered ID set. At < 1K vectors, brute force is < 1ms even for 768 dimensions.
+
+**Per-filter sub-indexes (advanced, high-traffic deployment):**
+
+For a small number of highly-selective filters with predictable query patterns (e.g., `tenant_id = X` in a multi-tenant deployment), maintain a separate HNSW index per tenant. Query routing sends `tenant_id = X` queries directly to the X sub-index, which has perfect recall without any filtering overhead. Trade-off: if there are 1,000 tenants, there are 1,000 indexes — storage cost is 1,000× and index management complexity scales accordingly. This only makes sense when tenant data is large enough to warrant a dedicated index (> 1M vectors per tenant).
+
+## Deep Dive: Write Path and Index Updates
+
+HNSW insertion is online — adding a single vector to an existing index takes O(log N × M) time, the same asymptotic cost as a single step of the build process. For a 1B-vector index with M=16, inserting one vector takes ~500µs on a modern CPU. At 10K upserts/sec, 20 cores handle the write load comfortably in parallel across 20 shards (each shard receives ~500 upserts/sec).
+
+**The deletion problem:**
+
+HNSW does not support efficient deletion. Deleting a node requires re-wiring all its neighbors' adjacency lists to maintain graph connectivity — this is an O(M²) operation per deletion and can create disconnected graph components if not done carefully. Production systems universally use soft delete instead.
+
+**Soft delete + Bloom filter:**
+1. On delete request, add the vector ID to a Bloom filter (`deleted.bloom`) and set `is_deleted = true` in LMDB.
+2. During HNSW search traversal, after collecting a candidate node, check the Bloom filter. If the ID is a probable member of the deleted set, verify against LMDB (to handle the small false-positive rate of Bloom filters). Skip deleted IDs.
+3. The HNSW graph still traverses deleted nodes as routing waypoints — they participate in graph navigation but are never returned as results. This is an acceptable overhead as long as the deleted fraction is small.
+
+**Compaction:**
+
+When the deleted fraction exceeds ~20% of the index, the dead nodes create traversal overhead and waste memory. Trigger a compaction:
+1. Snapshot all non-deleted vectors from LMDB.
+2. Build a new HNSW index from scratch (offline, using a background worker).
+3. Atomically swap the new index file for the old one (rename at the OS level — this is atomic on all POSIX filesystems).
+4. Clear the Bloom filter and update the WAL.
+
+Compaction takes 8+ hours for a 1B-vector index on a single node. During compaction, the shard continues serving reads from the old index and writes to the new WAL — the new index is built against the WAL-augmented snapshot. This is the same "shadow index build" technique used by Lucene for segment merges.
+
+**Two-tier write buffer for high write throughput:**
+
+For workloads with > 50K upserts/sec per shard, inline HNSW insertion cannot keep up. Use a two-tier design:
+- **Write buffer (L1)**: a small in-memory HNSW index (up to 100K vectors) that receives all new upserts. Insertions into 100K-vector HNSW are ~10µs — very fast.
+- **Main index (L2)**: the large HNSW index serving most queries.
+- At query time, search both L1 and L2 in parallel and merge results.
+- When L1 reaches 100K vectors, merge it into L2: build a new L2 index that includes all L1 vectors, then atomically swap.
+
+This pattern mirrors RocksDB's MemTable + SSTable architecture and Lucene's in-memory segment + on-disk segment architecture — both solve the same fundamental tension between write throughput and read-optimized data structures.
+
+## Deep Dive: Distributed Sharding
+
+A single HNSW index over 1B × 768-dim vectors at 3.1 KB per vector requires 3.1 TB of RAM — far beyond what a single machine can provide (maximum practical RAM in a single server is ~1–2 TB). Sharding across multiple nodes is mandatory.
+
+**Sharding strategy:**
+
+Vectors are assigned to shards randomly (round-robin or by hashing the vector ID modulo N). This is deliberately **not** by proximity in embedding space. You might think clustering nearby vectors on the same shard would improve locality, but for ANN it doesn't help: the query touches all shards regardless, because the nearest neighbors of a query vector might live on any shard — you don't know which shard holds the true nearest neighbors until you search all of them.
+
+Random sharding has three advantages: uniform load distribution (no hotspots), simple assignment logic (no clustering algorithm needed), and predictable per-shard index quality (each shard sees a representative sample of the full distribution, which produces better HNSW graph structure than clustering would).
+
+**Query execution across shards:**
+
+1. The Query Coordinator receives the query vector and metadata filter.
+2. Pre-filter step (optional): the Coordinator queries the Metadata Store for the allowed ID set and distributes the set to shards. For large allowed sets (> 1M IDs), this is impractical — instead, each shard applies the filter locally against its own LMDB.
+3. Fan-out: the Coordinator sends the query to all N shards simultaneously using async RPC (gRPC async stubs or Futures). Each shard performs its local HNSW search and returns top-K candidates (typically 2K to compensate for merge loss).
+4. Merge: the Coordinator collects results from all shards and maintains a min-heap of size K. It processes each shard's results in score order, inserting into the heap. Final output is the K entries remaining in the heap.
+
+**Tail latency and the straggler problem:**
+
+End-to-end latency equals the slowest shard's latency (since all shards must respond before the merge can produce a global top-K). At N=20 shards each at 2ms median with 5ms p99, the composite p99 is approximately:
+
+$$P(\text{any of 20 shards} > 5\text{ms}) = 1 - (1 - 0.01)^{20} \approx 18\%$$
+
+This is unacceptable — 18% of queries would miss the 5ms shard target. Mitigations:
+
+- **Hedged requests**: after sending to all shards, if any shard has not responded within 1× the median latency, send a second request to a replica of that shard. Cancel the slower request when either responds. This adds ~10% extra load but dramatically reduces tail latency.
+- **Replica-based timeout**: assign 2 replicas per shard. Fan-out goes to all replicas; merge uses the first response from each shard's replica pair.
+- **Approximate fan-out**: send to a random 80% of shards. Since vectors are randomly distributed, missing 20% of shards causes ~20% recall degradation — acceptable if your recall budget allows. This is a last resort for extreme latency requirements.
+
+**Replication:**
+
+Each shard has a primary node and 2 replica nodes. The primary serves writes (via Kafka consumer group — the primary is the group leader for its partition). Replicas receive index updates via replication log. Reads are served from both primary and replicas (read replicas), with round-robin load balancing. On primary failure, the Raft consensus algorithm among the shard's three nodes elects a new primary from the replicas within ~500ms.
+
+## Python Integration: VectorShard
+
+```python
+import numpy as np
+import hnswlib
+import lmdb
+import json
+from typing import List, Dict, Optional, Tuple
+
+class VectorShard:
+    def __init__(self, shard_id: int, dimension: int,
+                 max_elements: int, metric: str = "cosine"):
+        self.shard_id = shard_id
+        self.dim = dimension
+        self.metric = "cosine" if metric == "cosine" else "l2"
+        self.index = hnswlib.Index(space=self.metric, dim=dimension)
+        self.index.init_index(max_elements=max_elements, ef_construction=200, M=16)
+        self.index.set_ef(64)
+        self.id_to_int: Dict[str, int] = {}
+        self.int_to_id: Dict[int, str] = {}
+        self.deleted: set = set()
+        self._next_int = 0
+
+    def upsert(self, vector_id: str, vector: List[float], metadata: dict):
+        vec = np.array(vector, dtype=np.float32)
+        if self.metric == "cosine":
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+
+        if vector_id in self.id_to_int:
+            int_id = self.id_to_int[vector_id]
+            self.deleted.discard(vector_id)
+        else:
+            int_id = self._next_int
+            self._next_int += 1
+            self.id_to_int[vector_id] = int_id
+            self.int_to_id[int_id] = vector_id
+
+        self.index.add_items(vec.reshape(1, -1), [int_id])
+
+    def search(self, query: List[float], top_k: int,
+               allowed_ids: Optional[set] = None) -> List[Tuple[str, float]]:
+        q = np.array(query, dtype=np.float32)
+        if self.metric == "cosine":
+            norm = np.linalg.norm(q)
+            if norm > 0:
+                q = q / norm
+
+        fetch_k = top_k * 10 if allowed_ids else top_k
+        fetch_k = min(fetch_k, self.index.get_current_count())
+        if fetch_k == 0:
+            return []
+
+        labels, distances = self.index.knn_query(q.reshape(1, -1), k=fetch_k)
+        results = []
+        for label, dist in zip(labels[0], distances[0]):
+            vid = self.int_to_id.get(label)
+            if vid is None or vid in self.deleted:
+                continue
+            if allowed_ids is not None and vid not in allowed_ids:
+                continue
+            score = 1.0 - dist if self.metric == "cosine" else -dist
+            results.append((vid, float(score)))
+            if len(results) >= top_k:
+                break
+        return results
+
+    def delete(self, vector_id: str):
+        self.deleted.add(vector_id)
+```
+
+## Python Integration: QueryCoordinator
+
+```python
+import asyncio
+import heapq
+from typing import List, Dict, Any
+
+class QueryCoordinator:
+    def __init__(self, shards: List[VectorShard], metadata_store):
+        self.shards = shards
+        self.metadata = metadata_store
+
+    async def query(self, collection_id: str, query_vector: List[float],
+                    top_k: int, filter_expr: Optional[dict] = None,
+                    include_metadata: bool = True) -> List[Dict[str, Any]]:
+        allowed_ids = None
+        if filter_expr:
+            allowed_ids = await self.metadata.filter(collection_id, filter_expr)
+            if len(allowed_ids) == 0:
+                return []
+
+        tasks = [
+            asyncio.get_event_loop().run_in_executor(
+                None, shard.search, query_vector, top_k * 2, allowed_ids
+            )
+            for shard in self.shards
+        ]
+        shard_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        merged = []
+        for result in shard_results:
+            if isinstance(result, Exception):
+                continue
+            merged.extend(result)
+
+        merged.sort(key=lambda x: x[1], reverse=True)
+        top_results = merged[:top_k]
+
+        if not include_metadata:
+            return [{"id": vid, "score": score} for vid, score in top_results]
+
+        meta_batch = await self.metadata.batch_get(
+            collection_id, [vid for vid, _ in top_results])
+        return [
+            {"id": vid, "score": score, "metadata": meta_batch.get(vid, {})}
+            for vid, score in top_results
+        ]
+```
+
+<TradeoffTable title="ANN Index Algorithm Comparison">
+
+| Index | Query Latency | Recall | Build Time | Memory | Update Support | Best Use Case |
+|---|---|---|---|---|---|---|
+| **Flat (brute force)** | O(N × D) — very slow at scale | 100% (exact) | None | D × 4B per vector (no overhead) | No updates needed | Ground-truth evaluation, < 100K vectors, recall benchmark baseline |
+| **IVF-PQ (Faiss)** | Fast — ~0.5ms at 1M vectors | 90–95% tunable | Hours for large N | 0.5–1× raw (PQ compression) | Rebuild required | Offline batch serving, read-heavy, extreme memory constraint |
+| **HNSW** | Very fast — ~1ms at 1M vectors | 95–99% tunable | O(N log N), ~8h for 1B | 1.5–2× raw | Online insertions; soft-delete only | Production ANN serving — best recall/latency/update trade-off |
+| **Annoy** | Fast for low dims | 90–95% | Fast (tree build) | 1–2× raw | Rebuild required — read-only indexes | Mobile / embedded, low-latency approximate, static datasets |
+
+</TradeoffTable>
+
+<Pitfall title="Post-filtering ANN results destroys recall guarantees">
+
+ANN search returns approximate results even without any filtering. When you apply a metadata filter **after** ANN search, you are filtering an already-approximate candidate set — and the approximation error compounds with the filter selectivity.
+
+Consider: 5% of vectors match your filter and you want top-10 results. To get 10 results that pass the filter, you need ~200 ANN candidates. But HNSW's 95% recall guarantee applies to the top-200 among all 1B vectors — not to the top-200 among the 50M matching vectors. The 10 true nearest neighbors within the filtered set may rank 300th or 500th in the global order. Empirically, Recall@10 drops to 30–40% under this pattern when filter selectivity is 5% or lower.
+
+The correct solution is **pre-filtering**: evaluate the metadata filter against an inverted index to get the allowed ID set, then pass that set as a constraint to HNSW search. For result sets smaller than ~1,000 vectors, skip HNSW entirely and do brute-force search over the filtered IDs — it is faster and has 100% recall.
+
+</Pitfall>
+
+<Pitfall title="Cosine similarity requires normalized vectors; forgetting to normalize causes silently wrong results">
+
+Cosine similarity is defined as $\cos(\theta) = \frac{\mathbf{a} \cdot \mathbf{b}}{|\mathbf{a}||\mathbf{b}|}$. When vectors are pre-normalized to unit length ($|\mathbf{v}| = 1$), cosine similarity reduces to the dot product $\mathbf{a} \cdot \mathbf{b}$ — which is what HNSW libraries with `space="cosine"` actually store and compute internally (they normalize during `add_items`).
+
+The trap: if you insert vectors that are already normalized into an hnswlib cosine-space index, hnswlib normalizes them again (to no effect — idempotent). But if you query with an unnormalized query vector, the library normalizes the query automatically. However, if your index is `space="l2"` but you intended cosine similarity, or if you bypass the library's normalization and store raw vectors expecting cosine behavior, you get wrong results with no error or warning.
+
+The safe pattern: normalize explicitly before every upsert and every query, regardless of what the library promises to do internally. One line: `vec = vec / np.linalg.norm(vec)`. A bug in normalization produces results that look plausible (still a ranked list of similar-seeming vectors) but are subtly wrong — a particularly dangerous failure mode because it won't trigger any alert.
+
+</Pitfall>
+
+<Curveball title="How do you handle adding a new embedding model with a different dimension (e.g., 1536 instead of 768)?">
+
+You cannot reuse the existing index. HNSW indexes are built for a fixed dimension, and different embedding models produce vectors in incompatible vector spaces — even two 768-dim models will have different geometry and nearest-neighbor relationships because they were trained differently. A new model requires a new collection.
+
+The migration plan:
+
+**Phase 1 — Parallel build.** Create a new collection configured for 1536 dimensions. Launch a large-scale batch re-embedding job: pull every document from your document store, compute the new embedding using the new model, and upsert into the new collection. At 100M documents and 100ms per embedding call (batched GPU inference), this requires: $10^8 \times 0.1\text{s} = 10^7\text{ s}$ of compute. With 100 parallel inference workers, wall-clock time is 100,000 seconds (~28 hours). Budget accordingly — this is a significant compute cost.
+
+**Phase 2 — Shadow mode validation.** For one week, route every production query to both the old collection and the new collection. Compare Recall@10 (measured against your ground-truth evaluation set), MRR (Mean Reciprocal Rank) on click-through logs, and end-user satisfaction metrics. If the new model underperforms, abort the migration without any user impact.
+
+**Phase 3 — Traffic cutover.** Shift query traffic from old collection to new collection using feature flags — start at 1% of traffic, ramp to 10%, 50%, 100% over several days. Monitor error rates, latency, and recall metrics at each step.
+
+**Phase 4 — Decommission.** Once 100% of traffic is on the new collection and no rollback events have occurred in 2 weeks, delete the old collection and reclaim the storage.
+
+The key architectural enabler is that collection names are abstracted behind an alias in the router — the application code references the alias `"text-embeddings-prod"`, and the router resolves it to the current collection. Cutover is a metadata update on the alias, not a code deployment.
+
+</Curveball>
+
+<Curveball title="Your RAG application needs exact phrase matching alongside semantic similarity. How do you implement hybrid search?">
+
+Semantic similarity (dense vector ANN) and exact keyword matching (sparse BM25) capture different aspects of relevance. A query for "HNSW paper Malkov 2018" should return the exact paper, not just documents about graph-based ANN in general. Pure dense search misses this. Pure BM25 misses paraphrased content. Hybrid search combines both.
+
+**Architecture:**
+
+Run two indexes in parallel — the HNSW vector index (dense) and an inverted index with BM25 scoring (sparse, implemented via Elasticsearch or a native Lucene integration like Tantivy). At query time:
+
+1. Encode the query text into a dense embedding using the model (e.g., OpenAI Ada-002, sentence-transformers).
+2. In parallel: (a) run HNSW ANN search over dense embeddings; (b) run BM25 keyword search over the document text.
+3. Collect dense results (top-100) and sparse results (top-100).
+4. Fuse the two ranked lists using Reciprocal Rank Fusion (RRF):
+
+$$\text{RRF score}(d) = \sum_{r \in \{dense, sparse\}} \frac{1}{k + \text{rank}_r(d)}$$
+
+where $k = 60$ is the RRF smoothing constant. RRF is more robust than linear score combination because it is rank-based — it doesn't assume the two score distributions are on the same scale (dense scores are cosine similarities in [0,1]; BM25 scores are log-frequency weighted and unbounded).
+
+5. Re-rank the fused top-K using a cross-encoder reranker (a fine-tuned BERT model that scores query-document pairs) to get final ranked results. Cross-encoder reranking is expensive (~50ms per document), so it's applied only to the top 20–50 candidates from the fused list.
+
+**Typical parameter**: $\alpha = 0.7$ dense weight, $0.3$ sparse weight if using weighted linear combination instead of RRF. For knowledge-base RAG, dense-heavy is appropriate. For e-commerce product search with exact SKU matching, go sparse-heavy.
+
+</Curveball>
+
+<Curveball title="You need to serve 100 enterprise customers in a shared vector database cluster. How do you isolate them?">
+
+Multi-tenancy in a vector database requires balancing three competing concerns: strong isolation (one customer's queries must not degrade another's), cost efficiency (dedicated hardware per customer is expensive), and operational simplicity (you don't want 100 separate clusters to manage).
+
+**Namespace isolation as the baseline.** Every collection belongs to a tenant namespace. The router validates that the API key associated with a request is authorized for the requested namespace. Query fan-out is filtered to shards that hold data for the target namespace. Metadata is partitioned by `tenant_id` in LMDB and PostgreSQL.
+
+**Three-tier deployment model by customer size:**
+
+**Tier 1 — Shared pool (small customers, < 1M vectors each).** Multiple tenants share shard nodes. Resource isolation is enforced via quotas at the router: each namespace has a configured QPS limit and a maximum concurrent query budget. The shard nodes themselves use Linux cgroups to cap CPU usage per tenant thread pool. Data is logically isolated (queries only touch the allowed namespace) but physically co-located.
+
+**Tier 2 — Dedicated shard group (mid-size customers, 1M–100M vectors).** The customer's data is assigned to a dedicated group of shard nodes that no other tenant uses. The Query Coordinator routes all their queries to this shard group. They still share the router and coordinator tier with other customers, but the search compute is isolated.
+
+**Tier 3 — Dedicated cluster (enterprise, > 100M vectors or strict data residency requirements).** The customer gets their own namespace namespace of shard nodes, their own Kafka partitions, their own metadata database partition with row-level security, and their own KMS key for at-rest encryption. Provisioned as a dedicated Kubernetes namespace with network policies preventing cross-tenant traffic.
+
+**Cross-tenant data leakage prevention**: in addition to API-key authorization, every shard node validates that the `collection_id` in a query request belongs to the authenticated tenant before executing the search. This defense-in-depth means a bug in the router's routing logic cannot expose one tenant's data to another — the shard itself enforces the access check.
+
+**Resource quotas as the primary isolation mechanism in shared tiers**: QPS limits, max concurrent queries, and max vectors per namespace are enforced at the router and monitored by a separate quota service. When a tenant exceeds their QPS budget, requests are rate-limited with a 429 response rather than degrading the shared pool for other tenants.
+
+</Curveball>
+
+## Further Reading
+
+The foundational algorithm underlying all modern vector databases is described in Malkov and Yashunin's 2018 paper "Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs" (IEEE TPAMI). Meta's Faiss library — available on GitHub — is the reference implementation for IVF-PQ, the algorithm of choice for offline batch index builds at billion-scale, and its benchmarks are the de facto standard for comparing ANN performance. Pinecone's engineering blog has published detailed posts on their distributed architecture, including how they handle namespace isolation and the write-buffer merge strategy described in this article. For users who want vector search without a dedicated vector database, the `pgvector` PostgreSQL extension adds a native HNSW and IVF-Flat index type directly to PostgreSQL — an excellent starting point for < 10M vectors. Weaviate's documentation on hybrid search covers their implementation of BM25+vector fusion using their proprietary `hybrid` operator. For algorithmic comparison across dozens of ANN methods, the ANN Benchmarks project at ann-benchmarks.com provides reproducible benchmarks on standardized datasets including SIFT-1M, GIST-1M, and Deep-1B — an essential resource for choosing the right algorithm for a given dimension and dataset size.
+
+<RelatedQuestions items={[
+  { slug: "recommendation-engine", title: "Design a Recommendation Engine", difficulty: "staff" },
+  { slug: "ml-inference-pipeline", title: "Design an ML Model Serving Infrastructure", difficulty: "staff" },
+  { slug: "search-engine", title: "Design a Search Engine", difficulty: "staff" },
+]} />

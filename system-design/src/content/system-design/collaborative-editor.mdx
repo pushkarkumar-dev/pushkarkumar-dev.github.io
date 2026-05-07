@@ -1,0 +1,563 @@
+---
+title: "Design a Real-Time Collaborative Editor"
+slug: "collaborative-editor"
+category: "realtime"
+difficulty: "staff"
+estimatedReadMinutes: 28
+tags: ["OT", "CRDT", "operational-transformation", "conflict-resolution", "websocket", "kafka", "redis"]
+companyFlavors: ["Google Docs", "Notion", "Figma", "Quip", "Dropbox Paper"]
+relatedQuestions: ["multiplayer-game-backend", "live-sports-scores", "slack"]
+publishedAt: "2025-01-07"
+updatedAt: "2025-01-07"
+summary: "Implement conflict-free concurrent editing with Operational Transformation or CRDTs, maintain causal consistency across all collaborators, persist document history, and fan-out changes in real-time to all active editors."
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="collaborative-editor" title="Design a Real-Time Collaborative Editor" />
+
+<Tldr>
+- **OT vs CRDT**: Google Docs uses Operational Transformation with a central server as the serialization point; Figma and Notion use CRDTs that allow peer-to-peer merge without a coordination bottleneck.
+- **Revision numbers are mandatory in OT**: every client operation must carry the revision number at which the client last synchronized; the server transforms the operation against all missed revisions before applying it.
+- **A per-document lock is not optional**: OT's correctness proof requires that the server applies operations in a strict total order — without a lock or single-threaded actor, two concurrent operations can corrupt the revision sequence.
+- **Revision log is append-only**: the durable record of every applied operation enables full edit history, undo/redo, and crash recovery; snapshot compaction every 500 operations keeps storage bounded.
+- **Fan-out via WebSocket with Kafka relay**: clients maintain a persistent WebSocket for sub-100ms delivery; Kafka decouples the write path from fan-out so multiple WebSocket server nodes can receive transformed operations without tight coupling.
+</Tldr>
+
+A collaborative editor is one of the hardest problems in distributed systems — it requires solving the CAP theorem for the user experience. Users demand that their keystrokes appear instantly (availability over consistency) yet expect the document to converge to the same state for everyone (eventual consistency). The gap between these two requirements is bridged by either Operational Transformation or Conflict-free Replicated Data Types. Both techniques are deep enough that entire PhD dissertations have been written on each one, yet in a system design interview the question is less about proving correctness theorems and more about understanding the trade-offs, picking an approach, and designing the surrounding infrastructure that makes it production-viable at scale.
+
+## Clarifying questions
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| What document types must be supported? | Rich text (like Google Docs), plain text/code (like VS Code Live Share), or structured blocks (like Notion pages with headings, tables, callouts) | Each type has a different operation model. Rich text must handle formatting ranges (bold, italic, links); structured block documents have a tree rather than a linear sequence; code editors care about line-level operations. OT for rich text is well-understood but complex; CRDTs are more natural for tree-shaped documents. |
+| How many concurrent editors per document? | Up to 100 technically; realistic business case is 3–10; consumer apps like Google Docs see spikes to 50+ during live collaboration sessions | Directly affects whether a per-document in-memory lock is feasible (yes, for &lt;100), whether fan-out is O(N) trivial (yes), and whether presence state fits in a single Redis hash (yes). |
+| Do we need offline editing support? | Yes — mobile clients may lose connectivity; the system must buffer local operations and replay them on reconnect | Offline support is the key differentiator between OT (limited offline — the server must validate and transform before accepting) and CRDTs (excellent offline — peers merge without a server). Determines whether to use a pessimistic or optimistic client architecture. |
+| What is the undo/redo granularity? | Per-keystroke undo within a session is table-stakes; cross-session history ("revert to yesterday's version") is a separate product feature backed by the revision log | Per-session undo can use an in-memory client-side buffer. Cross-session undo requires replaying from snapshots and is non-trivial with concurrent editors — who is undoing what? |
+| How deep is the version history? | 30 days for standard; infinite for premium plans (like Google Workspace Business) | Drives the compaction and cold-tiering strategy. 30-day TTL allows aggressive log compaction; infinite history requires S3-backed archival with a snapshot manifest. |
+| What is the maximum document size? | 1 MB of plain text (roughly 500 pages) is a safe upper bound; very large documents (>5 MB) are a special case | Determines whether the document can be loaded into memory on the server for in-process OT transformation, or whether chunking/pagination of the document into independent OT contexts is required. |
+| Is cursor/selection presence required? | Yes — showing where other editors are looking is a core UX feature of all modern collaborative editors | Presence is an ephemeral side-channel, not part of the revision log. Implementation choices: Redis Pub/Sub per document, or piggyback on the WebSocket fan-out path. Cursor positions must also be transformed when operations shift text positions. |
+| What is the access control model? | Owner can grant editor or viewer roles; viewers cannot send operations; editors can edit but not share | Access control decisions happen at the WebSocket upgrade and per-message level; permission checks must be fast (Redis-cached), not PostgreSQL queries on every keystroke. |
+
+## Functional requirements
+
+- Multiple users can edit the same document simultaneously with perceived latency under 200ms — keystrokes appear immediately on the local client (optimistic local application) and propagate to all other editors after server reconciliation.
+- Concurrent edits by different users must be merged without data loss — the final document state must be the same for every collaborator regardless of the order in which their network packets arrive at the server.
+- Full edit history with per-session undo/redo and cross-session version history; users can browse past revisions and restore any previous state.
+- Cursor and selection presence: all active editors see each other's cursor position and selection range in real time, color-coded by user.
+- Offline editing: a client that loses connectivity continues editing locally, buffers operations, and replays them against the server on reconnect; if the server's log has been compacted past the client's last revision, the client receives the latest snapshot and discards its buffer.
+- Document access control with owner, editor, and viewer roles; role changes take effect immediately for connected sessions.
+- Export to PDF and DOCX from the latest snapshot (an asynchronous job, not part of the real-time path).
+
+## Non-functional requirements
+
+- **Scale**: 10 million total documents; 100,000 concurrently active documents (at least one connected editor); up to 100 simultaneous editors per document.
+- **Latency**: operation fan-out to other editors within 100ms at p99; local optimistic application is instant (no network round-trip perceived by the typing user).
+- **Consistency**: eventual consistency — all clients converge to the same document state after all in-flight operations are applied and acknowledged.
+- **Durability**: no acknowledged operation is ever lost; the revision log is written to PostgreSQL with synchronous commits before the server acknowledgement is sent to the client.
+- **History retention**: revision log retained for 30 days on standard plans; snapshot manifests for older history on premium plans archived to S3.
+
+<Capacity title="Collaborative Editor Capacity">
+
+**WebSocket connections**
+
+$100{,}000 \text{ active docs} \times 5 \text{ avg editors} = 500{,}000 \text{ concurrent WebSocket connections}$
+
+This is modest. A single WebSocket server node handles 50,000–100,000 connections; the fleet needs 5–10 nodes with headroom for spikes.
+
+**Operation throughput**
+
+Average keystroke rate per active editor: 5 keystrokes/second (touch-typing peak; average including pauses is closer to 2).
+
+$5 \text{ keys/s} \times 500{,}000 \text{ editors} = 2{,}500{,}000 \text{ ops/s at peak}$
+
+Each operation serializes to approximately 100 bytes (type, position, character, clientId, docId, revision number as a JSON envelope).
+
+Inbound write bandwidth: $2{,}500{,}000 \times 100 \text{ B} = 250 \text{ MB/s}$
+
+**Fan-out**
+
+Each operation must reach an average of 4 other editors (5 editors per doc minus the sender):
+
+$2{,}500{,}000 \text{ ops/s} \times 4 \text{ recipients} = 10{,}000{,}000 \text{ outbound messages/s}$
+
+At 100 bytes per message: $10{,}000{,}000 \times 100 \text{ B} = 1 \text{ GB/s outbound}$ — distributed across the WebSocket fleet, this is roughly 100–200 MB/s per node.
+
+**Revision log storage**
+
+Average editing session: 1,000 operations per hour × 8 active hours per document-day × 100 bytes per operation:
+
+$$\text{storage per doc-day} = 5 \text{ editors} \times 1000 \text{ ops/hr} \times 8\text{hr} \times 100\text{B} \approx 4\text{ MB/document/day}$$
+
+With 100,000 active documents: $4 \text{ MB} \times 100{,}000 = 400 \text{ GB/day}$ of new revision log data.
+
+With 10M total documents at steady state over 30 days with TTL compaction:
+
+$$10{,}000{,}000 \text{ docs} \times 4 \text{ MB/day} \times 30 \text{ days} \approx 1.2 \text{ PB}$$
+
+This is before compaction. In practice, most documents are not edited every day. Active documents (1% of total) drive 99% of writes. After snapshot compaction (storing one snapshot per 500 operations instead of all 500 individual operations), the revision log shrinks by roughly 10–20x. Realistic storage after compaction and with a 30-day TTL: **40–120 TB** for the hot revision log, with older revisions tiered to S3.
+
+</Capacity>
+
+## API design
+
+```text
+WebSocket: wss://docs.com/ws/doc/{docId}
+
+  Client → Server:
+    OperationMessage {
+      type:       "op",
+      clientId:   UUID,
+      revision:   long,        -- last revision the client has seen
+      ops:        [Op]         -- one or more operations to apply
+    }
+
+    PresenceMessage {
+      type:       "presence",
+      clientId:   UUID,
+      cursor:     { position: int, anchorPosition: int }
+    }
+
+  Server → Client (acknowledgement):
+    AckMessage {
+      type:       "ack",
+      revision:   long,        -- new server revision after applying this op
+      serverOps:  [Op]?        -- server-transformed version of the ops, if transformed
+    }
+
+  Server → Client (broadcast to other editors):
+    OpBroadcast {
+      type:           "op",
+      fromClientId:   UUID,
+      revision:       long,
+      ops:            [Op]
+    }
+
+  Server → All Clients in document:
+    PresenceUpdate {
+      type:    "presence",
+      cursors: [{ clientId: UUID, position: int, anchorPosition: int, color: string }]
+    }
+```
+
+```text
+REST API:
+
+GET  /api/v1/docs/{docId}
+     → 200 { snapshot: DocumentJSON, revision: long }
+     Fetches the latest compacted snapshot plus its revision number.
+     On reconnect or fresh load, clients use this to initialize local state.
+
+GET  /api/v1/docs/{docId}/history?from={revision}&to={revision}
+     → 200 { revisions: [{ revision, clientId, op, appliedAt }] }
+     Returns the revision log between two revision numbers.
+     Used for UI history timeline and for replaying missed operations on reconnect.
+
+POST /api/v1/docs
+     Body: { title: string, initialContent: DocumentJSON }
+     → 201 { docId: UUID, revision: 0 }
+
+PUT  /api/v1/docs/{docId}/snapshot
+     Admin endpoint to force a snapshot at the current revision.
+     → 204
+
+GET  /api/v1/docs/{docId}/collaborators
+     → 200 { active: [{ userId, role, cursorPosition }], permissions: [{ userId, role }] }
+```
+
+## Data model
+
+```sql
+CREATE TABLE documents (
+    doc_id           UUID PRIMARY KEY,
+    title            VARCHAR(500) NOT NULL,
+    owner_id         UUID NOT NULL,
+    content_snapshot JSONB,
+    snapshot_rev     BIGINT NOT NULL DEFAULT 0,
+    created_at       TIMESTAMPTZ DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE doc_revisions (
+    doc_id      UUID NOT NULL,
+    revision    BIGINT NOT NULL,
+    client_id   UUID NOT NULL,
+    operation   JSONB NOT NULL,
+    applied_at  TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (doc_id, revision)
+);
+
+CREATE TABLE doc_permissions (
+    doc_id  UUID NOT NULL,
+    user_id UUID NOT NULL,
+    role    VARCHAR(20) NOT NULL,
+    PRIMARY KEY (doc_id, user_id)
+);
+
+CREATE INDEX ON doc_revisions (doc_id, applied_at)
+    WHERE applied_at > NOW() - INTERVAL '30 days';
+```
+
+The `doc_revisions` table is the heart of the system. The composite primary key `(doc_id, revision)` makes the range query `WHERE doc_id = ? AND revision BETWEEN ? AND ?` a narrow index scan. The partial index on `applied_at` supports efficient TTL-based cleanup of revisions older than 30 days without scanning the full table.
+
+Redis session state tracks live document state so the OT transform service can read the current revision without a PostgreSQL round-trip on every keystroke:
+
+```text
+HASH doc:{docId}:session
+  revision          → "1045"
+  editorCount       → "3"
+  lastSnapshotRev   → "1000"
+
+SET doc:{docId}:editors
+  → { clientId_1, clientId_2, clientId_3 }
+  TTL: none — managed by connect/disconnect events
+
+STRING doc:{docId}:lock
+  → clientId (of the operation currently being applied)
+  TTL: 5 seconds — safety valve against lock leaks
+```
+
+The Redis lock key `doc:{docId}:lock` is the per-document serialization mechanism that OT correctness requires. It is held only during the transform-and-write critical section (typically &lt;5ms) and released immediately after the revision is persisted. A 5-second TTL prevents lock leaks if the transform service crashes mid-operation.
+
+## Architecture diagram
+
+<Mermaid diagram={`flowchart TD
+    A[Browser Client A] -->|WebSocket OperationMessage revision=50| B[WebSocket Server 1]
+    C[Browser Client B] -->|WebSocket OperationMessage revision=50| D[WebSocket Server 2]
+    B -->|applyClientOp docId clientRevision op| E[OT Transform Service]
+    D -->|applyClientOp docId clientRevision op| E
+    E -->|SETNX doc:id:lock| F[Redis Cluster]
+    E -->|HGET doc:id:session revision| F
+    E -->|SELECT ops WHERE revision BETWEEN 51 AND 55| G[PostgreSQL Revision Log]
+    E -->|INSERT revision 56 transformedOp| G
+    E -->|HSET doc:id:session revision 56| F
+    E -->|Produce key=docId| H[Kafka doc-ops topic]
+    H -->|Consumer group ws-fanout| B
+    H -->|Consumer group ws-fanout| D
+    B -->|OpBroadcast revision=56 to Client B| C
+    D -->|OpBroadcast revision=56 to Client A| A
+    subgraph Reconnect Flow
+    I[Offline Client C] -->|GET /api/v1/docs/id snapshot| J[REST API]
+    J -->|SELECT content_snapshot snapshot_rev| G
+    I -->|WebSocket OperationMessage with buffered ops| B
+    end
+    subgraph Presence Flow
+    A -->|PresenceMessage cursor=42| B
+    B -->|PUBLISH doc:id:presence cursor event| F
+    F -->|SUB doc:id:presence| D
+    D -->|PresenceUpdate to Client B| C
+    end`} />
+
+**Online editing flow (step by step)**
+
+1. Client A types a character. The client immediately applies the operation locally (optimistic rendering) and sends an `OperationMessage` with `revision=50` — the last revision the client has seen — over its WebSocket connection to WebSocket Server 1.
+2. WebSocket Server 1 forwards the request to the OT Transform Service (a stateless microservice, callable via gRPC or internal HTTP).
+3. The OT Transform Service acquires the per-document Redis lock (`SETNX doc:{docId}:lock`). If the lock is held (another operation is being processed for this document), the service retries briefly or returns a `ConcurrentEditException` prompting the client to retry after a backoff.
+4. The service reads the current server revision from Redis (`HGET doc:{docId}:session revision`) — say it is 55. Client A's operation was based on revision 50, so the service fetches revisions 51–55 from PostgreSQL.
+5. The service transforms Client A's operation against each of the 5 missed operations using the OT transform function. The result is a transformed operation that is semantically equivalent to what Client A intended but adjusted for the concurrent changes made by others.
+6. The transformed operation is written to PostgreSQL as revision 56. The Redis session hash is updated atomically to `revision=56`. The lock is released.
+7. The transformed operation is published to the Kafka topic `doc-ops` with the document ID as the partition key.
+8. Both WebSocket servers (1 and 2) are Kafka consumers in the `ws-fanout` consumer group. Each receives the event from Kafka. Server 1 sends an `AckMessage` with `revision=56` to Client A (the sender). Server 2 broadcasts an `OpBroadcast` with `revision=56` to Client B (the other editor).
+9. Client B receives the broadcast, applies the operation to its local document, and updates its revision pointer to 56. Client B also transforms any pending local operations against the received operation before retransmitting them.
+
+**Reconnect/offline sync flow**
+
+When a client reconnects after being offline, it calls `GET /api/v1/docs/{docId}` to retrieve the latest snapshot and its `snapshot_rev`. The client then opens a WebSocket and checks whether the gap between its last known revision and the `snapshot_rev` is small enough to replay (the server still has those revision log entries). If yes, the client replays missed operations and then resumes normally. If the gap is too large (log compacted), the client discards its local offline buffer and initializes from the fresh snapshot.
+
+## Deep dive: Operational Transformation
+
+OT requires transforming concurrent operations so that applying them in any order produces the same result — the convergence property. For linear text documents, the operation set is simple:
+
+```text
+Op types:
+  Insert(position, text)
+  Delete(position, length)
+  Retain(length)        -- Quill/Delta format: skip N characters unchanged
+```
+
+The transformation function `transform(opA, opB) → opA'` takes an operation `opA` (what this client wants to do) and a concurrent operation `opB` (what was applied to the server while `opA` was in flight) and returns `opA'` — a version of `opA` adjusted to apply correctly after `opB`.
+
+```text
+Example:
+  Document at revision 5: "Hello World"
+
+  User A (from revision 5): Insert(5, ",")  → intends "Hello, World"
+  User B (from revision 5): Delete(6, 5)    → intends "Hello" (removes " World")
+
+  Server receives A first (revision 6 = "Hello, World"):
+    Transform B against A:
+      B was Delete(6, 5). A inserted 1 char at position 5, shifting everything after.
+      New B' = Delete(7, 5) → applies to "Hello, World" → "Hello,"
+
+  Server receives B first (revision 6 = "Hello"):
+    Transform A against B:
+      A was Insert(5, ","). B deleted positions 6–10, which are after position 5.
+      A's position 5 is not affected. A' = Insert(5, ",") → applies to "Hello" → "Hello,"
+
+  Both orderings converge to "Hello," ✓
+```
+
+This example illustrates the critical property: the transformation must account for how one operation shifts the positions that subsequent operations reference. The full set of cases — Insert-after-Insert, Insert-after-Delete, Delete-after-Insert, Delete-after-Delete, each with overlapping and non-overlapping ranges — must all be handled correctly. Missing any case leads to document divergence that is extremely difficult to debug in production.
+
+**Google Docs' OT approach: the server as the single serialization point.**
+
+Every client maintains a local revision counter tracking the last server revision it has seen. When the client sends an operation, it includes this revision number. The server's job is:
+
+1. Acquire the per-document lock.
+2. Read the current server revision R_server from Redis.
+3. If the client's revision R_client < R_server, fetch all operations between R_client+1 and R_server from PostgreSQL.
+4. Iteratively transform the client's operation against each of those missed operations.
+5. Apply the final transformed operation as revision R_server+1.
+6. Persist to PostgreSQL, update Redis, release the lock.
+7. Broadcast the transformed operation + new revision to all other editors.
+
+Each receiving client applies the broadcast operation and increments its local revision. Any pending locally-applied-but-not-yet-acknowledged operations on the receiving client must be re-transformed against the broadcast operation — because the client already applied those pending ops optimistically and now needs to reconcile them with the server's ordering. This client-side "rebase" is the mirror of the server-side transform, and it is what allows optimistic local application without waiting for a server round-trip.
+
+**Rich text formatting complicates OT significantly.** Plain text Insert/Delete operations are manageable. Rich text adds formatting operations: `Format(start, end, attribute, value)` — e.g., making characters 5–20 bold. Two users applying overlapping format operations (one applies Bold, another applies Italic to the same range) must produce a result where both formats are applied. Extending OT to handle Format operations requires additional transformation rules for every combination of Insert × Format, Delete × Format, and Format × Format, multiplying the implementation complexity.
+
+**Quill's Delta format** is one practical solution: it represents both content and formatting as a sequence of `insert`, `delete`, and `retain` operations, where each `insert` carries inline attributes. This unified representation simplifies the transform function because formatting is embedded in the character stream rather than being a separate attribute layer.
+
+## Deep dive: CRDTs as an alternative
+
+CRDTs (Conflict-free Replicated Data Types) eliminate the need for a central server for conflict resolution by making the merge function itself conflict-free: commutative, associative, and idempotent. Any two replicas that have seen the same set of operations will converge to the same state, regardless of delivery order.
+
+For text documents, the standard CRDTs are:
+
+**RGA (Replicated Growable Array)** — assigns each character a unique identifier `(clientId, localCounter)`. Characters are ordered first by insertion time (logical clock), with ties broken by `clientId`. Every insert specifies the character after which the new character is inserted. The RGA merge is straightforward: each client maintains the full sequence of characters including deleted ones (marked as tombstones), and any two clients seeing the same operations will produce the same sequence. Deletion is non-destructive in the CRDT sense — deleted characters become tombstones, ensuring idempotent merge.
+
+**LSEQ (Logarithmic Sequence)** — allocates position identifiers between two neighboring characters using a variable-length bit string. The allocation strategy (random, boundary+, or boundary−) is chosen per level of the identifier tree to minimize identifier growth as the document evolves. LSEQ avoids the tombstone accumulation of RGA at the cost of more complex identifier allocation.
+
+**Y.js** is the dominant open-source CRDT library for collaborative editing. It uses a variant of YATA (Yet Another Transformation Approach) which is O(N) in the number of concurrent inserts at the same position — rare in practice. Y.js is used in production by dozens of editors including Quill, Monaco (VS Code's text engine), and Notion's early architecture.
+
+**Automerge** takes a different approach: it models the document as a JSON tree where each value at each path is a CRDT, supporting rich structured documents (not just linear text). Automerge is better suited for Notion-style block documents than for continuous text editing.
+
+Trade-offs vs OT:
+
+- CRDTs allow true peer-to-peer sync without a server — beneficial for offline-first apps where the server may be unavailable for hours or days.
+- CRDTs carry higher per-operation metadata overhead. Each character in RGA has a unique ID (typically 16–32 bytes of overhead per character) versus OT's 10-byte position integer. For a 100,000-character document, RGA metadata adds 1.6–3.2 MB.
+- OT is simpler to implement correctly for linear text; CRDTs are more natural for tree-structured documents where insert/delete positions are already node references rather than integer offsets.
+- CRDTs handle tombstones permanently: deleted characters remain in the logical sequence. Garbage collecting tombstones requires a distributed consensus on "every peer has seen this deletion," which is non-trivial without a coordinating server.
+- Figma uses a custom CRDT for its scene graph — each layer is a node in a tree, each property is a last-write-wins register. This maps naturally to CRDT semantics because concurrent edits to different properties of the same layer merge cleanly.
+
+## Deep dive: presence (cursor sharing)
+
+Cursor positions are ephemeral — they change on every keystroke and have no durable value. Persisting them in the revision log would pollute undo history and bloat storage. The correct architecture treats presence as a best-effort side channel:
+
+1. Each client sends a `PresenceMessage` on every cursor move, throttled to one update per 100ms using a debounce.
+2. The WebSocket server publishes the presence event to a Redis Pub/Sub channel keyed by document ID: `PUBLISH doc:{docId}:presence {json}`.
+3. All WebSocket servers with connections to that document are subscribed to `doc:{docId}:presence`. They receive the publish and forward the cursor update to their locally connected editors via the WebSocket.
+4. Cursor positions must be transformed when OT operations shift text. If Client A's cursor is at position 50 and Client B inserts 3 characters at position 30, Client A's cursor should move to position 53. The same position-transform logic used in OT is applied to cursor coordinates.
+
+**Cursor cleanup:** when a client WebSocket disconnects, the server publishes a `PresenceLeft` event with the disconnecting `clientId`. Recipients remove that cursor from their local presence state. A heartbeat safety net handles dirty disconnects: if no presence update is received for 30 seconds, the cursor is automatically removed from the display. The WebSocket server can enforce this with a per-editor TTL tracked in Redis (`SETEX presence:{docId}:{clientId} 30 "active"`) and a keyspace notification listener that fires the cleanup event on TTL expiry.
+
+**Presence does not belong in the revision log.** This point deserves emphasis: a common mistake is to store cursor position as a special operation type in `doc_revisions`. This means replaying the history of a document also replays every cursor movement — thousands of irrelevant events per minute of editing. Presence state belongs exclusively in Redis with TTL-based eviction.
+
+## Deep dive: snapshots and history
+
+Storing every revision forever is expensive (the capacity section showed 40–120 TB for the hot log at scale). The compaction strategy:
+
+**Snapshot creation**: after every 500 operations applied to a document, a background job reads the last snapshot and the 500 new operations from PostgreSQL, applies them in order to produce a new snapshot, and writes the new snapshot to the `documents.content_snapshot` JSONB column along with the new `snapshot_rev`. The old operations between the previous snapshot and the new one are eligible for archival or deletion.
+
+**Archival to cold storage**: operations older than the current snapshot but within the 30-day history window are moved from PostgreSQL to S3 as gzip-compressed NDJSON files (one file per document per day). The REST history endpoint checks PostgreSQL first for recent revisions and falls back to S3 for older ones.
+
+**Undo/redo within a session**: the WebSocket client maintains an in-memory operation buffer of all operations applied during the current session. Undo pops the most recent operation from the buffer and sends its inverse (Insert becomes Delete at the same position, Delete becomes Insert with the saved text). The inverse operation goes through the normal OT pipeline — it carries a revision number and is transformed at the server just like any other operation.
+
+**Cross-session undo (version history)**: restoring a document to a previous state is treated as a new set of operations that transform the current document into the target state. The server computes the diff between the current snapshot and the target historical snapshot, expresses it as a sequence of operations, and applies them in one batch. This approach preserves all intermediate history rather than overwriting it.
+
+The snapshot format for rich text is a Prosemirror document JSON: a tree of nodes where each node has a type, optional attributes, and an array of children or inline marks. For Notion-style block documents, the snapshot is the full block tree serialized as JSONB.
+
+## Java integration — Part A: OperationTransformService.java
+
+```java
+@Service
+@RequiredArgsConstructor
+public class OperationTransformService {
+
+    private final RevisionRepository revisionRepo;
+    private final KafkaTemplate<String, DocOpEvent> kafka;
+    private final StringRedisTemplate redis;
+
+    public AppliedOp applyClientOp(String docId, UUID clientId,
+                                    long clientRevision, Operation clientOp) {
+        String lockKey = "doc:%s:lock".formatted(docId);
+        Boolean locked = redis.opsForValue()
+            .setIfAbsent(lockKey, clientId.toString(), Duration.ofSeconds(5));
+        if (Boolean.FALSE.equals(locked)) {
+            throw new ConcurrentEditException("Retry: op in flight for " + docId);
+        }
+        try {
+            long serverRevision = getCurrentRevision(docId);
+            Operation transformedOp = clientOp;
+            if (clientRevision < serverRevision) {
+                List<DocRevision> missed = revisionRepo.findByDocIdAndRevisionBetween(
+                    docId, clientRevision + 1, serverRevision);
+                for (DocRevision past : missed) {
+                    transformedOp = transform(transformedOp, past.getOperation());
+                }
+            }
+            long newRevision = serverRevision + 1;
+            revisionRepo.save(DocRevision.builder()
+                .docId(docId).revision(newRevision).clientId(clientId)
+                .operation(transformedOp).appliedAt(Instant.now()).build());
+            redis.opsForHash().put("doc:%s:session".formatted(docId),
+                "revision", String.valueOf(newRevision));
+            kafka.send("doc-ops", docId,
+                DocOpEvent.of(docId, clientId, newRevision, transformedOp));
+            return new AppliedOp(transformedOp, newRevision);
+        } finally {
+            redis.delete(lockKey);
+        }
+    }
+
+    private Operation transform(Operation incoming, Operation concurrent) {
+        if (incoming instanceof InsertOp ins && concurrent instanceof InsertOp cIns) {
+            if (cIns.getPosition() <= ins.getPosition()) {
+                return new InsertOp(ins.getPosition() + cIns.getText().length(), ins.getText());
+            }
+        } else if (incoming instanceof InsertOp ins && concurrent instanceof DeleteOp cDel) {
+            if (cDel.getPosition() < ins.getPosition()) {
+                return new InsertOp(
+                    Math.max(cDel.getPosition(), ins.getPosition() - cDel.getLength()),
+                    ins.getText());
+            }
+        }
+        return incoming;
+    }
+
+    private long getCurrentRevision(String docId) {
+        Object rev = redis.opsForHash().get("doc:%s:session".formatted(docId), "revision");
+        return rev != null ? Long.parseLong(rev.toString()) : 0L;
+    }
+}
+```
+
+## Java integration — Part B: DocWebSocketHandler.java
+
+```java
+@Component
+@RequiredArgsConstructor
+public class DocWebSocketHandler extends TextWebSocketHandler {
+
+    private final OperationTransformService otService;
+    private final ObjectMapper mapper;
+    private final ConcurrentHashMap<String, Set<WebSocketSession>> docSessions = new ConcurrentHashMap<>();
+
+    @Override
+    public void afterConnectionEstablished(WebSocketSession session) {
+        docSessions.computeIfAbsent(extractDocId(session),
+            k -> ConcurrentHashMap.newKeySet()).add(session);
+    }
+
+    @Override
+    protected void handleTextMessage(WebSocketSession session, TextMessage message)
+        throws Exception {
+        OperationMessage msg = mapper.readValue(message.getPayload(), OperationMessage.class);
+        String docId = extractDocId(session);
+        AppliedOp result = otService.applyClientOp(
+            docId, msg.getClientId(), msg.getRevision(), msg.getOp());
+        session.sendMessage(new TextMessage(mapper.writeValueAsString(
+            Map.of("type", "ack", "revision", result.getRevision()))));
+        String broadcast = mapper.writeValueAsString(Map.of(
+            "type", "op", "fromClientId", msg.getClientId(),
+            "revision", result.getRevision(), "op", result.getOp()));
+        for (WebSocketSession peer : docSessions.getOrDefault(docId, Set.of())) {
+            if (peer.isOpen() && !peer.getId().equals(session.getId()))
+                peer.sendMessage(new TextMessage(broadcast));
+        }
+    }
+
+    @Override
+    public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
+        docSessions.values().forEach(s -> s.remove(session));
+    }
+    private String extractDocId(WebSocketSession session) {
+        return session.getUri().getPath().replaceAll(".*/doc/", "");
+    }
+}
+```
+
+Note that `DocWebSocketHandler` handles the local fan-out (to clients on the same WebSocket server node). The Kafka consumer, running in the same service, handles fan-out from operations that arrived at a different node — when another WebSocket server publishes to Kafka, this server's Kafka consumer receives the broadcast and calls a similar loop over `docSessions` to push to locally connected peers. This two-path design (direct local push + Kafka cross-node fan-out) ensures every editor receives every operation regardless of which WebSocket server they are connected to.
+
+<TradeoffTable title="OT vs CRDT vs Lock-Based Approaches">
+
+| Approach | Conflict Resolution | Offline Support | Metadata Overhead | Complexity | Used By |
+|---|---|---|---|---|---|
+| Lock-based (pessimistic) | Serialized — only one editor writes at a time; others block | None — clients cannot edit while offline since no lock can be acquired | Zero — no extra metadata per operation | Low — no transform function needed; simple last-write-wins on commit | Google Sheets cells (cell-level locking); older collaborative tools |
+| Operational Transformation | Central server required — server serializes operations, transforms against missed revisions, broadcasts transformed ops | Limited — client can buffer local ops offline but must replay and transform on reconnect; server must still have the revision log entries | Low — ~10–20 bytes per operation (position, type, character) | High — correct transform function for all op-pair combinations is subtle; rich text multiplies the cases | Google Docs, Quill (via ShareDB), Apache Wave |
+| CRDT (RGA/LSEQ) | Peer-to-peer — merge function is commutative and associative; no server coordination required | Excellent — peers can edit independently for arbitrarily long periods and merge cleanly on reconnect | High — ~30–64 bytes per character for unique IDs, logical clocks, tombstones | Medium — merge function is simpler than OT transform, but tombstone GC and ID allocation require careful design | Figma (custom CRDT for scene graph), Y.js (used in Notion, Jupyter), Automerge |
+| CRDT + server (hybrid) | Server assists convergence by acting as a relay and ordering hub, but merge remains CRDT-based | Good — clients sync to server on reconnect; long offline periods handled by CRDT merge semantics | Medium — server stores CRDT state (slightly larger than raw document) but clients don't need full character ID maps locally | Medium — server simplifies tombstone GC and ordering but adds a coordination dependency | Notion (Y.js with server relay), Linear (similar hybrid) |
+
+</TradeoffTable>
+
+<Pitfall title="Implementing OT without a server-side serialization lock">
+A critically common mistake when implementing OT is relying on database transactions alone instead of a per-document application-level lock. OT's correctness proof requires that the server applies operations in a strict total order: no two operations can be in the "transform against missed revisions, then write" critical section simultaneously for the same document.
+
+Without an explicit lock (or an equivalent — a per-document actor/goroutine, a single-threaded event loop per document), consider what happens when two operations arrive concurrently both claiming `clientRevision=50`. Both read the current server revision as 50 from Redis. Both find no missed operations to transform against. Both write revision 51 to PostgreSQL — but PostgreSQL's primary key constraint `(doc_id, revision)` makes one of them fail with a duplicate key error, and the other succeeds. The client whose operation was rejected must retry, but by then revision 51 belongs to someone else and the retry logic must handle the failure gracefully. More insidiously, if the revision column does not have a unique constraint and both writes succeed, the revision log has two conflicting entries at revision 51 and the document is permanently diverged with no automatic recovery path.
+
+The Redis `SETNX` lock (or a Redlock distributed lock for multi-node Redis) is the correct solution. It is held for &lt;5ms in the common case (the transform and PostgreSQL write are both fast), so contention is negligible for typical document edit rates. The 5-second TTL prevents deadlocks if the transform service crashes mid-operation — after 5 seconds, the next operation attempt will re-acquire the lock and succeed.
+</Pitfall>
+
+<Pitfall title="Storing cursor positions in the document revision log">
+Presence data — cursor positions, selection ranges, user colors — is tempting to store in the revision log alongside content operations. It seems elegant: all document state lives in one place, and replaying the revision log reconstructs the complete collaborative session. In practice, this is a significant mistake for two reasons.
+
+First, cursors move on every keystroke. An active editing session generates one cursor update per 100ms per editor, or 36,000 cursor events per editor per hour. With 5 editors working for 8 hours, that is 1.44 million cursor rows per document-day — dwarfing the 40,000 content operations in the same period. These cursor rows bloat the revision log by 36x, consume PostgreSQL write capacity, and slow down the already-expensive "fetch missed revisions for transform" query on every operation.
+
+Second, cursor positions pollute the undo history. When a user triggers "undo," the system should reverse content operations — not cursor moves. If cursors are in the revision log, the transform service must skip over presence operations when computing the transform sequence, adding special-case logic throughout. The clean separation is absolute: presence state lives in Redis with a 30-second TTL, expiring naturally when editors disconnect or go idle. Content operations live in the durable PostgreSQL revision log. These two concerns must never share a storage layer.
+</Pitfall>
+
+<Curveball title="How do you handle a user who was offline for 3 days reopening a shared document?">
+This question tests whether the candidate understands the limits of the revision log and has thought through the failure mode.
+
+On reconnect, the client sends its last known revision number — say, revision 800. The server checks whether its revision log still contains entries back to revision 800. If the document's `snapshot_rev` in the `documents` table is 1,200 and the revision log starts at revision 1,001 (everything before 1,001 was compacted into the snapshot at revision 1,000 and then the log was trimmed), the server cannot replay operations 801–1,000 — they no longer exist in the hot log.
+
+In this case the server responds with the current snapshot (revision 1,200) and informs the client that its offline buffer cannot be replayed. The client must discard its local buffer of operations composed during the offline period and initialize from the fresh snapshot at revision 1,200.
+
+The offline operations the user typed during those 3 days are lost from the document's perspective. The client should inform the user: "Your offline changes could not be applied because the document was edited heavily while you were offline. Your changes have been preserved in a separate recovery draft — would you like to paste them as a new edit?" This is the honest UX representation of the fundamental offline-first trade-off: OT cannot merge arbitrarily old offline changes when the revision log has been compacted.
+
+For applications that must handle multi-day offline periods gracefully (field workers, mobile apps in low-connectivity regions), this is one of the key reasons to prefer a CRDT approach over OT — CRDTs can merge changes from any time in the past without needing the full operation history, because the merge is based on logical timestamps and unique character identifiers rather than position-relative transforms that depend on the full sequence of intervening operations.
+</Curveball>
+
+<Curveball title="Google Docs performance degrades on very large documents (>1M characters). How would you address this?">
+This is a real problem that Google Docs users encounter with long-lived documents like team wikis, meeting notes compiled over years, or book manuscripts. The root cause is that OT's transform function is O(N) in the number of missed revisions, and for a 1M-character document that has accumulated 500,000 revisions, even a modestly-behind client triggers expensive transform operations.
+
+The solution is to paginate the document into independent chunks — each chunk is a self-contained OT context with its own revision counter. Think of it as sharding the document horizontally. Operations within a chunk go through that chunk's revision log and transform function in isolation. A chunk might correspond to a top-level section (heading + all content until the next heading), or a fixed-size block (every 10,000 characters is one chunk).
+
+The benefits: each chunk's revision log is 1/100th the size of the full document's log, making transform operations fast. The OT lock is per-chunk rather than per-document, so two users editing different sections do not contend for the same lock. Chunks can be independently snapshotted and compacted.
+
+The cost: operations that span chunk boundaries (like a delete that crosses a section boundary, or a "find and replace all" across the whole document) require coordinating across chunk boundaries. For deletions, the client sends a delete operation to each affected chunk independently; the server applies them in sequence. For search-and-replace, the operation is decomposed into per-chunk operations. This is analogous to how relational databases handle cross-shard transactions — you sacrifice cross-chunk atomicity for horizontal scalability. For most editing workflows this trade-off is acceptable because users rarely compose multi-megabyte cross-section operations in a single keypress.
+
+The chunk boundaries must be stable (not re-computed on every edit) to avoid the complexity of operations being applied to a chunk that no longer exists. Chunk identity is assigned at creation time (a UUID per chunk), and the document structure is a separate metadata layer mapping section headings to chunk IDs.
+</Curveball>
+
+<Curveball title="The interviewer asks about supporting collaborative editing in a structured document (spreadsheet cells, not linear text).">
+Spreadsheet cells have a natural addressing scheme — `(row, column)` coordinates — that transforms the conflict problem significantly compared to linear text. Two users editing different cells never conflict. Two users editing the same cell simultaneously is the only real conflict case, and it is rare in practice because users can see each other's cursors via presence.
+
+For the rare same-cell conflict, there are several strategies with different trade-offs. Last-write-wins (LWW) on the cell value is the simplest: whoever commits their edit last wins. This is appropriate for plain value entry (typing a number) because the last human intention is usually the one that matters. For additive edits (two users both incrementing a counter in the same cell), LWW loses one increment — a merge formula is better: show both values with a conflict marker ("42 | 51") and prompt the user to resolve.
+
+The deeper complexity in spreadsheets is not cell-level conflict but **formula dependency recalculation**. When cell A1 changes, all cells that reference A1 in their formulas must be recalculated. This creates a dependency graph where a single edit can cascade into thousands of formula evaluations. The recalculation engine must traverse this graph in topological order (dependencies before dependents) to avoid evaluating a cell before its inputs are updated. In a collaborative setting, concurrent edits to different cells may both trigger recalculations that affect shared downstream cells — the recalculation must be serialized or the results will be inconsistent.
+
+The practical architecture: cell edits are serialized via a per-spreadsheet lock (similar to OT's per-document lock), applied in revision order, and then a dependency graph traversal computes the full set of affected cells. The recalculation results are broadcast alongside the original edit operation so all clients can update their displayed values without re-running the formula engine locally. Circular dependency detection (A1 references B1 which references A1) is handled at formula parse time and rejected before the edit is persisted.
+</Curveball>
+
+## Further reading
+
+The intellectual foundation of Operational Transformation begins with the original 1989 paper by Clarence Ellis and Simon Gibbs, "Concurrency control in groupware systems" (ACM SIGMOD), which introduced the concept of operational transformation for collaborative editing more than a decade before Google Docs existed. Google's own contribution to OT theory came through the Google Wave project (2009), which published detailed technical documentation of its OT algorithm — Wave's OT engine was more sophisticated than Google Docs' original implementation, supporting rich formatting operations and multi-party editing. Google Wave was eventually shut down, but its OT implementation was open-sourced as the Apache Wave project.
+
+For practical implementations, **ShareDB** (formerly ShareJS, now maintained by the ShareDB community) is the definitive Node.js OT library — it provides a client-server OT framework with pluggable backends (MongoDB, PostgreSQL) and is the basis of several production collaborative editing products. The ShareDB codebase is small enough to read in a weekend and is invaluable for understanding how the client-side pending operation queue interacts with server acknowledgements.
+
+On the CRDT side, **Y.js** (by Kevin Jahns) is the state-of-the-art open-source CRDT library for collaborative editing. Y.js's technical blog posts explain its YATA algorithm, which achieves O(1) amortized insertion complexity — a significant improvement over naive RGA. **Automerge** (by Martin Kleppmann, author of "Designing Data-Intensive Applications") takes a more academically rigorous approach and supports arbitrary JSON documents as CRDTs, not just text. Kleppmann's 2011 paper with colleagues at Cambridge, "A comprehensive study of Convergent and Commutative Replicated Data Types" (Shapiro et al.), remains the foundational reference for the theoretical underpinnings of CRDTs.
+
+Figma's engineering blog post "How Figma's multiplayer technology works" (2019) provides an exceptional real-world case study of applying CRDT principles to a non-text collaborative tool — a vector graphics editor — and explains why Figma chose a custom CRDT over OT for its scene graph. Notion's engineering blog has described their migration from a custom conflict resolution system to Y.js, providing insight into the operational challenges of running a CRDT in production at scale.
+
+<RelatedQuestions items={[
+  { slug: "multiplayer-game-backend", title: "Design a Multiplayer Game Backend", difficulty: "senior" },
+  { slug: "live-sports-scores", title: "Design a Live Sports Score System", difficulty: "mid" },
+  { slug: "slack", title: "Design Slack", difficulty: "senior" },
+]} />

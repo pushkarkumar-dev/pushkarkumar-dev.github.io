@@ -1,0 +1,658 @@
+---
+title: "Design Spotify"
+slug: "spotify"
+category: "media"
+difficulty: "senior"
+estimatedReadMinutes: 22
+tags: ["audio-streaming", "recommendations", "playlist", "cdn", "colossus", "collaborative-filtering"]
+companyFlavors: ["Spotify", "Apple Music", "Amazon Music", "Tidal"]
+prerequisites: ["cdn-design", "design-a-cache", "distributed-unique-id-generator"]
+relatedQuestions: ["youtube-design", "netflix", "tiktok-reels"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design Spotify's audio streaming platform: track storage and CDN delivery, playlist management at scale, the Discover Weekly recommendation pipeline (collaborative filtering + NLP on playlist co-occurrence), and offline playback with license management."
+javaPackages:
+  - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+  - "software.amazon.awssdk:s3:2.25.0"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="spotify" title="Design Spotify" />
+
+<Tldr>
+- **Track storage**: Ogg Vorbis (free codec, default on Android/desktop/web) plus AAC (required for Apple devices) encoded at three quality tiers (96 / 160 / 320 kbps); files stored in GCS or S3 and served through Akamai CDN edge nodes; an average track at 320 kbps weighs roughly 8 MB.
+- **Gapless playback**: the client pre-fetches and pre-decodes the next track when 30 seconds remain on the current one; at the boundary the audio pipeline switches output buffers without re-initializing the decoder, eliminating the flush-and-reinit gap; optional crossfade mixes tail and head amplitudes client-side over a configurable window (typically 5 s).
+- **Playlists**: tracks stored in Cassandra with `playlist_id` as partition key and a float `position` as clustering key (fractional indexing); collaborative playlists use server-side last-write-wins conflict resolution with client notification of canonical state; playlists exceeding 10 K tracks are paginated with keyset cursors.
+- **Discover Weekly**: collaborative filtering via ALS matrix factorization on approximately 4 billion user-playlist co-occurrences, combined with NLP on playlist names and track metadata; runs as a weekly Hadoop batch job on Saturday night; results written to Cassandra and pushed to clients Monday morning at 6 AM local time.
+- **Offline playback**: downloaded tracks are DRM-encrypted (Widevine on Android, FairPlay on iOS); the license is bound to a specific device-and-account pair, expires immediately if the Premium subscription lapses, and is re-validated and re-synced automatically on reconnect.
+</Tldr>
+
+## The scale of the problem
+
+Spotify launched in 2008 as a legal, low-latency alternative to BitTorrent-era piracy. Its founding promise was simple: any track, immediately, at a quality that felt better than an MP3 you had downloaded the night before. By 2024 Spotify reported 602 million monthly active users, 100 million tracks in its catalog (counting podcasts, audiobooks, and music), and roughly 30 million DAU actively streaming audio at any given moment. At peak hours the platform sustains roughly 15 million concurrent streams, each pulling 96 to 320 kbps of audio data continuously. The CDN aggregate bandwidth this implies — approximately 2.4 Tbps — rivals the total output of the world's largest content networks.
+
+Audio streaming is, in several respects, a simpler engineering problem than video. Audio files are dramatically smaller: a 4-minute song at 320 kbps is approximately 8 MB, versus a 4-minute 1080p video segment at perhaps 150 MB. Audio has no concept of frame dependency (no I-frames, B-frames, or group-of-picture structures), so seekability and chunking are straightforward byte-range operations on a linear PCM or compressed bitstream. There is no transcoding complexity comparable to HLS or DASH adaptive bitrate ladders for video — audio quality tiers are pre-encoded offline and stored as independent files. All of this means that Spotify can serve a track from CDN cache without any origin-side compute per stream.
+
+Where audio streaming becomes unexpectedly hard is gapless playback. Music listeners — especially those streaming full albums or DJ mixes — have a physiological sensitivity to inter-track gaps of even 50 milliseconds. A gap that would be imperceptible in a video buffering event is immediately noticeable in a live performance recording or a continuous DJ set. This elevates what would normally be a minor buffering implementation detail into a first-class product requirement that shapes client architecture at every platform. The second differentiator that separates Spotify from YouTube or a podcast player is the nature of listening behavior: music is a repeat-listen medium. A user might stream the same album every morning for six months, which means recommendations are the primary growth and retention lever. Discover Weekly — Spotify's weekly personalized playlist — became one of the most-discussed product features in streaming history precisely because it cracked the cold-start problem for music discovery at scale using collaborative filtering on implicit feedback, not explicit ratings.
+
+## Clarifying questions
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| How many audio quality tiers are supported? | Three: 96 kbps (data saver), 160 kbps (normal), 320 kbps (high quality, Premium only) | Determines how many files to encode and store per track; drives CDN storage sizing |
+| Is podcast support in scope? | Yes — podcasts use the same player and CDN infrastructure but have a separate ingestion pipeline; treat them as tracks with `type=podcast` for this design | Keeps the architecture unified on the delivery side; ingestion is a separate concern |
+| Is offline playback in scope? | Yes — Premium users can download up to 10,000 tracks across 5 devices | Requires DRM key management, license binding, and a sync service to handle subscription state changes |
+| Are collaborative playlists supported? | Yes — multiple users with edit permission can add, remove, and reorder tracks simultaneously | Introduces concurrent-write conflicts in playlist storage; need to decide on OT, CRDT, or simpler LWW |
+| What social features are in scope? | Friend Activity sidebar (what your friends are listening to now), shared playlists, social sharing to external platforms | Friend Activity requires a lightweight presence-like feed; not a full social graph problem |
+| Are synced lyrics in scope? | Yes — word-by-word or line-by-line timestamps stored separately; the player polls a lyrics endpoint keyed to track position | Lyrics are a separate data product; they do not affect audio delivery architecture but add an API endpoint |
+| Is radio/endless queue mode in scope? | Yes — seed-based: provide a track or artist as seed, the backend generates an infinite queue using the recommendation engine | Radio mode is a streaming application of the same ALS-based recommendation model used for Discover Weekly |
+| Is cross-device session handoff supported? | Yes — pausing on desktop and resuming on mobile should restore track, position, and queue | Requires a small `player_state` record (track_id, position_ms, queue) written to a low-latency store (Redis) on pause |
+
+## Functional requirements
+
+- Users can search for and immediately play any of 100 million tracks; playback start latency is p99 under 1 second from button press to first audio output.
+- Users can create, edit, and follow playlists; playlists support up to 10,000 tracks; a Premium user can mark a playlist for offline download, causing the client to download and DRM-encrypt track files locally.
+- Collaborative playlists allow multiple users with edit permission to add and remove tracks concurrently; conflicts are resolved server-side.
+- The platform generates a personalized Discover Weekly playlist of 30 tracks per user every Monday, powered by collaborative filtering on listening history; users who have never listened still receive a curated editorial fallback.
+- The search API returns ranked results across tracks, artists, albums, and public playlists; search should tolerate misspellings and support phonetic matching.
+- Friend Activity shows what friends are currently playing in near-real-time (within ~30 s); users can opt out of this feature.
+
+## Non-functional requirements
+
+- **Scale**: 602 million monthly active users; 100 million tracks in catalog; 30 million DAU; 15 million concurrent streams at peak.
+- **Playback start latency**: p99 under 1 second from stream request to first audio frame decoded on client.
+- **Gapless playback**: inter-track gap under 50 ms; crossfade window configurable from 0 to 12 seconds.
+- **Availability**: 99.99% for the streaming path; a user mid-song must not experience interruption due to a single zone failure.
+- **Offline correctness**: a downloaded track must be unplayable within 60 seconds of a Premium subscription lapse (enforced by license expiry check on playback).
+- **Recommendation freshness**: Discover Weekly is acceptable at weekly cadence; radio mode must generate the next track within 500 ms of the current track ending.
+
+<Capacity title="Spotify Capacity Estimates">
+
+**Concurrent stream bandwidth**
+
+Peak concurrent streams: 30M DAU × 50% active at peak = 15 million concurrent streams.
+
+Assuming mid-quality as average: $15{,}000{,}000 \times 160 \text{ kbps} = 2{,}400{,}000 \text{ Mbps} = 2.4 \text{ Tbps}$ total CDN egress.
+
+**Track storage in object storage**
+
+100 million tracks × 3 quality tiers (Ogg Vorbis) × average 8 MB per tier = 2.4 PB, plus AAC tier for Apple devices:
+
+$$100 \times 10^6 \times 4 \text{ files} \times 8 \text{ MB} = 3.2 \text{ PB raw}$$
+
+With GCS/S3 multi-region replication (×3): $3.2 \times 3 \approx 9.6 \text{ PB}$ total object storage footprint.
+
+**CDN cache efficiency**
+
+Popularity follows a power law: the top 10 million tracks (10% of catalog) account for roughly 90% of all stream requests. At 4 files × 8 MB per track:
+
+$$10 \times 10^6 \times 4 \times 8 \text{ MB} = 320 \text{ GB}$$
+
+320 GB fits comfortably in a single regional CDN PoP's SSD cache. CDN cache hit rate ≈ 90%, so the origin object storage sees only 10% of stream traffic, or approximately 240 Gbps of origin pull.
+
+**Playlist metadata storage**
+
+Average 5,000 playlists per user × 602 million users × 50 bytes per playlist row ≈ 150 TB in Cassandra, well within a moderately-sized Cassandra cluster with replication factor 3.
+
+**Discover Weekly batch job sizing**
+
+600 million users × 30 recommended tracks per user × 16 bytes per track reference = approximately 288 GB of results written to Cassandra each weekend batch run.
+
+$$\frac{288 \text{ GB}}{48 \text{ hours (weekend window)}} \approx 1.7 \text{ MB/s write throughput required}$$
+
+This is a trivially low write rate for Cassandra; the constraint is actually the Hadoop compute time for ALS matrix factorization, not the write path.
+
+</Capacity>
+
+## API design
+
+The Spotify Web API follows REST conventions with OAuth 2.0 bearer tokens. The streaming path is intentionally decoupled from the metadata API — the API tier returns a signed CDN URL, and the client fetches audio bytes directly from CDN without touching the application tier again.
+
+**Stream initiation**
+
+```text
+GET /v1/tracks/{track_id}/stream
+Authorization: Bearer {access_token}
+X-Spotify-Device-Type: android
+
+HTTP 307 Temporary Redirect
+Location: https://audio-ak.spotifycdn.com/audio/{track_id}/320_ogg.ogg?sig=...&expires=1705399200
+```
+
+The `307` redirect keeps the API tier stateless: it resolves the CDN URL and immediately returns the redirect. SDK clients on mobile may prefer to receive the URL in the response body instead, to avoid an extra redirect hop on cellular.
+
+**Track metadata**
+
+```text
+GET /v1/tracks/{track_id}
+GET /v1/tracks?ids={id1},{id2},...{id50}   (batch, max 50)
+
+Response:
+{
+  "track_id": "4iV5W9uYEdYUVa79Axb7Rh",
+  "isrc": "USUM71703861",
+  "title": "Shape of You",
+  "duration_ms": 233713,
+  "explicit": false,
+  "popularity": 87,
+  "preview_url": "https://p.scdn.co/mp3-preview/...",
+  "artists": [{"id": "6eUKZXaKkcviH0Ku9w2n3V", "name": "Ed Sheeran"}],
+  "album": {"id": "3T4tUhGYeRNVUGevb0wThu", "name": "÷ (Divide)"}
+}
+```
+
+**Playlist management**
+
+```text
+GET  /v1/playlists/{playlist_id}/tracks?offset={o}&limit={l}
+POST /v1/playlists/{playlist_id}/tracks
+     Body: { "uris": ["spotify:track:4iV5W9uYEdYUVa79Axb7Rh"], "position": 5 }
+
+DELETE /v1/playlists/{playlist_id}/tracks
+       Body: { "tracks": [{"uri": "spotify:track:4iV5W9uYEdYUVa79Axb7Rh"}] }
+```
+
+**Player control**
+
+```text
+POST /v1/me/player/play
+     Body: { "context_uri": "spotify:playlist:{id}", "offset": {"position": 0}, "position_ms": 0 }
+
+PUT  /v1/me/player/pause
+PUT  /v1/me/player/seek?position_ms={ms}
+GET  /v1/me/player        (current playback state)
+```
+
+**Recommendations**
+
+```text
+GET /v1/recommendations/discover-weekly?user_id={id}
+GET /v1/recommendations?seed_tracks={ids}&seed_artists={ids}&limit=20   (radio mode)
+```
+
+**Search**
+
+```text
+GET /v1/search?q={query}&type=track,artist,album,playlist&limit=20&market=US
+```
+
+## Data model
+
+**tracks (PostgreSQL for writes + Elasticsearch for search)**
+
+```sql
+CREATE TABLE tracks (
+    track_id        varchar(22) PRIMARY KEY,
+    isrc            char(12) UNIQUE NOT NULL,
+    title           varchar(500) NOT NULL,
+    duration_ms     int NOT NULL,
+    explicit        boolean DEFAULT false,
+    popularity      smallint DEFAULT 0,
+    audio_key_ogg   text NOT NULL,
+    audio_key_aac   text,
+    preview_key     text,
+    lyrics_key      text,
+    created_at      timestamptz DEFAULT now()
+);
+
+CREATE TABLE track_artists (
+    track_id    varchar(22) REFERENCES tracks(track_id),
+    artist_id   varchar(22) NOT NULL,
+    role        varchar(32) DEFAULT 'main',
+    position    smallint DEFAULT 0,
+    PRIMARY KEY (track_id, artist_id)
+);
+```
+
+**playlists (Cassandra)**
+
+```sql
+CREATE TABLE playlists (
+    playlist_id     uuid PRIMARY KEY,
+    owner_id        uuid NOT NULL,
+    name            text,
+    description     text,
+    is_public       boolean DEFAULT true,
+    is_collaborative boolean DEFAULT false,
+    follower_count  counter,
+    image_key       text,
+    snapshot_id     text,
+    created_at      timestamp,
+    updated_at      timestamp
+);
+```
+
+**playlist_tracks (Cassandra — fractional indexed positions)**
+
+```sql
+CREATE TABLE playlist_tracks (
+    playlist_id     uuid,
+    position        double,
+    track_id        varchar,
+    added_by_user_id uuid,
+    added_at        timestamp,
+    PRIMARY KEY (playlist_id, position)
+) WITH CLUSTERING ORDER BY (position ASC);
+```
+
+The `position` column uses floating-point fractional indexing: inserting between positions 3.0 and 4.0 assigns 3.5; inserting between 3.0 and 3.5 assigns 3.25. This makes single-track insertions O(1) writes — no row renumbering. Only after approximately 50 consecutive fractional insertions between the same two tracks does the gap shrink to float precision limits, at which point a background job renumbers positions using integers with a stride of 1000.
+
+**user_library (Cassandra)**
+
+```sql
+CREATE TABLE user_library (
+    user_id     uuid,
+    type        text,
+    entity_id   varchar,
+    saved_at    timestamp,
+    PRIMARY KEY ((user_id), type, entity_id)
+) WITH CLUSTERING ORDER BY (type ASC, entity_id ASC);
+```
+
+Types: `track`, `album`, `playlist`, `artist`, `podcast`. Allows `SELECT * FROM user_library WHERE user_id=? AND type='track'` to retrieve all saved tracks in one partition scan.
+
+**listen_events (Kafka topic, compacted to Hadoop hourly)**
+
+```json
+{
+  "event_id": "01HXYZ...",
+  "user_id": "uuid",
+  "track_id": "4iV5W9...",
+  "playlist_id": "uuid-or-null",
+  "context_type": "playlist",
+  "position_ms": 0,
+  "duration_listened_ms": 218000,
+  "skipped": false,
+  "platform": "android",
+  "country": "SE",
+  "timestamp": "2025-01-15T09:14:22Z"
+}
+```
+
+**audio_files (GCS / S3 key schema)**
+
+```text
+audio/{track_id}/96_ogg.ogg
+audio/{track_id}/160_ogg.ogg
+audio/{track_id}/320_ogg.ogg
+audio/{track_id}/256_aac.m4a
+previews/{track_id}/preview.mp3
+```
+
+**offline_licenses (device-local + License Service)**
+
+```sql
+CREATE TABLE offline_licenses (
+    license_id      uuid PRIMARY KEY,
+    user_id         uuid NOT NULL,
+    device_id       varchar(64) NOT NULL,
+    track_id        varchar(22) NOT NULL,
+    encrypted_key   bytea NOT NULL,
+    granted_at      timestamptz DEFAULT now(),
+    expires_at      timestamptz NOT NULL,
+    UNIQUE (user_id, device_id, track_id)
+);
+```
+
+## Architecture flows
+
+<Mermaid diagram={`flowchart LR
+  subgraph Client["Client (Mobile / Desktop)"]
+    APP["App\n(Spotify Player)"]
+    BUF["Pre-fetch Buffer\n(next track decoded)"]
+    DRM["DRM Module\n(Widevine / FairPlay)"]
+  end
+
+  subgraph APITier["API Tier"]
+    PB["Playback\nService"]
+    AUTH["Auth / Token\nService"]
+    USER["User\nService"]
+  end
+
+  subgraph CDN["CDN (Akamai)"]
+    EDGE["Edge PoP\n(regional SSD cache)"]
+    ORIG["Origin\n(GCS / S3)"]
+  end
+
+  subgraph Reco["Recommendation Pipeline"]
+    KAFKA["Kafka\n(listen-events)"]
+    HADOOP["Hadoop Batch\n(ALS / NLP)"]
+    CASS_R["Cassandra\n(discover-weekly)"]
+  end
+
+  APP -->|"1  GET /v1/tracks/{id}/stream"| PB
+  PB -->|"2  verify subscription"| USER
+  PB -->|"3  resolve codec + quality"| PB
+  PB -->|"4  sign CDN URL (HMAC, 1h TTL)"| PB
+  PB -->|"5  307 Redirect + log to Kafka"| APP
+  APP -->|"6  fetch audio bytes (byte-range)"| EDGE
+  EDGE -->|"cache miss only"| ORIG
+  APP -->|"at 30s remaining"| BUF
+  BUF -->|"pre-fetch + decode next track"| EDGE
+  APP -->|"listen event"| KAFKA
+  KAFKA -->|"hourly compaction"| HADOOP
+  HADOOP -->|"weekly ALS batch"| CASS_R
+  CASS_R -->|"Monday push"| APP
+`} />
+
+<Mermaid diagram={`flowchart TD
+  subgraph Batch["Discover Weekly Batch (Saturday night)"]
+    LE["Filter 7-day listen events\n(min 30s per play)"]
+    MAT["Build user-track\nimplicit feedback matrix\n(sparse CSR, 600M × 100M)"]
+    ALS["ALS Matrix Factorization\n128-dim user + track embeddings\n(Apache Spark MLlib)"]
+    ANN["ANN Search (FAISS)\nfor similar users per target user"]
+    FILTER["Filter tracks heard\nin last 6 months"]
+    RANK["Re-rank by:\npredicted completion rate,\ngenre diversity,\nfreshness (< 6 mo old)"]
+    WRITE["Write top 30 tracks\nper user → Cassandra"]
+    PUSH["Push playlist to\nclient apps on\nMonday 06:00 local time"]
+  end
+
+  LE --> MAT --> ALS --> ANN --> FILTER --> RANK --> WRITE --> PUSH
+`} />
+
+## Deep dives
+
+### Audio file storage and codec selection
+
+Spotify maintains four audio files per track: three Ogg Vorbis tiers and one AAC tier. Ogg Vorbis is the workhorse: it is patent-free, which matters legally in markets where MP3 and AAC license fees are non-trivial at Spotify's volume, and it delivers perceptibly better quality than MP3 at equivalent bitrates, especially below 160 kbps. The 96 kbps tier targets data-saver mode on mobile networks; 160 kbps is the default for free-tier listeners; 320 kbps is the Premium "High Quality" setting, audibly transparent on good headphones.
+
+AAC is required specifically for Apple's ecosystem. iOS, macOS, HomePod, and CarPlay all have hardware-accelerated AAC decoders in their chipsets and no equivalent hardware acceleration for Ogg Vorbis. Shipping Ogg Vorbis to iOS would consume measurably more battery and CPU. Spotify encodes AAC-LC at 256 kbps for the "High Quality" Apple tier — 256 kbps AAC is audibly indistinguishable from 320 kbps Ogg Vorbis by most listeners.
+
+Audio files are encoded offline during track ingestion, stored in GCS or S3 under the key schema shown in the data model section, and never modified after creation. This append-only property means CDN caching is trivial: there is no cache invalidation problem for audio bytes — a track's 320 kbps Ogg file is immutable once published. Only metadata (title, artist credits, popularity) changes post-publication, and metadata is served from a separate API path.
+
+Files are structured to support byte-range seeks: the audio container (Ogg or M4A) begins with a minimal header, and the rest is sequential audio pages. A client seeking to the 2-minute mark of a 4-minute track issues `Range: bytes=4194304-` and the CDN edge serves the tail half without reading the full file from origin. The Spotify desktop and mobile clients do not pre-buffer the entire track — they maintain a rolling buffer of approximately 30 seconds of decoded audio, streaming additional chunks as the buffer drains.
+
+The CDN caching story is the economic core of the architecture. The top 10 million tracks by play count account for approximately 90% of all stream events — a textbook Zipf distribution. These 10 million tracks at 4 files × 8 MB each occupy 320 GB. A modern CDN PoP with a 1 TB SSD cache tier can absorb the entire hot catalog with room to spare, achieving a cache hit rate north of 90%. The remaining 90 million long-tail tracks (classic recordings, regional artists, niche genres) are served on cache miss from GCS/S3, incurring origin egress costs but at manageable volume.
+
+### Gapless playback implementation
+
+Gapless playback is simultaneously the most user-visible audio feature and the one most invisible when working correctly. A naive player implementation flushes the audio output buffer when a track ends, closes the decoder, opens the next track file, initializes a new decoder, and refills the buffer — a sequence that introduces a 50–200 ms gap in audio output. This is unacceptable for albums designed to flow continuously (Pink Floyd's "The Wall", any DJ mix compilation, classical movements).
+
+Spotify's implementation is entirely client-side. The server's only contribution is delivering the next CDN URL quickly. The client-side sequence works as follows:
+
+When the currently playing track reaches the 30-second-remaining mark, the player issues a background request for the next track's stream URL and immediately begins fetching and decoding that track into a secondary in-memory PCM buffer. This pre-fetch has 30 seconds to complete before it is needed — ample time even on a 3G connection for the 8 MB file.
+
+At the track boundary, the audio output pipeline does not reinitialize. The player switches the read pointer from the primary PCM buffer (current track, now exhausted) to the secondary PCM buffer (next track, already decoded and waiting). The audio hardware sees a continuous stream of PCM samples with no interruption. The gap is eliminated not by making the transition faster but by ensuring both tracks are fully decoded before the boundary arrives.
+
+Optional crossfade is an amplitude interpolation layer on top of this pre-fetch. When crossfade is enabled with a 5-second window, starting 5 seconds before the end of the current track the player begins reading samples from both the primary and secondary buffers simultaneously: primary buffer samples are multiplied by a linearly decreasing coefficient ($1.0 \rightarrow 0.0$ over the crossfade window), secondary buffer samples by a linearly increasing coefficient ($0.0 \rightarrow 1.0$). The two amplitude-scaled signals are summed. This produces the characteristic DJ fade-out/fade-in with zero gap. The crossfade is entirely in the client's audio mixing layer — the CDN and API tier have no involvement.
+
+There are two edge cases that break naive gapless implementations. First, the ReplayGain or normalization header in an Ogg Vorbis file adjusts the decoded amplitude by a per-track gain coefficient. Crossfade calculations must apply the gain before mixing, or the volume will jump at the boundary. Second, silence-trimming codecs (like AAC with iTunSMPB tags) encode a small count of padding samples at the head and tail of each track that should be skipped during gapless playback. Spotify's decoder reads these tags and adjusts the sample window accordingly, trimming the silence without introducing a gap.
+
+### Playlist storage and concurrent edit
+
+The key data modeling insight for playlists is that tracks within a playlist have an explicit user-defined order, and that order changes frequently (users drag tracks up and down). Storing position as an integer with sequential numbering (1, 2, 3, ...) makes single insertions expensive: inserting at position 5 in a 10,000-track playlist requires updating positions 5 through 10,000. At Cassandra write throughput this is manageable in a batch, but it creates contention on the partition for large playlists.
+
+Fractional indexing resolves this elegantly. Position is stored as a `double`. A playlist created with 10 tracks assigns positions 1000.0, 2000.0, ..., 10000.0 (stride 1000). Inserting a new track between positions 3000.0 and 4000.0 assigns position 3500.0 — one write, no other rows touched. Inserting again between 3000.0 and 3500.0 assigns 3250.0. After approximately 50 consecutive insertions in the same gap, the gap narrows below double precision (roughly $2^{-52}$), at which point a background reindexing job reads the full playlist and rewrites positions with a fresh stride of 1000. Reindexing is rare under normal usage and can be done in the background without blocking reads.
+
+Collaborative playlists introduce concurrent writes from multiple users. The conflict scenario: User A and User B both drag a track to position 5 simultaneously. Spotify's production approach is server-side last-write-wins: the second write to reach the Playlist Service simply overwrites the first. The first writer's client receives a `playlist-updated` WebSocket event (or polls and detects a changed `snapshot_id`) and re-renders the canonical state from the server. This is simpler to implement than operational transformation and correct enough for the use case — collaborative playlist editing is not a high-frequency concurrent-write scenario the way collaborative document editing is.
+
+A more principled alternative would use a CRDT: model the playlist as a Replicated Growable Array where additions are appended with globally unique timestamps and deletions are tombstones. This gives strong eventual consistency without coordination overhead. The tradeoff is that the CRDT state must be merged on read, adding latency to every playlist fetch, and the tombstone log grows unboundedly for long-lived playlists unless periodically garbage collected.
+
+### Discover Weekly recommendation pipeline
+
+Discover Weekly is Spotify's most technically sophisticated product: a weekly personalized playlist of 30 tracks that feels like it was curated by a friend who knows your taste perfectly. It shipped in 2015 and within months had users describing it as "magic." The engineering behind it is collaborative filtering via Alternating Least Squares (ALS) matrix factorization, combined with NLP-derived audio features, all running as a weekly batch job on Hadoop.
+
+**Data collection.** Every listen event — play, skip at N seconds, completion, repeat — is written to a Kafka topic keyed by `user_id`. A Kafka consumer compacts these events into Hadoop hourly. Over a week, this accumulates billions of rows. For recommendation purposes an event is counted as a positive implicit feedback signal only if the user listened for at least 30 seconds — this filters out accidental plays and tracks that auto-played from a playlist the user wasn't actively listening to.
+
+**Matrix construction.** The batch job (running Saturday night to be ready by Monday morning) loads the 7-day listen event window and builds a sparse user-track matrix $R$ where $R_{u,i} = 1$ if user $u$ listened to track $i$ for at least 30 seconds in the past week. This is implicit feedback (no explicit ratings), which is the regime in which ALS was designed to operate (Hu, Koren, Volinsky 2008). The matrix is enormous but extremely sparse: 600 million users × 100 million tracks, but any given user interacts with at most a few thousand tracks per week.
+
+**ALS factorization.** ALS decomposes $R \approx U \cdot V^T$ where $U \in \mathbb{R}^{600M \times 128}$ is the user embedding matrix and $V \in \mathbb{R}^{100M \times 128}$ is the track embedding matrix. Each 128-dimensional row vector encodes latent factors such as genre affinity, tempo preference, mood tendency, and era preference — not explicitly labeled, but learned from co-occurrence patterns. ALS alternates between holding $V$ fixed and solving for $U$ in closed form, then holding $U$ fixed and solving for $V$. Each alternation is a parallel linear algebra operation — embarrassingly parallelizable across Hadoop workers because each user's row can be updated independently given $V$.
+
+In practice Spotify uses Apache Spark MLlib's `ALS` implementation, which distributes the matrix across the cluster using block-partitioned RDDs. A full training run on 600 million users takes several hours on a large Spark cluster (thousands of nodes on GCP Dataproc). The resulting 128-dimensional embeddings are serialized and stored for the next step.
+
+**Candidate generation.** For each target user, the pipeline performs an approximate nearest-neighbor (ANN) search in the user embedding space using FAISS or Annoy. Finding users whose taste vectors are closest to the target user identifies a neighborhood of listeners with similar preferences. The system then retrieves tracks that this neighborhood listened to and that the target user has not heard in the last 6 months. This candidate set can be large — hundreds of tracks — and must be pruned and ranked.
+
+**Re-ranking.** The ranking model applies several signals: (1) predicted completion rate — the dot product $u_{\text{target}} \cdot v_{\text{track}}$ gives the ALS-predicted affinity score; (2) genre diversity — no more than 4 consecutive tracks from the same genre, enforced via a greedy diversity pass using the genre tags from Elasticsearch; (3) freshness bonus — tracks released in the past 6 months receive a multiplier to surface new music the user hasn't encountered; (4) editorial override — Spotify's editorial team can pin specific tracks to Discover Weekly for a given week to promote emerging artists, overriding the ML output for a small fraction of slots.
+
+**Delivery.** The top 30 ranked tracks per user are written to a Cassandra table keyed by `user_id` with a composite column `week_id`. On Monday morning at 6 AM in the user's local timezone, the app fetches this pre-computed playlist on first open. The latency of Discover Weekly is thus O(milliseconds) — a single Cassandra row read — because all the expensive ML compute happened offline over the weekend.
+
+New users with fewer than 10 listen events do not have meaningful ALS embeddings. For these users the pipeline falls back to a hand-curated editorial playlist specific to the user's market and any genre signals derived from their Spotify signup preferences or early listening sessions. The cold-start problem is managed by the editorial team, not the ML model.
+
+### Search and entity resolution
+
+Spotify's search index must serve 100 million tracks, 10 million artists, 5 million albums, and several hundred million public playlists. The search backend uses Elasticsearch, with separate indices per entity type to allow independent scaling and ranking tuning.
+
+Track search indexing:
+
+```json
+{
+  "track_id": "4iV5W9uYEdYUVa79Axb7Rh",
+  "title": "Shape of You",
+  "title_phonetic": "ʃeɪp ɒv juː",
+  "artists": ["Ed Sheeran"],
+  "album": "÷ (Divide)",
+  "genres": ["pop", "acoustic pop"],
+  "popularity": 87,
+  "release_year": 2017,
+  "explicit": false,
+  "market_availability": ["US", "GB", "SE", ...]
+}
+```
+
+The `title_phonetic` field is populated using the Soundex or Metaphone algorithm during indexing. This allows "Taylur Swift" to match "Taylor Swift" — critical for voice search on Spotify's Car View and SmartSpeaker integrations.
+
+Search ranking is a linear combination of BM25 text relevance and a `popularity` field-value boost. A query for "shape of you" would match hundreds of tracks phonetically, but the Ed Sheeran recording (popularity 87) outranks a covers artist (popularity 12) by the popularity multiplier. For logged-in users, Spotify applies a personalization layer: a user whose history is dominated by pop tracks sees pop results ranked above acoustically similar folk tracks in ambiguous queries.
+
+ISRC (International Standard Recording Code) is the key deduplication mechanism. The same recording may appear in multiple Spotify uploads — a track from an original album, a greatest-hits compilation, a remaster, and a region-specific release. All four should share the same canonical `track_id` in search results, not appear as four separate entries. The ingestion pipeline checks the ISRC of each uploaded track against existing catalog entries and links duplicates to the canonical recording, preventing the search index from fragmenting a popular track across dozens of equivalent entries.
+
+### Cross-device session handoff
+
+When a user pauses playback on desktop and opens the mobile app, the mobile app should restore the exact track, position, and upcoming queue. This requires a lightweight `player_state` record persisted on every meaningful player event.
+
+```json
+{
+  "user_id": "uuid",
+  "device_id": "desktop-xyz",
+  "track_id": "4iV5W9uYEdYUVa79Axb7Rh",
+  "position_ms": 127000,
+  "context_uri": "spotify:playlist:37i9dQZEVXbMDoHDwVN2tF",
+  "queue": ["track_b", "track_c", "track_d"],
+  "is_playing": false,
+  "updated_at": "2025-01-15T09:14:22Z"
+}
+```
+
+This record is written to Redis on every pause, seek, and track change, with a TTL of 30 days. When the mobile app opens, it fetches the active device's `player_state` via `GET /v1/me/player` and restores from the stored position. The queue is truncated to the next 10 tracks for storage efficiency; the recommendation engine regenerates deeper queue entries on demand.
+
+## Java integration
+
+### Part A — PlaybackUrlService.java
+
+```java
+package com.spotify.playback;
+
+import org.springframework.stereotype.Service;
+import org.springframework.kafka.core.KafkaTemplate;
+import java.time.Instant;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.util.Base64;
+import java.util.UUID;
+
+public record PlaybackUrl(
+    String signedUrl, String trackId, Instant expiresAt, int qualityKbps) {}
+
+public enum DeviceType { IOS, MACOS, ANDROID, WEB, CHROMECAST }
+
+@Service
+public class PlaybackUrlService {
+
+    private static final String CDN_BASE = "https://audio-ak.spotifycdn.com";
+    private final UserService userService;
+    private final CdnSigner cdnSigner;
+    private final KafkaTemplate<String, String> kafka;
+
+    public PlaybackUrlService(UserService userService,
+                              CdnSigner cdnSigner,
+                              KafkaTemplate<String, String> kafka) {
+        this.userService = userService;
+        this.cdnSigner  = cdnSigner;
+        this.kafka      = kafka;
+    }
+
+    public PlaybackUrl resolveUrl(String trackId, String userId, DeviceType device) {
+        SubscriptionTier tier = userService.getSubscriptionTier(userId);
+
+        int qualityKbps = switch (tier) {
+            case FREE    -> 160;
+            case PREMIUM -> 320;
+        };
+
+        boolean useAac = (device == DeviceType.IOS || device == DeviceType.MACOS);
+        String codec = useAac ? "aac" : "ogg";
+        String ext   = useAac ? "m4a" : "ogg";
+
+        String cdnPath = "audio/%s/%d_%s.%s".formatted(trackId, qualityKbps, codec, ext);
+        Instant expiresAt = Instant.now().plusSeconds(3_600);
+        String signedUrl  = CDN_BASE + "/" + cdnSigner.sign(cdnPath, expiresAt);
+
+        String event = """
+            {"user_id":"%s","track_id":"%s","action":"stream_start","ts":"%s"}
+            """.formatted(userId, trackId, Instant.now());
+        kafka.send("listen-start", userId, event);
+
+        return new PlaybackUrl(signedUrl, trackId, expiresAt, qualityKbps);
+    }
+}
+```
+
+### Part B — PlayerController.java
+
+```java
+package com.spotify.playback;
+
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import java.net.URI;
+import java.util.List;
+
+public record PlaybackState(String trackId, long positionMs, boolean isPlaying) {}
+public record TrackSummary(String trackId, String title, String artistName) {}
+public record PlayContextRequest(String context_uri, int offset, long position_ms) {}
+
+@RestController
+@RequestMapping("/v1")
+public class PlayerController {
+
+    private final PlaybackUrlService playbackUrlService;
+    private final PlaylistService    playlistService;
+    private final RecommendationRepo recommendationRepo;
+
+    public PlayerController(PlaybackUrlService playbackUrlService,
+                            PlaylistService playlistService,
+                            RecommendationRepo recommendationRepo) {
+        this.playbackUrlService  = playbackUrlService;
+        this.playlistService     = playlistService;
+        this.recommendationRepo  = recommendationRepo;
+    }
+
+    @GetMapping("/tracks/{trackId}/stream")
+    public ResponseEntity<Void> streamTrack(
+            @PathVariable String trackId,
+            @RequestAttribute String userId,
+            @RequestHeader(value = "X-Spotify-Device-Type", defaultValue = "WEB") String deviceTypeHeader) {
+
+        DeviceType device = DeviceType.valueOf(deviceTypeHeader.toUpperCase());
+        PlaybackUrl url   = playbackUrlService.resolveUrl(trackId, userId, device);
+        return ResponseEntity.status(HttpStatus.TEMPORARY_REDIRECT)
+                .location(URI.create(url.signedUrl())).build();
+    }
+
+    @PostMapping("/me/player/play")
+    public ResponseEntity<PlaybackState> play(
+            @RequestBody PlayContextRequest req,
+            @RequestAttribute String userId,
+            @RequestHeader(value = "X-Spotify-Device-Type", defaultValue = "WEB") String deviceTypeHeader) {
+
+        String trackId = playlistService.resolveFirstTrack(req.context_uri(), req.offset());
+        DeviceType device = DeviceType.valueOf(deviceTypeHeader.toUpperCase());
+        playbackUrlService.resolveUrl(trackId, userId, device);
+        return ResponseEntity.ok(new PlaybackState(trackId, req.position_ms(), true));
+    }
+
+    @GetMapping("/recommendations/discover-weekly")
+    public ResponseEntity<List<TrackSummary>> discoverWeekly(@RequestAttribute String userId) {
+        List<TrackSummary> tracks = recommendationRepo.getDiscoverWeekly(userId);
+        if (tracks.isEmpty()) {
+            tracks = recommendationRepo.getEditorialFallback(userId);
+        }
+        return ResponseEntity.ok(tracks);
+    }
+
+    @PostMapping("/playlists/{playlistId}/tracks")
+    public ResponseEntity<Void> addTracks(
+            @PathVariable String playlistId,
+            @RequestBody AddTracksRequest req,
+            @RequestAttribute String userId) {
+
+        playlistService.validateEditPermission(playlistId, userId);
+        playlistService.addTracksWithFractionalPosition(playlistId, req.trackIds(), req.position());
+        playlistService.publishPlaylistUpdated(playlistId);
+        return ResponseEntity.status(HttpStatus.CREATED).build();
+    }
+}
+```
+
+## Tradeoffs
+
+<TradeoffTable>
+
+| Approach | Bandwidth Cost | Latency | Quality Flexibility | DRM Complexity |
+|---|---|---|---|---|
+| **Progressive download (no streaming)** | High — full file downloaded before play; wastes bandwidth on skipped tracks | High start latency on slow connections; must buffer entire track | Single quality level per download; no mid-stream quality switch | Low — file can be encrypted at rest with a symmetric key |
+| **Third-party CDN + fixed bitrate** | Medium — CDN handles egress but all users get same quality regardless of connection | Low for warm cache hits; high for long-tail tracks on cache miss | None — fixed bitrate means poor mobile experience on cellular | Medium — CDN signed URLs work but DRM integration requires license server separate from CDN |
+| **Multi-tier CDN + adaptive codec** | Low — client selects lowest adequate quality; fewer bits wasted | Low — CDN serves appropriate quality without mid-stream rebuffering | High — client can switch quality tiers between tracks | High — each quality tier needs its own encrypted file; license must cover all tiers for a track |
+| **Spotify actual (Akamai CDN + codec-per-device + pre-fetch gapless)** | Optimal — codec selection minimizes bits for device hardware; pre-fetch avoids wasted re-requests | Lowest — signed URL redirect in &lt;50ms; pre-fetched next track ready at boundary | Highest — 4 files per track cover all quality × codec combinations | Highest — Widevine + FairPlay per device type; license bound to device-account pair; expiry on subscription lapse |
+
+</TradeoffTable>
+
+<Pitfall>
+**Routing all audio traffic through application servers.** It is tempting in early designs to have the Playback Service proxy audio bytes — client requests the stream, the API server fetches from S3 and streams the bytes to the client. This is catastrophically wrong at Spotify's scale. The aggregate audio bandwidth is 2.4 Tbps at peak. Routing that through application servers would require an API fleet larger than the rest of Spotify's infrastructure combined, with enormous cost and latency. The correct architecture is a signed-URL redirect: the API server generates a cryptographically signed CDN URL and returns a 307 redirect. The client fetches audio bytes directly from the CDN edge, never touching the application tier again. The application tier handles only the lightweight URL generation (microseconds of compute) and the listen event write to Kafka — not the bytes themselves.
+</Pitfall>
+
+<Pitfall>
+**Computing Discover Weekly recommendations in real time per request.** ALS matrix factorization on 600 million users and 100 million tracks is a batch operation that takes several hours on a Spark cluster. Running it per request would return results in hours, not milliseconds. The correct approach is pre-computation: run ALS on Saturday night, store the top 30 tracks per user in Cassandra, and serve from that cache when the user opens the app on Monday. For radio mode (which does require near-real-time recommendations for the next track), use the pre-computed user and track embeddings to run a cheap dot-product ANN query, not a full ALS iteration. Stale recommendations served with sub-millisecond latency are dramatically better than fresh recommendations served after a 4-hour compute delay.
+</Pitfall>
+
+<Curveball>
+**"Spotify wants to launch a 'Live Concert Streaming' feature — artists perform live, fans hear the concert in real-time with under 2 seconds of latency. How does this change the architecture?"**
+
+On-demand streaming tolerates 30-second pre-buffers and CDN cache layers that add 1–5 seconds of glass-to-glass latency — completely acceptable because the content is not live. For under 2-second latency, the architecture must invert: instead of client-pull (fetch from CDN), you need server-push via WebRTC or low-latency HLS (LLHLS). The CDN must operate in live origin-pull mode rather than cache-hit mode — every segment is unique, so cache hit rate drops near zero and origin egress triples. The encoding pipeline must shift from offline batch (pre-encode at 3 tiers) to real-time encoding (FFmpeg with hardware acceleration, 1-2 second segment duration, concurrent encoder-upload pipeline). A separate streaming origin distinct from the on-demand CDN is almost certainly required to avoid cache poisoning of the on-demand tier. Gapless playback and signed-URL redirect patterns no longer apply — the client connects to a WebRTC SFU or an LLHLS ingest origin and receives a continuous segment stream.
+</Curveball>
+
+<Curveball>
+**"A major label pulls their catalog from Spotify mid-stream. 50,000 users are actively playing tracks from that label right now. How do you handle in-flight streams, purge CDN caches, and notify users?"**
+
+This is a license revocation event with three distinct layers. For in-flight streams: the signed CDN URLs already issued have a 1-hour TTL — renegotiating these is difficult without introducing active session tracking. Spotify's practical approach is to let the current signed URL expire naturally (at most 1 hour) and block renewal. When the client attempts to refresh the signed URL for the next track in the queue, the Playback Service checks the track's label against the revocation list (propagated from the Rights Management Service to a Redis set) and returns `HTTP 451 Unavailable For Legal Reasons`. For CDN purge: issue a CDN purge API call for all audio key prefixes associated with the label's tracks — Akamai's purge API can target by tag or URL pattern and propagates globally within 5 minutes. For user notification: publish a `track-unavailable` event to the notification fan-out pipeline; the client displays "This track is no longer available in your region" and auto-advances the queue. The search index must also be updated to suppress these tracks, which is an Elasticsearch delete-by-query operation that can be batched.
+</Curveball>
+
+<Curveball>
+**"Design 'Spotify DJ' — an AI DJ that mixes between tracks in real time, adds spoken commentary between songs, and adapts the set based on real-time user reactions (skips, likes). What architecture changes are needed?"**
+
+This requires three new capabilities that do not exist in the on-demand architecture. First, real-time audio synthesis: commentary is generated by a TTS (text-to-speech) model running on GPU infrastructure, producing short MP3 segments (5–15 seconds) between tracks. These commentary segments cannot be pre-cached on CDN because they are generated on the fly based on what the previous track was, the user's location, time of day, and current listening session context. They must be streamed from a low-latency origin — either served via WebRTC or as very-short-lived signed URLs generated seconds before playback. Second, reactive queue adaptation: when a user skips a track, the DJ pipeline must re-run a lightweight ANN query using the current session's momentum (the last 5 tracks played) to find a replacement that continues the musical arc — not a cold Discover Weekly recommendation. This requires the pre-computed track embeddings to be queryable in memory (FAISS index loaded on recommendation service nodes) with sub-100ms latency. Third, crossfade orchestration at the server level: for smooth DJ-style mixing, the server must know when the current track will end (track `duration_ms` is known), schedule TTS generation to begin 10 seconds before end, and deliver the commentary segment just-in-time. A session state machine tracking `{current_track, position_ms, next_track, commentary_segment}` per user session is needed — a stateful service, unlike the stateless Playback Service today.
+</Curveball>
+
+## Further reading
+
+- Spotify Engineering Blog: "For Your Ears Only: Personalizing Spotify Home with Machine Learning" — covers the feature engineering and model architecture behind home page personalization, which shares infrastructure with Discover Weekly.
+- Hu, Koren, Volinsky (2008): "Collaborative Filtering for Implicit Feedback Datasets" — the foundational ALS paper that underpins Discover Weekly's recommendation model; available via IEEE Xplore.
+- Spotify Engineering Blog: "The 'Discover Weekly' Playlist: How Spotify Applies ML to Create Personalized Playlists" (2015) — the original technical writeup from the team that shipped the feature.
+- Nilufar Baghai: "Spotify's Event Delivery — Life in the Cloud" (QCon 2015) — covers the Kafka-based event pipeline that feeds the listen event stream powering recommendations and analytics.
+
+<RelatedQuestions items={[
+  { slug: "youtube-design", title: "Design YouTube", difficulty: "staff" },
+  { slug: "netflix", title: "Design Netflix", difficulty: "staff" },
+  { slug: "tiktok-reels", title: "Design TikTok/Reels", difficulty: "senior" },
+]} />

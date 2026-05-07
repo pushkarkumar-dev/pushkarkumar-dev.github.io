@@ -1,0 +1,81 @@
+---
+const year = new Date().getFullYear();
+const base = import.meta.env.BASE_URL;
+---
+
+<footer class="sd-footer">
+  <div class="sd-footer__inner">
+
+    <div class="sd-footer__left">
+      <a href={`${base}/`} class="sd-footer__brand">System Design</a>
+      <span class="sd-footer__sep" aria-hidden="true">·</span>
+      <span class="sd-footer__copy">&copy; {year} Pushkar Kumar</span>
+    </div>
+
+    <nav class="sd-footer__links" aria-label="Footer links">
+      <a href="/" class="sd-footer__link">pushkar.dev</a>
+      <a href="https://github.com/pushkar1005" class="sd-footer__link" target="_blank" rel="noopener noreferrer">GitHub</a>
+      <a href={`${base}/`} class="sd-footer__link">All questions</a>
+    </nav>
+
+  </div>
+</footer>
+
+<style>
+  .sd-footer {
+    border-top: 1px solid var(--line);
+    margin-top: auto;
+    padding: 1.5rem 0;
+  }
+
+  .sd-footer__inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 clamp(1rem, 3vw, 2rem);
+    flex-wrap: wrap;
+  }
+
+  .sd-footer__left {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .sd-footer__brand {
+    font-family: 'Geist', system-ui, sans-serif;
+    font-weight: 600;
+    font-size: 0.875rem;
+    color: var(--ink-2);
+    text-decoration: none;
+    transition: color var(--dur-fast);
+  }
+  .sd-footer__brand:hover { color: var(--accent); }
+
+  .sd-footer__sep {
+    color: var(--ink-4);
+    font-size: 0.875rem;
+  }
+
+  .sd-footer__copy {
+    font-size: 0.8rem;
+    color: var(--ink-4);
+  }
+
+  .sd-footer__links {
+    display: flex;
+    align-items: center;
+    gap: 1.25rem;
+  }
+
+  .sd-footer__link {
+    font-size: 0.8rem;
+    color: var(--ink-3);
+    text-decoration: none;
+    transition: color var(--dur-fast);
+  }
+  .sd-footer__link:hover { color: var(--ink); }
+</style>

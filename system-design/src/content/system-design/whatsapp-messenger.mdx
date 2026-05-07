@@ -1,0 +1,694 @@
+---
+title: "Design WhatsApp Messenger"
+slug: "whatsapp-messenger"
+category: "social"
+difficulty: "senior"
+estimatedReadMinutes: 24
+tags: ["messaging", "e2e-encryption", "websocket", "presence", "offline-delivery", "signal-protocol"]
+companyFlavors: ["WhatsApp", "iMessage", "Signal", "Telegram"]
+prerequisites: ["design-a-cache", "distributed-unique-id-generator"]
+relatedQuestions: ["slack", "discord", "notification-system"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Build WhatsApp's 1:1 and group messaging at 2 B users: Signal Protocol E2E encryption, offline message queuing, online presence at scale, and the engineering trade-offs behind 'last seen' and read receipts."
+javaPackages:
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+  - "org.springframework.boot:spring-boot-starter-websocket:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "org.springframework.data:spring-data-cassandra:4.3.0"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="whatsapp-messenger" title="Design WhatsApp Messenger" />
+
+<Tldr>
+- **Transport**: persistent WebSocket per client to a Chat Server; servers are stateless — message routing uses Kafka partitioned by `recipient_id`, so any Chat Server can receive a message and route it to whichever server holds the recipient's WebSocket
+- **E2E encryption**: Signal Protocol — X3DH key exchange at session setup, Double Ratchet for per-message keys; server stores and forwards only ciphertext and never touches plaintext under any circumstance
+- **Offline delivery**: undelivered messages stored in Cassandra partitioned by `recipient_id` until the client connects and ACKs receipt; 30-day TTL ensures orphaned messages are automatically purged
+- **Online presence**: heartbeat every 30 s, `last_seen` stored in Redis with 75 s expiry; at 2 B users, only active users' presence is cached (~100 M entries at peak, roughly 7.5 GB — fits in a single Redis cluster)
+- **Group messaging** (up to 1,024 members): sender's device encrypts one copy per recipient using that recipient's established Signal session key; server receives and routes N individual ciphertext blobs, never a single broadcast plaintext
+</Tldr>
+
+## The scale of the problem
+
+WhatsApp serves over two billion monthly active users across more than 180 countries, exchanging roughly 100 billion messages per day. That single number — 100 billion messages per day — is deceptive in its simplicity. Averaged uniformly it is 1.16 million messages per second, but the distribution is brutally uneven: New Year's Eve alone regularly sets records exceeding three times the daily average, and regional events (elections, sports finals, Eid) create sharp spikes that must be absorbed without degrading the p99 delivery latency below one second for online recipients.
+
+The mobile network reality compounds the engineering challenge. A persistent TCP connection on a mobile device is not free. Every keep-alive packet costs battery, and carrier-grade NAT (CGNAT) on LTE and 5G networks aggressively drops idle TCP sessions after 30–90 seconds — sometimes sooner on congested towers. WhatsApp's transport layer must balance connection longevity against battery drain, which is why the heartbeat interval is tuned to 28–30 seconds (just below the aggressive CGNAT timeout floor) and why the server must handle millions of connection drops and re-establishments per minute as devices transition between WiFi, LTE, and background states.
+
+End-to-end encryption is not an afterthought bolted on at the end of the design — it is the architectural constraint that changes every other decision. Once you commit to E2E encryption using the Signal Protocol, the server fundamentally cannot read message content. This means you cannot do server-side spam filtering on content, cannot build keyword-triggered moderation, and cannot recover messages if a user loses their device without a backup. It also means group message delivery requires the sender's device to perform N encryption operations — one per group member — rather than the server decrypting and re-broadcasting a single ciphertext. Every architectural decision downstream flows from this cryptographic commitment, and understanding the trade-offs honestly is what separates a junior whiteboard answer from a staff-level one.
+
+## Clarifying questions
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| What is the group size limit? | 1,024 members | Determines whether sender-side fanout is feasible; beyond ~5K members you need a different key distribution model (Sender Key protocol) |
+| What media types must be supported? | Photos, video, voice notes, documents, GIFs | Media is never sent inline over WebSocket — always via pre-signed S3 URL; but this affects the media service design and CDN strategy |
+| Is E2E encryption required? | Yes, mandatory for all message types | Changes the entire key management architecture; server can only store ciphertext |
+| How long are offline messages retained? | 30 days | Determines Cassandra TTL and storage capacity planning |
+| Are read receipts required? | Yes, but user-controllable | Read receipts require an ACK path from recipient back to sender; privacy toggle means the server must respect the recipient's preference |
+| Is "last seen" visibility user-controlled? | Yes — everyone / contacts only / nobody | Presence must be a two-step system: heartbeat updates Redis regardless; display is gated on the viewer-recipient contact relationship |
+| Is multi-device support required? | Yes, linked devices (phone primary + up to 4 linked) | X3DH requires a separate session per device; sender must encrypt N copies per recipient across all their registered devices |
+| Geographic distribution? | Global, multi-region | Message delivery must respect data residency laws; Chat Servers in each region with cross-region routing for international conversations |
+
+The multi-device question is worth dwelling on. WhatsApp's linked-device model (introduced in 2021) treats the primary phone as the identity anchor. Linked devices register their own identity keys but are subordinate to the phone's master identity. This means a sender encrypting a message for a user with three linked devices must produce three separate ciphertexts — one per device — because each device has its own Signal session with distinct ratchet state. The server routes each ciphertext to the appropriate device's WebSocket connection. This detail eliminates several naive design shortcuts and should surface early in the interview.
+
+## Functional requirements
+
+- **1:1 messaging**: users can send and receive text messages, voice notes, images, video, and documents in private conversations with guaranteed ordering and delivery
+- **Group messaging**: up to 1,024 members can participate in a group conversation; all messages are E2E encrypted; membership operations (add, remove, promote admin) are supported
+- **Media sharing**: photos, videos, voice notes, and documents are uploaded to object storage; the encrypted media key and URL reference are shared via the message ciphertext
+- **Read receipts**: single tick (sent to server), double tick (delivered to recipient device), blue double tick (read by recipient) — each stage triggers an upstream notification to the sender
+- **Online presence and last seen**: contacts can see whether a user is currently online or when they were last active; visibility is controlled per user via privacy settings
+- **Offline delivery**: messages sent to offline users are queued server-side and delivered in order upon reconnection; messages expire after 30 days if undelivered
+
+## Non-functional requirements
+
+- **Scale**: 2 billion registered users, ~500 million daily active users, 100 billion messages per day
+- **Delivery latency**: p99 end-to-end delivery under 1 second for online recipients; offline messages delivered within 5 seconds of reconnection
+- **Availability**: 99.95% uptime for the messaging path (higher priority than social graph reads or profile updates); planned maintenance must be transparent to users
+- **Message ordering**: per-conversation ordering guaranteed using monotonically increasing sequence numbers at the Chat Server level; global ordering across conversations is explicitly not required
+- **Durability**: a message ACKed by the server must not be lost even under Chat Server failure — Kafka provides durability before Cassandra write for offline users; for online users, delivery ACK from the recipient's device confirms end-to-end delivery
+- **Data residency**: messages in transit must stay within regional boundaries for the EU (GDPR), Brazil (LGPD), and India (PDPB) — Chat Servers are deployed per region with regional Kafka clusters
+
+<Capacity title="WhatsApp Capacity Estimates">
+
+**Message throughput**
+
+$$
+\text{sustained rate} = \frac{100 \times 10^9}{86{,}400} \approx 1.16 \text{ M messages/s}
+$$
+
+$$
+\text{peak (3×)} \approx 3.5 \text{ M messages/s}
+$$
+
+**WebSocket fleet sizing**
+
+Assume 25% of 2B users are concurrently connected at peak: 500M active WebSocket connections. At 1,000 connections per Chat Server pod (conservative — Netty can handle 50–100K, but we provision conservatively to leave headroom for GC pauses and TLS handshake bursts):
+
+$$
+\text{Chat Server pods} = \frac{500 \times 10^6}{1{,}000} = 500{,}000 \text{ pods}
+$$
+
+In practice WhatsApp uses far fewer, far larger machines — but this gives a floor for the conversation.
+
+**Offline message storage**
+
+Average undelivered message queue per user: ~50 messages × 1 KB ciphertext each. At 2B users with 10% offline message penetration:
+
+$$
+50 \text{ msgs} \times 1 \text{ KB} \times 200 \times 10^6 \text{ users} = 10 \text{ TB Cassandra storage}
+$$
+
+With 3× Cassandra replication factor: 30 TB raw. Modest by modern standards; the real constraint is Cassandra read throughput on reconnect storms.
+
+**Presence heartbeat load**
+
+$$
+500 \times 10^6 \text{ active clients} \times \frac{1 \text{ heartbeat}}{30 \text{ s}} \approx 16.7 \text{ M heartbeats/s}
+$$
+
+Redis `SET` throughput on a modern cluster (r7g.4xlarge) is ~1M ops/s per node. You need at minimum 17 Redis nodes dedicated to presence writes — in practice you use a Redis Cluster with presence sharded by `userId % num_shards`.
+
+**Presence memory footprint**
+
+$$
+500 \times 10^6 \text{ active users} \times 150 \text{ bytes/entry} = 75 \text{ GB Redis}
+$$
+
+A 6-node Redis Cluster (12 GB RAM each) handles this comfortably with room for key overhead and expiry metadata.
+
+</Capacity>
+
+## API design
+
+WhatsApp's primary transport is a persistent WebSocket connection. REST endpoints handle session setup, key exchange, and media — operations that are infrequent and do not require real-time bidirectionality.
+
+**WebSocket protocol (JSON frames over TLS)**
+
+Client to Server — send a message:
+
+```json
+{
+  "type": "message",
+  "to": "14155551234",
+  "payload": "<base64-encoded ciphertext>",
+  "msg_id": "01HQZ4M8K7BVNP3X9CFGD2JW5E",
+  "conversation_id": "conv:14155551234:14085559876",
+  "media_ref": null,
+  "timestamp_client": 1705312800000
+}
+```
+
+Server to Client — deliver a message:
+
+```json
+{
+  "type": "deliver",
+  "from": "14155551234",
+  "payload": "<base64-encoded ciphertext>",
+  "msg_id": "01HQZ4M8K7BVNP3X9CFGD2JW5E",
+  "conversation_id": "conv:14155551234:14085559876",
+  "timestamp_server": 1705312800123
+}
+```
+
+Client to Server — acknowledge receipt (triggers read receipt upstream):
+
+```json
+{
+  "type": "ack",
+  "msg_id": "01HQZ4M8K7BVNP3X9CFGD2JW5E",
+  "ack_type": "delivered"
+}
+```
+
+Client to Server — heartbeat (updates presence):
+
+```json
+{
+  "type": "heartbeat",
+  "client_timestamp": 1705312829000
+}
+```
+
+Client to Server — sync on reconnect:
+
+```json
+{
+  "type": "sync",
+  "since_msg_id": "01HQZ4M8K7BVNP3X9CFGD2JW5E"
+}
+```
+
+**REST endpoints**
+
+Upload pre-keys for X3DH (called after registration and whenever the one-time prekey bundle runs low):
+
+```
+POST /v1/keys
+Authorization: Bearer <device-token>
+Body: {
+  "identity_key": "<base64>",
+  "signed_prekey": { "key_id": 42, "public_key": "<base64>", "signature": "<base64>" },
+  "one_time_prekeys": [ { "key_id": 1, "public_key": "<base64>" }, ... ]
+}
+Response 200: { "prekeys_registered": 100 }
+```
+
+Fetch a recipient's key bundle to initiate a Signal session:
+
+```
+GET /v1/keys/{userId}?device_id=1
+Authorization: Bearer <device-token>
+Response 200: {
+  "identity_key": "<base64>",
+  "signed_prekey": { "key_id": 42, "public_key": "<base64>", "signature": "<base64>" },
+  "one_time_prekey": { "key_id": 7, "public_key": "<base64>" }
+}
+```
+
+The server marks the returned one-time prekey as consumed atomically — a CAS operation in Cassandra ensures two concurrent fetches for the same user never return the same prekey.
+
+Request a pre-signed URL for encrypted media upload:
+
+```
+POST /v1/media/upload
+Authorization: Bearer <device-token>
+Body: { "content_type": "image/jpeg", "size_bytes": 2048000, "sha256": "<hex>" }
+Response 200: { "media_id": "m_01HRQZ...", "upload_url": "https://s3.amazonaws.com/...", "expires_in": 3600 }
+```
+
+## Data model
+
+**`messages` — Cassandra, partitioned by recipient for efficient offline delivery**
+
+```sql
+CREATE TABLE messages (
+    recipient_id    text,
+    conversation_id text,
+    msg_id          timeuuid,
+    sender_id       text,
+    ciphertext      blob,
+    media_ref       text,
+    sent_at         timestamp,
+    delivered_at    timestamp,
+    read_at         timestamp,
+    PRIMARY KEY ((recipient_id), conversation_id, msg_id)
+) WITH CLUSTERING ORDER BY (conversation_id ASC, msg_id ASC)
+  AND default_time_to_live = 2592000;
+```
+
+Partition by `recipient_id` means a single Cassandra partition holds all pending offline messages for one user, enabling a single-partition read on reconnect. The 30-day TTL (`2592000` seconds) ensures abandoned messages don't accumulate. The `timeuuid` clustering key provides both ordering and uniqueness without a separate sequence number service.
+
+**`key_store` — Cassandra, stores X3DH key material per device**
+
+```sql
+CREATE TABLE key_store (
+    user_id          text,
+    device_id        int,
+    identity_key     blob,
+    signed_prekey_id int,
+    signed_prekey    blob,
+    spk_signature    blob,
+    spk_created_at   timestamp,
+    PRIMARY KEY ((user_id), device_id)
+);
+
+CREATE TABLE one_time_prekeys (
+    user_id   text,
+    device_id int,
+    key_id    int,
+    public_key blob,
+    consumed  boolean,
+    PRIMARY KEY ((user_id, device_id), key_id)
+);
+```
+
+One-time prekeys are consumed on first use. The Key Server uses a Cassandra lightweight transaction (`IF consumed = false`) to atomically claim a prekey, preventing two concurrent session initiations from consuming the same key.
+
+**`presence` — Redis, ephemeral heartbeat state**
+
+```
+SET presence:{userId} {epoch_ms} EX 75
+```
+
+The 75-second TTL is 2.5× the 30-second heartbeat interval — enough headroom for one missed heartbeat under poor connectivity. The value is the last-seen epoch in milliseconds. When a client disconnects gracefully, the Chat Server persists the current epoch to `last_seen_persistent` in Cassandra before clearing the Redis key.
+
+**`groups` — MySQL, group metadata and membership**
+
+```sql
+CREATE TABLE groups (
+    group_id   BINARY(16) PRIMARY KEY,
+    name       VARCHAR(128) NOT NULL,
+    owner_id   VARCHAR(32) NOT NULL,
+    avatar_key VARCHAR(256),
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    max_members SMALLINT NOT NULL DEFAULT 1024
+);
+
+CREATE TABLE group_members (
+    group_id  BINARY(16) NOT NULL,
+    user_id   VARCHAR(32) NOT NULL,
+    role      ENUM('member', 'admin') NOT NULL DEFAULT 'member',
+    joined_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (group_id, user_id),
+    INDEX idx_user_groups (user_id)
+);
+```
+
+**`media_refs` — MySQL, encrypted media metadata**
+
+```sql
+CREATE TABLE media_refs (
+    media_id      VARCHAR(32) PRIMARY KEY,
+    uploader_id   VARCHAR(32) NOT NULL,
+    s3_key        VARCHAR(512) NOT NULL,
+    sha256        CHAR(64) NOT NULL,
+    size_bytes    BIGINT NOT NULL,
+    content_type  VARCHAR(64) NOT NULL,
+    expires_at    DATETIME NOT NULL,
+    INDEX idx_uploader (uploader_id)
+);
+```
+
+Media objects are stored encrypted in S3. The encryption key is embedded in the message ciphertext and is never stored server-side. The `sha256` field is of the encrypted blob (not plaintext) and allows deduplication of identical uploads without compromising E2E encryption.
+
+## Architecture diagram
+
+<Mermaid diagram={`flowchart TD
+  subgraph Client["Client Devices"]
+    SenderPhone["Sender Phone\n(Signal session)"]
+    RecipientPhone["Recipient Phone\n(Signal session)"]
+  end
+
+  subgraph Ingress["Ingress Tier"]
+    LB["Load Balancer\n(sticky by userId)"]
+  end
+
+  subgraph ChatFleet["Chat Server Fleet"]
+    CSA["Chat Server A\n(holds Sender WS)"]
+    CSB["Chat Server B\n(holds Recipient WS)"]
+  end
+
+  subgraph Routing["Message Routing"]
+    Kafka["Kafka Cluster\n(partition by recipient_id)"]
+    RouterReg["WebSocket Registry\nRedis: chatserver:{userId}"]
+  end
+
+  subgraph Storage["Offline Storage"]
+    Cassandra["Cassandra\nmessages table\n30d TTL"]
+  end
+
+  subgraph KeyInfra["Key Infrastructure"]
+    KeyServer["Key Server\n(X3DH prekeys)"]
+    KeyStore["Cassandra\nkey_store +\none_time_prekeys"]
+  end
+
+  SenderPhone -->|"WebSocket TLS"| LB
+  RecipientPhone -->|"WebSocket TLS"| LB
+  LB -->|"sticky session"| CSA
+  LB -->|"sticky session"| CSB
+  CSA -->|"1. publish msg"| Kafka
+  CSA -->|"2. lookup recipient server"| RouterReg
+  Kafka -->|"3. consume partition"| CSB
+  CSB -->|"4a. recipient online: deliver"| RecipientPhone
+  CSB -->|"4b. recipient offline: store"| Cassandra
+  Cassandra -->|"5. sync on reconnect"| CSB
+  SenderPhone -->|"GET /v1/keys"| KeyServer
+  KeyServer -->|"read prekeys"| KeyStore`} />
+
+<Mermaid diagram={`flowchart LR
+  subgraph SessionSetup["X3DH Session Setup (first message only)"]
+    S1["Sender fetches\nRecipient key bundle\nfrom Key Server"]
+    S2["Sender computes\n4 DH operations\n→ shared root key"]
+    S3["Sender creates\nDouble Ratchet\nwith root key"]
+    S4["Sender encrypts\nmessage with\nratchet output key"]
+    S5["Server stores\nciphertext only"]
+    S6["Recipient decrypts\nusing own private keys\n→ same root key"]
+    S1 --> S2 --> S3 --> S4 --> S5 --> S6
+  end`} />
+
+## Deep dives
+
+### Signal Protocol: X3DH and Double Ratchet
+
+The Signal Protocol is the cryptographic engine behind WhatsApp, Signal, and (since 2016) Facebook Messenger's Secret Conversations. Understanding it at the level required for a staff-level interview means grasping two distinct algorithms that work in sequence.
+
+**X3DH (Extended Triple Diffie-Hellman)** solves the bootstrapping problem: how does a sender establish a shared secret with a recipient who is currently offline, without a trusted server in the middle? The answer is asynchronous key exchange using key material the recipient pre-deposited on the server.
+
+The recipient registers four types of keys on the Key Server: an **Identity Key** (IK) — a long-lived Curve25519 key pair that represents their identity; a **Signed Prekey** (SPK) — a medium-term key pair (rotated monthly) signed with IK to prove authenticity; and a bundle of **One-Time Prekeys** (OPKs) — ephemeral key pairs, each used exactly once and deleted after use. The sender generates an **Ephemeral Key** (EK) fresh for each session.
+
+The sender then performs four Diffie-Hellman operations:
+
+```
+DH1 = DH(IK_sender, SPK_recipient)
+DH2 = DH(EK_sender, IK_recipient)
+DH3 = DH(EK_sender, SPK_recipient)
+DH4 = DH(EK_sender, OPK_recipient)   [omitted if no OPK available]
+```
+
+These four outputs are concatenated and fed into HKDF to derive a 32-byte shared root key: `root_key = HKDF(DH1 || DH2 || DH3 || DH4)`. Both sides can compute this identically from their respective private keys — no exchange of the root key itself is needed. The Key Server never sees any private keys and therefore cannot compute `root_key`.
+
+**Double Ratchet** takes over after the root key is established. It combines two mechanisms: a **symmetric-key ratchet** (a chain of HKDF derivations producing one message key per step) and a **Diffie-Hellman ratchet** (a new DH key exchange injected at every message in the other direction). The DH ratchet is what provides **break-in recovery**: even if an attacker compromises the current ratchet state, the next DH step produces a fresh root key from new ephemeral DH material, locking the attacker out of future messages. The symmetric ratchet provides **forward secrecy**: each message key is derived from the chain and immediately deleted after use, making it impossible to decrypt past messages with a later-compromised key.
+
+The operational implication: the Key Server is involved only at session creation (to serve the prekey bundle) and when a device uploads new one-time prekeys. All per-message cryptography is entirely client-side. The server stores and forwards ciphertext. If served with a legal demand for message content, WhatsApp genuinely cannot produce it — not as a policy choice, but as a cryptographic impossibility.
+
+### WebSocket fleet and message routing
+
+Every Chat Server pod maintains a map of `userId → WebSocketSession` for the connections it currently holds. This local map is authoritative for that pod only. When Chat Server A receives a message for user B, it must first determine whether B is connected, and if so, to which server.
+
+The routing registry lives in Redis: `SET chatserver:{userId} {serverAddr}`. This key is written when a client connects (`afterConnectionEstablished`) and deleted when the client disconnects (`afterConnectionClosed`). Expiry is set conservatively at 90 seconds and refreshed with each heartbeat, ensuring stale entries from crashed pods expire automatically.
+
+Message routing logic at Chat Server A:
+
+1. Receive message frame from Sender.
+2. Publish to Kafka topic `chat-messages` with partition key = `recipient_id`. This ensures Kafka durability before any delivery attempt.
+3. A Kafka consumer (co-located on the Chat Server or on a separate Router service) picks up the message.
+4. Lookup `chatserver:{recipientId}` in Redis.
+5. If found: forward to that Chat Server via internal gRPC call: `DeliverMessage(msg_id, ciphertext, recipient_session_id)`.
+6. If not found (user offline): write the message to Cassandra `messages` table with the 30-day TTL.
+
+The gRPC call in step 5 is synchronous with a 200ms timeout. If Chat Server B is overloaded or temporarily unreachable, the caller treats it as an offline delivery and falls back to Cassandra. Chat Server B, on recovery, will not re-deliver from Cassandra because the Redis registry was cleaned up — the recipient's next connection will trigger a sync. This design accepts the edge case of double delivery (Cassandra write + gRPC delivery both succeeding) and relies on client-side deduplication by `msg_id`.
+
+The Kafka partition key of `recipient_id` means all messages for a given recipient go through the same partition, in order. This is the mechanism that guarantees per-conversation ordering — not a sequence number service, but Kafka's own partition ordering guarantee. Different conversations for the same recipient all land in the same partition; within-conversation ordering is maintained by the Cassandra clustering key.
+
+### Offline message delivery
+
+When a user reconnects, the client sends a sync frame with the last `msg_id` it successfully received. The Chat Server queries Cassandra:
+
+```
+SELECT * FROM messages
+WHERE recipient_id = ?
+AND msg_id > ?
+LIMIT 200
+```
+
+The Chat Server streams these in Cassandra clustering order (which is also arrival order, since `msg_id` is a `timeuuid`). Each message is delivered to the client WebSocket. The client sends an individual ACK frame per message. On receipt of the ACK, the Chat Server executes a Cassandra lightweight transaction to delete the row:
+
+```
+DELETE FROM messages
+WHERE recipient_id = ? AND conversation_id = ? AND msg_id = ?
+IF EXISTS
+```
+
+The `IF EXISTS` guard makes the delete idempotent — if the client crashes mid-sync and reconnects, re-delivering and re-ACKing the same messages doesn't cause Cassandra errors. The 30-day TTL acts as a safety net: if the client never reconnects, Cassandra's compaction process will eventually evict those rows without any application-level cleanup job.
+
+A reconnect storm — millions of devices reconnecting simultaneously after a 30-minute regional outage — is one of the most dangerous failure modes. Each reconnecting client fires a Cassandra read. At 50M reconnects in 60 seconds (realistic for a regional outage affecting Southeast Asia in morning peak), that is 833K Cassandra reads per second. Mitigation: exponential backoff with jitter on the client reconnect timer, plus a graduated rate limiter at the Chat Server that queues reconnect-driven Cassandra reads before they hit the storage tier.
+
+### Presence at 2B user scale
+
+The naive implementation of presence — a global map of `userId → isOnline` — does not scale to 2B users. Even at 150 bytes per entry, 2B entries is 300 GB. More critically, updating and reading from a single data structure at 16.7M writes per second (heartbeats) plus billions of read operations per day requires a fundamentally different approach.
+
+WhatsApp's presence model has two key constraints that make it tractable: **(1) you only see presence for contacts who have your number**, and **(2) you only need presence granularity at 30-second resolution**. Constraint 1 limits the fan-out of a presence update to your contact list (typically a few hundred people), not all 2B users. Constraint 2 allows Redis `SET ... EX 75` with lazy reads — you don't push presence updates; the reader queries Redis when they open a chat.
+
+On heartbeat receipt: `SET presence:{userId} {epoch_ms} EX 75`. On chat open (viewer opens chat with contact): `GET presence:{userId}`. If the key exists and the epoch is within the last 30 seconds: show "online." If the key exists but older: show "last seen at \{epoch\}." If the key is absent (expired or never set): query Cassandra `last_seen_persistent` table for the stored timestamp and display "last seen [date]."
+
+The "last seen" feature adds one more operation: when a user disconnects (WebSocket close), the Chat Server writes the current timestamp to `last_seen_persistent:{userId}` in Cassandra. This persists across Redis TTL expiry. The user's privacy setting (show last seen to: everyone / contacts / nobody) is enforced at read time by the API layer — the data is stored, but the response is withheld based on the viewer-contact relationship. This is simpler and more consistent than attempting to conditionally not write the data.
+
+### Group message delivery
+
+WhatsApp supports groups up to 1,024 members with full E2E encryption. The cryptographic model is **sender-side fan-out**: the sender's device is responsible for encrypting one copy of the message per recipient, using the established Signal session for each recipient-device pair.
+
+A group with 1,024 members where each member has an average of 1.5 registered devices means the sender's app must produce ~1,536 ciphertext blobs per group message. For text messages (a few hundred bytes of plaintext), this is fast — AES-256-CBC encryption of 300 bytes, 1,536 times, takes less than 50ms on a modern mobile CPU. For a 5MB video file, encrypting 1,536 copies would be catastrophically slow and bandwidth-prohibitive.
+
+The solution for media is the **Encrypted Media Key** pattern: the sender generates a random 256-bit symmetric key, encrypts the media file once with this key (producing a single encrypted blob uploaded to S3), then distributes the symmetric key to each recipient by embedding it in their individual Signal-encrypted message envelope. Each recipient uses their session key to decrypt the envelope, extracts the media symmetric key, and decrypts the S3 blob locally. The server stores one encrypted blob regardless of group size.
+
+For text message fan-out, the **Sender Key** optimization (part of the Signal specification) can reduce the number of encryption operations. With Sender Key, each group member generates a "sender key" — a symmetric ratcheting key specific to their sender identity within this group. The sender distributes this key to all members encrypted via their individual Signal sessions (a one-time setup cost per group member). Subsequent messages are encrypted once with the Sender Key and the single ciphertext is broadcast to all members, who decrypt it using the cached Sender Key. This reduces per-message encryption from O(N) to O(1). The trade-off: Sender Key has weaker forward secrecy properties (a compromised Sender Key reveals all messages until the next Sender Key rotation) and adds complexity to membership changes (every time a member leaves, the Sender Key must be rotated and re-distributed to all remaining members).
+
+WhatsApp uses Sender Key for group messages when the group is large enough that the O(N) per-message cost becomes user-visible. Understanding this trade-off — O(N) encryption per message with full forward secrecy vs. O(1) encryption per message with a Sender Key rotation on membership change — is the level of detail that distinguishes a complete answer.
+
+## Java integration
+
+### Part A — OfflineMessageStore.java
+
+```java
+package dev.pushkar.whatsapp.messaging;
+
+import org.springframework.data.cassandra.core.CassandraOperations;
+import org.springframework.data.cassandra.core.query.Criteria;
+import org.springframework.data.cassandra.core.query.Query;
+import org.springframework.stereotype.Repository;
+
+import java.time.Instant;
+import java.util.List;
+
+@Repository
+public class OfflineMessageStore {
+
+    private static final int TTL_SECONDS = 2_592_000; // 30 days
+
+    private final CassandraOperations cassandra;
+
+    public OfflineMessageStore(CassandraOperations cassandra) {
+        this.cassandra = cassandra;
+    }
+
+    public void storeMessage(String recipientId, String conversationId,
+                             String msgId, byte[] ciphertext, Instant sentAt) {
+        StoredMessage msg = new StoredMessage(
+            recipientId, conversationId, msgId, null, ciphertext, sentAt, null, null
+        );
+        cassandra.insert(msg);
+    }
+
+    public List<StoredMessage> fetchUndelivered(String recipientId,
+                                                 String sinceMessageId, int limit) {
+        Query query = Query.query(
+            Criteria.where("recipient_id").is(recipientId),
+            Criteria.where("msg_id").gt(sinceMessageId)
+        ).limit(limit);
+        return cassandra.select(query, StoredMessage.class);
+    }
+
+    public void markDelivered(String recipientId, String conversationId, String msgId) {
+        cassandra.delete(Query.query(
+            Criteria.where("recipient_id").is(recipientId),
+            Criteria.where("conversation_id").is(conversationId),
+            Criteria.where("msg_id").is(msgId)
+        ), StoredMessage.class);
+    }
+
+    public record StoredMessage(
+        String recipientId,
+        String conversationId,
+        String msgId,
+        String senderId,
+        byte[] ciphertext,
+        Instant sentAt,
+        Instant deliveredAt,
+        Instant readAt
+    ) {}
+}
+```
+
+### Part B — ChatWebSocketHandler.java
+
+```java
+package dev.pushkar.whatsapp.transport;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import dev.pushkar.whatsapp.messaging.OfflineMessageStore;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Component;
+import org.springframework.web.socket.TextMessage;
+import org.springframework.web.socket.WebSocketSession;
+import org.springframework.web.socket.handler.TextWebSocketHandler;
+
+import java.time.Instant;
+import java.util.concurrent.TimeUnit;
+
+@Component
+public class ChatWebSocketHandler extends TextWebSocketHandler {
+
+    private final KafkaTemplate<String, String> kafka;
+    private final StringRedisTemplate redis;
+    private final OfflineMessageStore offlineStore;
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    public ChatWebSocketHandler(KafkaTemplate<String, String> kafka,
+                                 StringRedisTemplate redis,
+                                 OfflineMessageStore offlineStore) {
+        this.kafka = kafka;
+        this.redis = redis;
+        this.offlineStore = offlineStore;
+    }
+
+    @Override
+    public void afterConnectionEstablished(WebSocketSession session) {
+        String userId = extractUserId(session);
+        String serverAddr = System.getenv("POD_IP") + ":" + System.getenv("GRPC_PORT");
+        redis.opsForValue().set("chatserver:" + userId, serverAddr, 90, TimeUnit.SECONDS);
+    }
+
+    @Override
+    protected void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
+        JsonNode frame = mapper.readTree(message.getPayload());
+        String type = frame.get("type").asText();
+        String userId = extractUserId(session);
+
+        switch (type) {
+            case "message" -> {
+                String payload = mapper.writeValueAsString(frame);
+                kafka.send("chat-messages", frame.get("to").asText(), payload);
+            }
+            case "ack" -> {
+                String msgId = frame.get("msg_id").asText();
+                String convId = frame.get("conversation_id").asText();
+                offlineStore.markDelivered(userId, convId, msgId);
+                kafka.send("read-receipts", userId, mapper.writeValueAsString(frame));
+            }
+            case "heartbeat" -> redis.opsForValue().set(
+                "presence:" + userId,
+                String.valueOf(Instant.now().toEpochMilli()),
+                75, TimeUnit.SECONDS
+            );
+        }
+    }
+
+    @Override
+    public void afterConnectionClosed(WebSocketSession session,
+                                       org.springframework.web.socket.CloseStatus status) {
+        String userId = extractUserId(session);
+        redis.delete("chatserver:" + userId);
+        redis.opsForValue().set(
+            "last_seen_persistent:" + userId,
+            String.valueOf(Instant.now().toEpochMilli())
+        );
+    }
+
+    private String extractUserId(WebSocketSession session) {
+        return (String) session.getAttributes().get("userId");
+    }
+}
+```
+
+The handler is intentionally thin. The `switch` dispatches by frame type and delegates durable work (Kafka publish, Cassandra write) to downstream components. The `afterConnectionClosed` hook writes `last_seen_persistent` to Redis (which is later synced to Cassandra by a background job) rather than doing a synchronous Cassandra write on the critical path of WebSocket teardown — this keeps connection close latency under 5 ms.
+
+<TradeoffTable title="Messaging encryption and offline delivery models">
+
+| Approach | E2E Security | Offline Support | Group Scale | Complexity |
+|---|---|---|---|---|
+| Server-side encryption (no E2E) | None — server can read all messages; legally compelled disclosure is trivial | Full — server has plaintext and can queue/re-deliver trivially | Excellent — server decrypts once and re-encrypts per recipient (cheap) | Low — no client-side crypto; standard queue-and-deliver |
+| Client-side E2E, server stores ciphertext (Signal Protocol — WhatsApp) | Strong — server stores ciphertext; key compromise does not reveal past messages (forward secrecy) | Good — ciphertext queued server-side; TTL enforced; ordering via Cassandra clustering key | Moderate — sender-side O(N) encryption per message; Sender Key optimization reduces to O(1) with rotation cost | High — X3DH session setup, Double Ratchet state machine, prekey management, multi-device sessions |
+| Client-side E2E, no offline queue (iMessage-style push-only) | Strong — Apple has no access to message content in iMessage | Poor — messages dropped if recipient offline; relies on push notification wakeup which is unreliable | Poor — push token fan-out required; no guaranteed ordering | Medium — crypto is client-side but simpler delivery model (push or fail) |
+| Federation (Matrix protocol) | Varies — homeservers exchange encrypted events; server admins can read if client-side crypto not used | Good — federated homeservers queue for offline members | Excellent — rooms fan-out across homeservers; each homeserver delivers to its own members | Very High — federation protocol, homeserver trust model, DAG-based event ordering, room state resolution |
+
+</TradeoffTable>
+
+<Pitfall title="Using a single Chat Server as the message broker without Kafka">
+
+A common early design puts all message routing inside the Chat Server: Server A holds Alice's WebSocket and Bob's WebSocket, so when Alice sends to Bob, Server A just looks up Bob's session and writes directly. This works until you have more users than one server can hold — which happens immediately at any meaningful scale.
+
+The more subtle failure is in-flight message loss. Without a durable intermediate layer, a Chat Server failure between receiving Alice's message and delivering to Bob means the message is gone. There is no replay. The user experience is that messages silently disappear. Adding Kafka between the Chat Server receiving the message and the Chat Server delivering it provides durability: the message is committed to Kafka's log before any delivery attempt, and any server can be the consumer. If the consumer crashes mid-delivery, Kafka redelivers from the last committed offset. The Chat Server becomes stateless with respect to message routing — it holds WebSocket sessions, but message durability is Kafka's responsibility.
+
+</Pitfall>
+
+<Pitfall title="Pre-key exhaustion in X3DH and silent fallback">
+
+X3DH requires the recipient to have one-time prekeys (OPKs) registered on the Key Server. Each OPK is consumed exactly once. If a user receives many new session initiations simultaneously (they went viral, or they just changed phones and many contacts are re-establishing sessions), the OPK bundle can be exhausted before the client replenishes it.
+
+The Signal specification defines a fallback: if no OPK is available, X3DH proceeds with only three DH operations (omitting `DH4`). The session is established successfully, but without the one-time prekey, you lose the "one-time" property that protects against a key compromise scenario where an attacker retroactively learns the SPK. The session's forward secrecy from the Double Ratchet is unaffected, but the initial message before the first ratchet step has weaker protection.
+
+The mitigation is aggressive prekey monitoring. The Key Server tracks OPK counts per device and pushes a silent notification to the client when the count drops below 20, triggering a replenishment upload. Clients should upload 100 OPKs at registration time. This is a detail that WhatsApp's protocol documentation explicitly calls out, and raising it in an interview signals you have read the spec, not just the Wikipedia summary.
+
+</Pitfall>
+
+<Curveball question="A government demands that WhatsApp provide decrypted message content for a specific user. How does the E2E architecture respond to this legally, and what data CAN WhatsApp hand over?">
+
+The E2E architecture makes compliance with such a demand cryptographically impossible, not just a policy refusal. WhatsApp stores only ciphertext on its servers. The decryption keys exist only on user devices as part of the Double Ratchet state, and each message's key is derived ephemerally and immediately discarded after use. WhatsApp cannot produce plaintext even if it wanted to comply.
+
+What WhatsApp CAN provide in response to a lawful demand: message metadata — sender ID, recipient ID, timestamp, conversation ID, message size — because these are stored unencrypted to facilitate routing and delivery. They can also provide account registration data (phone number, registration timestamp, last-seen timestamp, IP address at registration), group membership lists (group IDs and member phone numbers, but not group message content), and backup data if the user opted into unencrypted cloud backups (WhatsApp's cloud backups were historically not E2E encrypted, a fact that authorities have exploited — this was corrected with the optional E2E backup feature introduced in 2021). Legally, WhatsApp can also attempt to serve a user with a legal demand to compel them to produce their own device data — but that is no longer WhatsApp's architectural concern.
+
+The important nuance for the interview: metadata is not nothing. Knowing who talks to whom, when, and how frequently is substantial intelligence even without message content. This is why privacy-focused users often pair Signal Protocol messaging with metadata-minimizing measures like sealed sender (hiding the sender identity even from the server). WhatsApp does not implement sealed sender, which is a known architectural difference from Signal.
+
+</Curveball>
+
+<Curveball question="Design message delivery for a group of 1,024 members where 800 are offline. How do you avoid sending 1,024 Kafka messages per group post?">
+
+The naive implementation publishes one Kafka message per recipient — 1,024 messages for a single group post. At a group posting rate of 10 messages per second across 500M groups, that is 5.12 billion Kafka messages per second from group fan-out alone. This is clearly untenable.
+
+The correct design separates the fan-out into two stages with a group-level Kafka message as the unit of routing, not per-recipient messages. Stage 1: the Chat Server publishes a single message to the `group-messages` Kafka topic with payload `{group_id, sender_id, encrypted_blobs: {userId: ciphertext, ...}, msg_id}`. The key is `group_id`, so all messages for a group land in the same partition in order.
+
+Stage 2: a **Group Fan-out Service** consumes from `group-messages`. For each group message, it reads the member list from MySQL (or a Redis cache of the member list), looks up each member's current Chat Server from the WebSocket Registry, and batches deliveries: for all online members sharing the same Chat Server, it sends a single gRPC batch call to that server with N ciphertext blobs. For offline members, it does a Cassandra batch write — one `UNLOGGED BATCH` per Cassandra partition (per recipient) to amortize write overhead.
+
+This reduces Kafka messages from O(N) per group post to O(1), and gRPC calls from O(N) to O(unique Chat Servers with online members) — typically O(1) to O(10) for most groups. The Cassandra write for 800 offline members can be parallelized across Cassandra partitions with async writes and a semaphore to cap concurrency at 200 parallel writes. The entire fan-out for a 1,024-member group with 800 offline members completes in under 200ms at p99 — well within the 1-second delivery SLA.
+
+</Curveball>
+
+<Curveball question="WhatsApp wants to add 'Disappearing Messages' — messages auto-delete from all devices after 7 days. How do you enforce deletion on devices that are offline for 7 days?">
+
+Disappearing messages is a client-side enforcement problem with a server-side signaling assist. The fundamental constraint is that you cannot remotely execute code on a client device — you can only send it messages.
+
+The design has three layers. First: every message in a disappearing-messages conversation has a `disappear_at` timestamp embedded in the message frame (7 days from `sent_at`). The sender's and recipient's apps set a local timer to delete the message from local storage at `disappear_at`. This handles the happy path.
+
+Second: for devices that were online, received the message, and then go offline for 7 days — when they reconnect, the app checks all stored messages against their `disappear_at` timestamp and deletes any that have expired. This is a local operation and requires no server involvement.
+
+Third: for devices that were offline for the full 7 days and never received the message — the server-side Cassandra TTL (already set to 30 days for normal messages) is overridden to 7 days for disappearing conversations. The message simply expires from the offline queue before the device reconnects. The device syncs on reconnect, requests messages `since_msg_id`, and Cassandra returns nothing because the rows have TTL-expired. The message was never delivered, which is the correct behavior — it should have disappeared.
+
+The adversarial case is a rooted device where a user has disabled app-level message deletion. WhatsApp cannot prevent this — they can only make it harder by not storing plaintext anywhere on disk (messages are held in encrypted SQLite with a key derived from the device's hardware-backed keystore). More importantly, disappearing messages is a social contract, not a cryptographic guarantee: "I intend for these messages not to be retained," not "it is technically impossible to retain them." The design should acknowledge this limitation explicitly rather than overclaiming the security model.
+
+</Curveball>
+
+## Further reading
+
+- Marlinspike & Perrin: "The Double Ratchet Algorithm" — the canonical Signal documentation explaining the ratchet mechanisms, security proofs, and implementation considerations; available at signal.org/docs/specifications/doubleratchet
+- Cohn-Gordon, Cremers, Dowling, Garratt, Stebila: "A Formal Security Analysis of the Signal Messaging Protocol" — IEEE European Symposium on Security and Privacy 2017; provides rigorous cryptographic proofs of the properties claimed informally in the Signal documentation
+- WhatsApp Engineering Blog: "Scaling to Billions" — the team's overview of how Erlang/BEAM was used for the original Chat Server fleet, achieving millions of connections per machine; also covers the move to a more modular architecture post-Facebook acquisition
+- Electronic Frontier Foundation: "Surveillance Self-Defense — How End-to-End Encryption Works" — accessible explanation of the threat model E2E encryption addresses and what it explicitly does not protect against (metadata, endpoint compromise, backup vulnerabilities)
+
+<RelatedQuestions items={[
+  { slug: "slack", title: "Design Slack", difficulty: "senior" },
+  { slug: "discord", title: "Design Discord", difficulty: "senior" },
+  { slug: "notification-system", title: "Design a Multi-channel Notification System", difficulty: "senior" },
+]} />

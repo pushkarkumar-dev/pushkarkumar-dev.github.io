@@ -1,0 +1,571 @@
+---
+title: "Design a Distributed Logging System"
+slug: "distributed-logging-system"
+category: "infra"
+difficulty: "senior"
+estimatedReadMinutes: 20
+tags: ["elasticsearch", "kafka", "structured-logging", "sampling", "hot-cold-tiering", "loki", "opentelemetry"]
+companyFlavors: ["Elastic (ELK Stack)", "Datadog", "Splunk", "Grafana Loki", "AWS CloudWatch"]
+prerequisites: []
+relatedQuestions: ["metrics-monitoring", "distributed-job-scheduler", "api-gateway"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Design a logging pipeline that ingests billions of structured log lines per day, supports full-text search with sub-second latency, and implements hot/warm/cold tiering to control storage costs — covering sampling strategies, schema design, and query performance."
+javaPackages: ["org.springframework.boot:spring-boot-starter-actuator:3.3.0", "net.logstash.logback:logstash-logback-encoder:7.4", "org.springframework.kafka:spring-kafka:3.2.0", "co.elastic.clients:elasticsearch-java:8.13.0"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="distributed-logging-system" title="Design a Distributed Logging System" />
+
+<Tldr>
+- **Structured logs (JSON) over unstructured text** — searchable fields without regex parsing at query time; Elasticsearch indexes `level`, `service`, and `traceId` as first-class keyword fields
+- **Kafka as the ingestion buffer** — decouples producers from the index cluster, absorbs log bursts, and allows full replay if the indexer falls behind or is redeployed
+- **Tail-based sampling** — don't sample randomly; collect all traces, then keep 100% of errors and sample 1% of successful requests. Head-based random sampling loses the error traces you actually need.
+- **Hot/warm/cold tiering** — recent 7 days in Elasticsearch on SSD, days 8–90 on warm HDD nodes, 90+ days in S3/GCS queried via Athena/BigQuery. Cost drops roughly 10× per tier transition.
+- **Log levels are a contract** — ERROR means page-worthy, WARN means investigate, INFO means business event, DEBUG is disabled in production by default. Violating this contract drowns the signal in noise.
+</Tldr>
+
+## Why centralized logging?
+
+In a monolithic application, logs are simple: one process, one file, tail it. In a microservices architecture running on Kubernetes, a single user request may traverse eight services — an API gateway, an auth service, a product catalog, an inventory service, a pricing engine, an order service, a notification service, and a payment processor. Each service runs as ephemeral pods that are created and destroyed by the scheduler. If the order service pod crashes and is replaced, its local logs vanish with it. When a customer reports that their order failed, reconstructing what happened across those eight services — without centralized logging — means SSHing into eight different nodes, grepping through eight different log files, and manually correlating timestamps. That is not operationally viable at any reasonable scale.
+
+Centralized logging solves this by funneling every log line from every service into a single queryable store, indexed by a common `traceId` field that is propagated through every service as part of the request context. With this, a single query `GET /trace/abc-123` retrieves the complete story of a request across all services, ordered by timestamp. The engineering challenge is making that pipeline reliable enough to be trusted under load, fast enough to be useful during an active incident, and cheap enough to retain logs for compliance periods without breaking the storage budget.
+
+The design pressure at staff level is not "how do we collect logs" — that is solved. The real questions are around the ingestion rate (bytes per second), the query latency SLA during incidents, the cost of retaining years of data, and the correctness guarantees around delivery semantics and PII handling. These are the dimensions that separate a toy ELK setup from a production logging system.
+
+## Clarifying questions
+
+Before designing anything, pin down these eight dimensions. Each answer gates a different architectural decision.
+
+| Question | Ideal answer to extract | Why it matters |
+|---|---|---|
+| What is the log volume per day in bytes and events? | "10 TB/day, roughly 5 billion events" | Determines Kafka partition count, Elasticsearch shard size, and storage tier budgets |
+| What is the required retention period? | "30 days hot, 1 year archive" | Drives the ILM policy and determines whether you need S3 cold storage |
+| What are the primary query patterns? | "Full-text search, field filtering by service/level/traceId, trace correlation" | Decides whether Elasticsearch (full-text), Loki (label-only), or ClickHouse (columnar) wins |
+| Do we need real-time alerting on log patterns? | "Yes — ERROR rate spike should page on-call within 60 seconds" | Requires a streaming processor (Flink, Kafka Streams) on the Kafka topic, not just index queries |
+| Is this multi-tenant — different teams or customers? | "Multi-team internally; index-level RBAC per team" | Affects index naming strategy and Elasticsearch role mapping |
+| Do we need distributed tracing (OpenTelemetry) integration? | "Yes — correlate logs to traces via traceId/spanId" | Means the log schema must carry W3C trace context fields |
+| Are there compliance or PII scrubbing requirements? | "GDPR — no PII in logs, right-to-erasure within 30 days" | Forces a scrubbing layer in the ingestor and daily index rollover for targeted deletion |
+| What is the storage cost budget? | "$50–100K/month" | Rules out keeping all logs on SSD; tiering to S3 is mandatory |
+
+## Functional requirements
+
+- **Ingest** structured log events from any service via a log agent (FluentBit, OpenTelemetry Collector) or direct Kafka publish, with at-least-once delivery semantics
+- **Search** logs by any combination of structured fields — `service`, `level`, `traceId`, `userId`, `host` — with optional full-text search on the `message` field
+- **Tail** live logs for a given service and level in real-time via a WebSocket streaming endpoint (useful during deployments and active incident response)
+- **Correlate** all log lines belonging to a distributed trace via a single `GET /trace/{traceId}` lookup
+- **Enforce retention policies** — automatic deletion of hot-tier indices after 7 days, migration to warm tier at day 7, cold archival at day 90, full deletion at day 365
+- **Alert** on log-based conditions — "more than 100 ERROR lines per minute from the payment service" — with sub-60-second detection latency
+
+## Non-functional requirements
+
+- **Ingestion throughput**: sustain 10 TB/day raw log volume (~116 MB/sec) with the ability to absorb 10× bursts for up to 10 minutes via Kafka buffering
+- **Search latency**: p99 < 1 second for queries against the last 24 hours of data; p99 < 10 seconds for queries spanning 30 days
+- **Delivery guarantee**: 99.9% log delivery under normal conditions; tolerate up to 0.1% loss during extreme sustained bursts (this is a logging system, not a financial ledger)
+- **Hot retention**: 30 days fully indexed and searchable in Elasticsearch
+- **Archive retention**: 1 year in object storage (S3/GCS), queryable via Athena/BigQuery on demand
+- **Availability**: logging pipeline failure must be non-blocking to application services — the logging agent must never stall the application thread
+
+## Capacity estimation
+
+<Capacity title="Back-of-envelope: 10 TB/day raw logs, 30-day hot tier, 1-year archive">
+
+**Ingestion rate**
+
+$$
+\text{ingestion\_rate} = \frac{10 \text{ TB/day}}{86{,}400 \text{ s/day}} = \frac{10 \times 10^{12}}{86{,}400} \approx 116 \text{ MB/s}
+$$
+
+At an average log line size of 2 KB (JSON with context fields), that is roughly 58,000 log events per second sustained.
+
+**Elasticsearch storage — hot tier (7 days, 3× replication)**
+
+$$
+\text{hot\_storage} = 10 \frac{\text{TB}}{\text{day}} \times 7 \text{ days} \times 3 \text{ replicas} = 210 \text{ TB SSD}
+$$
+
+Elasticsearch's inverted index adds roughly 20% overhead on top of raw data, so budget 252 TB of SSD provisioned capacity.
+
+**Warm tier (days 8–90, HDD, replicas reduced to 1)**
+
+$$
+\text{warm\_storage} = 10 \frac{\text{TB}}{\text{day}} \times 83 \text{ days} \times 2 \text{ copies} = 1{,}660 \text{ TB HDD}
+$$
+
+After force-merge to 1 segment in the warm phase, index overhead drops; budget 1.8 PB HDD.
+
+**Cold archive (days 91–365, S3 at \$0.023/GB)**
+
+$$
+\text{archive\_data} = 10 \frac{\text{TB}}{\text{day}} \times 275 \text{ days} = 2{,}750 \text{ TB} = 2.75 \text{ PB}
+$$
+
+$$
+\text{monthly\_archive\_cost} = 2{,}750{,}000 \text{ GB} \times \$0.023 \approx \$63{,}250 \text{/month}
+$$
+
+Apply Snappy or Zstd compression to raw log files before archival — typical 4–6× compression ratio on JSON reduces this to roughly \$12–15K/month.
+
+**Kafka buffer (2-hour burst absorber)**
+
+$$
+\text{kafka\_buffer} = 116 \frac{\text{MB}}{\text{s}} \times 7{,}200 \text{ s} \approx 835 \text{ GB}
+$$
+
+With a replication factor of 3: 2.5 TB of Kafka broker disk for the ingestion buffer. Kafka topic retention is set to 2 hours under normal conditions, extendable to 24 hours during indexer incidents.
+
+</Capacity>
+
+## API design
+
+The logging system exposes five endpoints — two for write, three for read.
+
+```
+POST /ingest
+  Content-Type: application/json
+  Body: { "logs": [LogEvent, ...] }   // batch up to 1000 events
+  Response: 202 Accepted              // async; delivery not guaranteed beyond Kafka commit
+
+POST /ingest/stream (Kafka topic: log-events)
+  // Preferred path for high-throughput services; agents publish directly
+  // Key: service name (enables per-service partition affinity)
+
+GET /search?q=NullPointerException&service=order-svc&level=ERROR&from=now-1h&to=now&size=100
+  // Full-text search + structured field filtering
+  // Returns: { hits: [LogEntry], total: int, took_ms: int }
+
+GET /tail?service=payment-svc&level=ERROR
+  // WebSocket — streams live matching log events as they are indexed
+  // Useful during deploys and incident triage
+
+GET /trace/{traceId}
+  // Fetch all log lines correlated to a distributed trace, ordered by timestamp
+  // Returns: { events: [LogEntry], services: [string], span_count: int }
+
+POST /alerts
+  Body: { "name": "payment-error-spike", "query": { "service": "payment-svc", "level": "ERROR" },
+          "threshold": 100, "window_seconds": 60, "channel": "pagerduty" }
+  // Creates a stream-processor rule on the Kafka topic
+```
+
+## Data model
+
+**Log event schema** — every field is mandatory except `extra`, which carries service-specific key-value pairs:
+
+```json
+{
+  "@timestamp": "2026-05-07T14:23:01.456Z",
+  "level": "ERROR",
+  "service": "order-service",
+  "host": "pod-order-7d9f8b-xk2p1",
+  "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "spanId": "00f067aa0ba902b7",
+  "userId": "usr_9kq2m",
+  "message": "Payment processing failed: insufficient funds",
+  "logger": "dev.pushkar.order.PaymentClient",
+  "thread": "http-nio-8080-exec-3",
+  "extra": {
+    "orderId": "ord_8xp4q",
+    "amountCents": 4999,
+    "currency": "USD",
+    "errorCode": "INSUFFICIENT_FUNDS"
+  }
+}
+```
+
+**Elasticsearch index strategy** — daily rolling indices named `logs-YYYY-MM-DD`. This pattern enables three things: (1) time-range queries route to a small number of indices rather than scanning everything, (2) retention enforcement is a single `DELETE /logs-2026-04-06` API call with no document-level deletion, (3) ILM transitions happen at index granularity, not document granularity.
+
+**Elasticsearch field mapping** — explicit mapping is mandatory; dynamic mapping on a high-cardinality field will silently create a `text` field with an inverted index that balloons heap usage:
+
+```json
+{
+  "mappings": {
+    "properties": {
+      "@timestamp":  { "type": "date" },
+      "level":       { "type": "keyword" },
+      "service":     { "type": "keyword" },
+      "host":        { "type": "keyword" },
+      "traceId":     { "type": "keyword" },
+      "spanId":      { "type": "keyword" },
+      "userId":      { "type": "keyword" },
+      "message":     { "type": "text", "analyzer": "standard" },
+      "logger":      { "type": "keyword" },
+      "thread":      { "type": "keyword" },
+      "extra":       { "type": "flattened" }
+    }
+  }
+}
+```
+
+The `extra` field uses Elasticsearch's `flattened` type — it indexes all leaf values as keywords without creating a dynamic field per key. This prevents the mapping explosion that happens when 200 services each add their own unique `extra.*` fields.
+
+**ILM policy** — four phases, driven by index age and primary shard size:
+
+| Phase | Trigger | Node tier | Replicas | Segment state | Storage |
+|---|---|---|---|---|---|
+| Hot | On creation | SSD data nodes | 1 (primary + 1) | Normal | NVMe SSD |
+| Warm | 7 days old OR primary shard > 50 GB | HDD warm nodes | 0 replicas | Force-merged to 1 segment | Spinning HDD |
+| Cold (frozen) | 90 days old | No local copies | 0 replicas | Loaded from snapshot | S3 via searchable snapshot |
+| Delete | 365 days old | — | — | Index deleted | — |
+
+## High-level architecture
+
+<Mermaid caption="End-to-end log pipeline: agents buffer locally, Kafka decouples ingestion from indexing, ILM manages tier transitions automatically" diagram={`graph LR
+  Services[Microservices] --> Agent[Log Agents\nFluentBit / OTEL]
+  Agent --> Kafka[Kafka\nlog-events topic]
+  Kafka --> Ingestor[Logstash /\nVector Ingestor]
+  Ingestor --> ES[Elasticsearch\nHot Tier]
+  ES --> Warm[Warm Tier\nHDD]
+  Warm --> Cold[Cold Tier\nS3 + Athena]
+  ES --> Kibana[Kibana /\nGrafana]
+  Kafka --> Alerter[Stream Processor\nAlerts]`} />
+
+**Log agents (FluentBit / OpenTelemetry Collector)** run as DaemonSets on every Kubernetes node. They tail container stdout/stderr via the Docker logging driver, buffer locally to disk (so a Kafka hiccup doesn't lose in-flight logs), and batch-publish to Kafka. The agent is the reliability boundary — once a log line is committed to Kafka, the system guarantees at-least-once delivery to Elasticsearch.
+
+**Kafka** acts as the shock absorber. When Elasticsearch is slow (during a rolling upgrade, a shard rebalance, or a query-heavy incident), the ingestors fall behind but Kafka holds the backlog. The topic is partitioned by service name, giving each service its own ordered partition. Partition count starts at 64 — enough for 64 parallel ingestor threads — and scales horizontally.
+
+**Logstash / Vector ingestors** are stateless consumers that read from Kafka, run the PII scrubbing pipeline, enrich events with Kubernetes metadata (namespace, pod name, node), and bulk-write to Elasticsearch using the `_bulk` API with batches of 5,000 documents. Vector (Rust-based) is preferred over Logstash for new deployments — 3× lower CPU at equivalent throughput and no JVM heap tuning.
+
+**Elasticsearch cluster** runs three tiers of data nodes: hot (NVMe SSD, 8 primary shards per daily index, sized to keep each shard under 50 GB), warm (HDD, ILM migrates indices automatically), and frozen (searchable snapshots backed by S3 — no local storage, reads hydrate from S3 on demand). A separate coordinating node tier handles query fan-out without competing with data node resources.
+
+**Stream processor** (Kafka Streams or Flink) consumes the same `log-events` topic in parallel and evaluates alert rules. It maintains sliding window counts per `(service, level)` and fires notifications when thresholds are crossed. This path has sub-10-second latency from log emission to alert, independent of Elasticsearch indexing lag.
+
+## Deep dives
+
+### Structured logging and schema design
+
+The single highest-leverage change in any logging system is the move from unstructured to structured logs. Consider the difference between:
+
+```
+2026-05-07 14:23:01 ERROR Order creation failed for user 9kq2m, orderId=ord_8xp4q, amount=49.99
+```
+
+and:
+
+```json
+{"@timestamp":"2026-05-07T14:23:01.456Z","level":"ERROR","service":"order-service",
+ "userId":"usr_9kq2m","extra":{"orderId":"ord_8xp4q","amountCents":4999}}
+```
+
+The unstructured line requires a regex at query time to extract `userId` — and if the format changes across services or versions, the regex breaks. The JSON line lets Elasticsearch index `userId` as a `keyword` field, enabling an exact-match query in O(log N) via the inverted index. At 5 billion events per day, the difference between an index lookup and a full-text scan is the difference between a 200 ms query and a timeout.
+
+**MDC (Mapped Diagnostic Context)** is the mechanism in Java for propagating request context — `traceId`, `userId`, `orderId` — through all log lines in a request without passing them as method arguments. SLF4J's `MDC` is a thread-local map that logback-logstash-encoder serializes as top-level JSON fields automatically. Set it in an `OncePerRequestFilter` at the entry point of every request, and clear it in a `finally` block.
+
+**Field cardinality governs cost.** Every unique value of a `keyword` field adds an entry to Elasticsearch's term dictionary. Fields like `traceId` and `requestId` — with billions of unique values — are appropriate as `keyword` only if you actually search for specific values. If you only need them for correlation (fetch by exact ID), they are fine. If you try to run aggregations (e.g., `terms` aggregation on `traceId`), you will immediately OOM the coordinating node. Forbid aggregations on high-cardinality fields via index aliases that set `"aggregate_metric_only": true` on those fields.
+
+### Sampling strategies
+
+At 58,000 events per second, even a 2× amplification event (a chatty error loop) doubles your ingestion cost and risks overwhelming your Elasticsearch cluster. Sampling is the pressure relief valve — but the strategy determines whether it is useful or destructive.
+
+**Head-based sampling** makes the sampling decision at the start of a trace. A random number is drawn; if it falls below the sampling rate (say 1%), the trace is recorded. Simple to implement, but catastrophic for error visibility: a 1% sampling rate means 99% of error traces are discarded before you even know they are errors. During an incident where 0.1% of requests are failing, head-based sampling at 1% means you have a 10% chance of capturing any given error trace. You would be debugging a production incident blind.
+
+**Tail-based sampling** defers the decision until the trace is complete. A trace buffer in the OpenTelemetry Collector holds all spans for every in-flight trace for up to 30 seconds. When the root span completes, a sampling processor evaluates the completed trace: if any span has an error status or if the total trace duration exceeds a latency threshold (e.g., p99 of 2 seconds), keep 100% of it. Otherwise, apply a 1% random sample to successful, fast traces. This gives you complete visibility into errors at the cost of a 30-second buffering delay and the memory required to hold in-flight traces.
+
+**Adaptive sampling** is the production refinement: instead of a fixed 1% rate, the sampler targets a fixed event budget (e.g., 10,000 events per second) and adjusts the sampling rate dynamically based on current volume. During quiet periods, sample at 10%; during a traffic spike, drop to 0.1%. This keeps your Elasticsearch ingest rate predictable regardless of application load.
+
+The implementation uses the OpenTelemetry Collector's `tailsampling` processor with composite policies:
+
+```yaml
+processors:
+  tail_sampling:
+    decision_wait: 30s
+    num_traces: 100000
+    policies:
+      - name: errors-policy
+        type: status_code
+        status_code: {status_codes: [ERROR]}
+      - name: slow-traces-policy
+        type: latency
+        latency: {threshold_ms: 2000}
+      - name: probabilistic-policy
+        type: probabilistic
+        probabilistic: {sampling_percentage: 1}
+```
+
+### Hot/warm/cold tiering
+
+The economics of tiering are stark. NVMe SSD in AWS (`io2`) costs roughly $0.125/GB-month. `gp3` SSD is $0.08/GB-month. HDD (`st1`) is $0.045/GB-month. S3 Standard is $0.023/GB-month. S3 Glacier Instant Retrieval is $0.004/GB-month. Keeping all 1-year logs on SSD would cost 30× what tiered storage costs.
+
+Elasticsearch ILM automates the transitions. The critical implementation details:
+
+**Rollover in the hot phase** happens when a primary shard exceeds 50 GB or the index is older than 1 day — whichever comes first. Keeping shards under 50 GB ensures that merge operations complete in minutes rather than hours, and that shard recovery after a node failure is fast.
+
+**Force merge in the warm phase** reduces each index from many segments (created by ongoing writes in the hot phase) to a single immutable segment. This reduces the per-segment overhead (each segment has its own file handles, bloom filters, and term dictionaries) and dramatically improves warm-tier query performance. The force merge is I/O-intensive — schedule it to run during off-peak hours by setting a rollover phase delay.
+
+**Frozen indices** in the cold phase use Elasticsearch's searchable snapshot feature: the index data lives exclusively in S3 (or GCS), and shard copies are loaded on demand when a query hits them. Cold queries are slow (5–60 seconds) because they read from object storage, but they cost near-zero to maintain. Reserve cold queries for compliance audits and post-mortem investigations, not operational triage.
+
+**Index aliases** provide a stable query surface across tier transitions. Client code always queries `logs-*` or a service-specific alias like `logs-order-service-*`. The underlying index names change as ILM renames and migrates them, but the alias stays constant.
+
+### PII scrubbing and compliance
+
+Logs are the most dangerous surface for accidental PII exposure. A developer adds `log.info("Processing payment for {}", request)`, and suddenly every log line contains a full credit card number. The ingestor layer is the last chance to catch this before it hits the index.
+
+The scrubbing pipeline runs as a Logstash/Vector filter stage with three layers:
+
+1. **Field blocklist** — certain JSON keys are always dropped before indexing: `password`, `cvv`, `ssn`, `creditCard`, `authToken`, `apiKey`. This is a structural check, not a content check — if the field name matches, drop it.
+
+2. **Regex scrubber** — scan the `message` field and any string values in `extra` for patterns matching credit card numbers (Luhn-checkable 13–19 digit sequences), US SSNs (`\d{3}-\d{2}-\d{4}`), email addresses, and AWS secret keys. Replace matches with `[REDACTED]`. This runs on every log line; keep the regex list short and use compiled `Pattern` objects.
+
+3. **Field-level pseudonymization** — `userId` values are hashed with a per-day rotating HMAC key before indexing. This allows correlation (all log lines for the same user in a given day share the same pseudonym) without storing the raw user ID in the log index. The mapping from pseudonym to real user ID is stored in a separate access-controlled store.
+
+**GDPR right to erasure** is the hardest requirement to satisfy in a logging system. The naive solution — delete individual documents from Elasticsearch — does not work: Elasticsearch marks documents as deleted but does not reclaim disk space until a segment merge, and with billions of documents across hundreds of indices this is operationally impossible. The correct solution is daily index rollover: because each day's logs are in their own index, erasing a user's logs for a specific day means reindexing that day's index with those documents excluded. For the S3 archive, maintain a separate `deletion_requests` table; run a nightly batch job that scans the table and rewrites affected Parquet files in S3 with the user's records removed. The 30-day window for GDPR erasure gives adequate time for this batch process.
+
+## Java integration
+
+### Structured logging with Logback and Logstash encoder
+
+The `logstash-logback-encoder` library replaces Logback's default text encoder with a JSON encoder that serializes every MDC field as a top-level JSON key. The result is machine-parseable JSON on stdout, which FluentBit tails and ships to Kafka without any regex parsing.
+
+```java
+package dev.pushkar.logging;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
+
+import org.springframework.stereotype.Service;
+import java.util.Map;
+
+@Service
+public class OrderService {
+
+    private static final Logger log = LoggerFactory.getLogger(OrderService.class);
+
+    public Order createOrder(CreateOrderRequest req) {
+        // MDC propagates trace context to all log lines in this request thread.
+        // logstash-logback-encoder serializes MDC entries as top-level JSON fields.
+        MDC.put("userId", req.userId());
+        MDC.put("orderId", req.idempotencyKey());
+
+        try {
+            log.info("Creating order",
+                Map.of("amount", req.amount(), "currency", req.currency()));
+
+            Order order = repo.save(req.toOrder());
+
+            log.info("Order created successfully",
+                Map.of("orderId", order.id(), "totalCents", order.totalCents()));
+
+            return order;
+        } catch (Exception e) {
+            log.error("Order creation failed", e);
+            throw e;
+        } finally {
+            // Always clear MDC in finally — thread pool reuse will bleed context otherwise.
+            MDC.clear();
+        }
+    }
+}
+```
+
+The corresponding `logback-spring.xml` configures the JSON appender with an async wrapper so log serialization never blocks the application thread:
+
+```xml
+<configuration>
+  <appender name="JSON_STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+      <providers>
+        <timestamp><fieldName>@timestamp</fieldName></timestamp>
+        <logLevel><fieldName>level</fieldName></logLevel>
+        <loggerName><fieldName>logger</fieldName></logName>
+        <threadName><fieldName>thread</fieldName></threadName>
+        <message/>
+        <mdc/>
+        <stackTrace>
+          <fieldName>stackTrace</fieldName>
+          <throwableConverter class="net.logstash.logback.stacktrace.ShortenedThrowableConverter">
+            <maxDepthPerCause>20</maxDepthPerCause>
+            <rootCauseFirst>true</rootCauseFirst>
+          </throwableConverter>
+        </stackTrace>
+      </providers>
+    </encoder>
+  </appender>
+
+  <appender name="ASYNC" class="ch.qos.logback.classic.AsyncAppender">
+    <queueSize>8192</queueSize>
+    <discardingThreshold>0</discardingThreshold>
+    <appender-ref ref="JSON_STDOUT"/>
+  </appender>
+
+  <root level="INFO">
+    <appender-ref ref="ASYNC"/>
+  </root>
+</configuration>
+```
+
+The `AsyncAppender` with `discardingThreshold=0` prevents Logback from silently dropping WARN and ERROR lines when the queue is 80% full (the default behavior). Set `queueSize` large enough that the async buffer can absorb a 1-second burst at peak logging rate.
+
+For Spring Boot applications, OpenTelemetry auto-instrumentation injects `traceId` and `spanId` into MDC automatically when the `opentelemetry-javaagent` is on the classpath — you get distributed trace correlation with zero code changes to existing services.
+
+### Elasticsearch log query service
+
+The search service wraps the Elasticsearch Java client with a type-safe query builder. The `LogEntry` class maps Elasticsearch hits to a Java record; Jackson handles JSON deserialization.
+
+```java
+package dev.pushkar.logging;
+
+import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch._types.SortOrder;
+import co.elastic.clients.elasticsearch.core.SearchResponse;
+import co.elastic.clients.elasticsearch.core.search.Hit;
+import co.elastic.clients.json.JsonData;
+import org.springframework.stereotype.Service;
+
+import java.time.Instant;
+import java.util.List;
+
+@Service
+public class LogSearchService {
+
+    private final ElasticsearchClient esClient;
+
+    public LogSearchService(ElasticsearchClient esClient) {
+        this.esClient = esClient;
+    }
+
+    public List<LogEntry> search(String service, String level,
+                                 Instant from, Instant to,
+                                 String query) throws Exception {
+
+        SearchResponse<LogEntry> response = esClient.search(s -> s
+            .index("logs-*")
+            .query(q -> q
+                .bool(b -> b
+                    .must(m -> m
+                        .match(t -> t.field("message").query(query))
+                    )
+                    .filter(f -> f
+                        .term(t -> t.field("service").value(service))
+                    )
+                    .filter(f -> f
+                        .term(t -> t.field("level").value(level))
+                    )
+                    .filter(f -> f
+                        .range(r -> r
+                            .field("@timestamp")
+                            .gte(JsonData.of(from.toString()))
+                            .lte(JsonData.of(to.toString()))
+                        )
+                    )
+                )
+            )
+            .sort(so -> so
+                .field(f -> f.field("@timestamp").order(SortOrder.Desc))
+            )
+            .size(100),
+            LogEntry.class
+        );
+
+        return response.hits().hits().stream()
+            .map(Hit::source)
+            .toList();
+    }
+
+    public List<LogEntry> getTrace(String traceId) throws Exception {
+        SearchResponse<LogEntry> response = esClient.search(s -> s
+            .index("logs-*")
+            .query(q -> q
+                .term(t -> t.field("traceId").value(traceId))
+            )
+            .sort(so -> so
+                .field(f -> f.field("@timestamp").order(SortOrder.Asc))
+            )
+            .size(10_000),
+            LogEntry.class
+        );
+
+        return response.hits().hits().stream()
+            .map(Hit::source)
+            .toList();
+    }
+}
+```
+
+A key implementation detail: the `bool` query separates `must` (full-text, scored, affects relevance) from `filter` (exact match, not scored, cached by Elasticsearch). Filters are always faster than must clauses for exact keyword matches because Elasticsearch caches filter bitsets in the field data cache. Always use `filter` for `term`, `terms`, and `range` queries on structured fields.
+
+## Storage backend comparison
+
+<TradeoffTable title="Log storage backend tradeoffs — choose based on your query pattern, not the vendor brand">
+
+| Backend | Query speed | Cost | Full-text search | Cardinality limit | Best for |
+|---|---|---|---|---|---|
+| **Elasticsearch** | Sub-second | High — RAM-heavy JVM heap, NVMe SSD | Yes — inverted index on `message` | High cardinality OK with `keyword` mapping | Operational logs requiring full-text + field filter |
+| **Grafana Loki** | Seconds | Low — index only label set, raw text in object store | No — LogQL grep scans raw files | Low — only static label sets | Cost-sensitive logs, Kubernetes-native, Prometheus shops |
+| **ClickHouse** | Sub-second | Medium — columnar compression, no JVM | Partial — `LIKE` on String columns, no relevance | High cardinality OK | Analytics on structured logs, SQL-familiar teams |
+| **S3 + Athena** | Minutes | Lowest — pay-per-query | No | Unlimited | Compliance archive, post-mortem, bulk export |
+
+</TradeoffTable>
+
+Grafana Loki's log-label-only indexing model is a deliberate tradeoff: by refusing to index the log body, it stores logs at near-object-storage cost. The penalty is that log body searches (`|= "NullPointerException"`) perform a distributed grep over raw compressed files — fast enough for small time windows, but painful for queries spanning weeks. Loki is the right choice if your team primarily uses Grafana for dashboards and Prometheus for metrics, and log queries are secondary. Elasticsearch is the right choice if operational search is primary.
+
+## Common pitfalls
+
+<Pitfall title="High-cardinality fields mapped as text — silent heap bomb">
+
+Mapping `userId` or `requestId` as a `text` field (with full-text analysis) on a column with one billion unique values creates a term dictionary entry for every unique value. Elasticsearch stores this term dictionary in heap (the JVM field data cache). On a cluster indexing 10 TB/day, this blows heap within hours and triggers cascading GC pauses, eventually causing the cluster to go read-only as a circuit breaker.
+
+Use `keyword` type for exact-match fields — it stores the raw string without analysis overhead. For fields with truly massive cardinality that you never filter on (like raw `requestId` UUIDs), consider not indexing them at all and relying on the `_source` document for retrieval. You can achieve this with `"index": false` in the field mapping while still storing the field value in `_source`.
+
+</Pitfall>
+
+<Pitfall title="Synchronous log shipping in the application hot path">
+
+If the logging agent or Kafka producer is configured with synchronous, blocking delivery — waiting for an acknowledgment from the broker before returning from the log call — then any Kafka slowdown (a broker restart, a network partition, a rebalance) directly adds latency to every application request that logs. A 2-second Kafka hiccup becomes a 2-second p99 spike visible to end users.
+
+Logs must always be shipped asynchronously. The correct architecture is a two-step buffer: the application writes to a local, in-memory async queue (Logback's `AsyncAppender`), the agent reads from a file or Unix socket (never blocking the application thread), and the agent handles the network I/O to Kafka. The application thread's contract is: write to the local buffer, return immediately, do not wait for any network acknowledgment. Under extreme memory pressure, it is acceptable to drop log lines from the local buffer — that is what the 0.1% loss budget is for.
+
+</Pitfall>
+
+## Follow-up questions
+
+<Curveball question="A critical production incident: a service is throwing 50K errors per second for 5 minutes. Your Elasticsearch cluster falls behind by 10 minutes. How do you triage the incident when your logs are delayed?">
+
+This is where the Kafka-first architecture pays off. Because every log line is committed to Kafka before being written to Elasticsearch, the raw data is available immediately — it is just not indexed yet. The stream processor (Kafka Streams/Flink) consuming the same topic is processing in real time regardless of Elasticsearch lag, so log-based alerts fire on schedule.
+
+For direct triage, use the stream processor to run an ad-hoc query: scan the Kafka topic from the earliest unconsumed offset, filter for the service and level in question, and stream matching events to the operator's terminal. This is functionally equivalent to `kafka-console-consumer --topic log-events --from-beginning | grep "order-service" | grep "ERROR"` — no Elasticsearch required.
+
+For the Elasticsearch lag itself, the recovery path is: temporarily increase ingestor parallelism (spin up additional Logstash/Vector instances consuming from Kafka), reduce Elasticsearch refresh interval from 1 second to 5 seconds to reduce indexing overhead, and increase bulk batch size from 5K to 20K documents. Kafka's consumer group offset tracks exactly where the ingestor is — there is no data loss, just a delay in searchability.
+
+</Curveball>
+
+<Curveball question="You need to comply with GDPR: a user requests deletion of all their data, including logs. Your logs are spread across 90 days of daily Elasticsearch indices and 2 years of S3 archives. Walk me through your deletion strategy.">
+
+First, the wrong answer: calling `DELETE /logs-*/_doc/{id}` for each document. Document-level deletion in Elasticsearch marks documents as deleted but does not reclaim space until the next segment merge. With billions of documents, this would run for days and still leave ghost records in un-merged segments. It is also not auditable.
+
+The correct strategy has three components. For Elasticsearch hot and warm indices: because logs are partitioned into daily indices, and the user's `userId` is indexed as a keyword, run a reindex operation that reads each affected day's index, excludes documents matching the user's pseudonymized ID, and writes to a new index. Swap the alias to the new index, delete the original. The GDPR clock starts at the erasure request; the 30-day compliance window gives adequate time to process the reindex queue asynchronously.
+
+For S3 cold storage: maintain a `pending_erasures` table with `(userId, requestedAt)`. A nightly Spark job reads this table, scans the relevant Parquet partitions in S3, filters out matching records, and rewrites the partition files. Because S3 objects are immutable, the old files are deleted after the new ones are committed. Run a verification query after each partition rewrite.
+
+For the pseudonymization HMAC key: if the key is rotated and the mapping is destroyed, all historical pseudonyms become unresolvable — effectively erasing the user's correlation across log records without touching any log data. This is a privacy-preserving shortcut but requires careful key management.
+
+</Curveball>
+
+<Curveball question="Your log ingestion pipeline handles 10 TB/day. A bad deploy causes 100× log amplification — effectively 1 PB/day — for 30 minutes. What happens to your system and what circuit breakers prevent a full meltdown?">
+
+Without circuit breakers, the sequence is: Kafka producers overwhelm broker disk within minutes (at 116 GB/sec sustained, 2 TB of Kafka disk fills in 17 seconds), back-pressure propagates to the agent, the agent's local buffer fills, and the agent starts dropping log lines or — worst case — blocking the application thread. Meanwhile, Elasticsearch ingestors are falling arbitrarily far behind on a topic they can never catch up with, and the Elasticsearch cluster is being hammered with bulk requests that it cannot keep up with either.
+
+The circuit breakers at each layer: (1) **Agent-level rate limiting** — FluentBit and the OTel Collector both support output rate limiting; configure a maximum bytes-per-second to Kafka, with drop-oldest semantics beyond that limit. (2) **Kafka producer quotas** — Kafka broker-side producer quotas (`quota.producer.byte-rate`) cap per-client-ID throughput, returning throttle metadata to the producer rather than accepting unbounded writes. (3) **Elasticsearch backpressure** — the ingestor should implement exponential backoff on bulk API 429 responses and reduce batch size under load, not increase it. (4) **Log level escalation alert** — a Kafka Streams job should alert if the per-minute event count from any single service exceeds 10× its 7-day p99 baseline. This catches log amplification within 60 seconds and pages the on-call engineer before downstream systems are impacted. (5) **Dynamic log level suppression** — expose a runtime API (`POST /log-level?service=order-service&level=WARN`) backed by a distributed config store (Zookeeper/etcd); the agent respects it and drops DEBUG/INFO lines from the offending service at the source, before they reach Kafka.
+
+</Curveball>
+
+<RelatedQuestions items={[
+  { slug: "metrics-monitoring", title: "Design a Metrics & Monitoring System", difficulty: "senior" },
+  { slug: "distributed-job-scheduler", title: "Design a Distributed Job Scheduler", difficulty: "senior" },
+  { slug: "api-gateway", title: "Design an API Gateway / Service Mesh", difficulty: "senior" },
+]} />
+
+## Further reading
+
+- [Elasticsearch Index Lifecycle Management documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/index-lifecycle-management.html) — Official ILM docs covering hot/warm/cold/frozen phase configuration, rollover policies, and searchable snapshots
+- [Grafana Loki architecture overview](https://grafana.com/docs/loki/latest/get-started/architecture/) — Detailed explanation of Loki's label-indexed, object-storage-backed design and how it differs from Elasticsearch's inverted index approach
+- [OpenTelemetry specification — Logs Data Model](https://opentelemetry.io/docs/specs/otel/logs/data-model/) — The canonical schema for structured log events in the OTel ecosystem, including the `traceId`/`spanId` correlation fields and severity number mapping
+- [Logging at Twitter: Updated](https://blog.twitter.com/engineering/en_us/topics/infrastructure/2021/logging-at-twitter-updated) — Twitter's engineering blog post on scaling their centralized logging infrastructure to petabytes, covering the transition from Splunk to their own pipeline and the operational lessons learned

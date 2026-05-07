@@ -1,0 +1,39 @@
+---
+export interface Props {
+  href?: string;
+  class?: string;
+  hoverable?: boolean;
+}
+
+const { href, class: className = '', hoverable = !!href } = Astro.props;
+const Tag = href ? 'a' : 'div';
+---
+
+<Tag
+  class:list={['card', hoverable && 'card--hoverable', className]}
+  href={href}
+>
+  <slot />
+</Tag>
+
+<style>
+  .card {
+    display: block;
+    background: var(--bg-card);
+    border: 1px solid var(--line-2);
+    border-radius: var(--r-lg);
+    padding: 1.25rem 1.5rem;
+    text-decoration: none;
+    color: inherit;
+    transition:
+      border-color var(--dur-fast),
+      background var(--dur-fast),
+      transform var(--dur-fast) var(--ease-out);
+  }
+
+  .card--hoverable:hover {
+    border-color: var(--accent-line);
+    background: var(--bg-raised);
+    transform: translateY(-1px);
+  }
+</style>

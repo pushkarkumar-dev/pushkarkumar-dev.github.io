@@ -1,0 +1,602 @@
+---
+title: "Design Photo Storage at Scale"
+slug: "photo-storage-haystack"
+category: "storage"
+difficulty: "senior"
+estimatedReadMinutes: 19
+tags: ["haystack", "needle-format", "io-amplification", "cold-tiering", "cdn", "object-storage", "photo-dedup"]
+companyFlavors: ["Facebook Haystack", "Instagram", "Pinterest", "Twitter", "Imgur"]
+prerequisites: []
+relatedQuestions: ["s3-object-storage", "dropbox-google-drive", "cdn-design"]
+publishedAt: "2026-05-07"
+updatedAt: "2026-05-07"
+summary: "Design a purpose-built photo storage system in the style of Facebook Haystack — storing hundreds of billions of photos with sub-millisecond disk lookup by packing many small objects into large files, eliminating filesystem metadata overhead, and aggressive cold tiering."
+javaPackages: ["software.amazon.awssdk:s3:2.25.0", "org.springframework.boot:spring-boot-starter-webflux:3.3.0", "com.github.ben-manes.caffeine:caffeine:3.1.8"]
+---
+
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import Bookmark from '../../components/content/Bookmark.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="photo-storage-haystack" title="Design Photo Storage at Scale" />
+
+<Tldr>
+- **The core problem**: traditional filesystems require ~3 disk I/Os per photo read — directory lookup, inode fetch, then data block read. At 1M photo reads/sec, that is 3M I/Os/sec, the majority of which are spent on filesystem metadata rather than actual photo data. The disk subsystem saturates long before the network does.
+- **Haystack fix**: pack thousands of photos ("needles") into one large file ("haystack"). Keep an in-memory index of `{photoId → (haystackFileId, offset, size)}`. Each photo read becomes a single disk seek to the exact byte offset. Index metadata fits entirely in RAM; the disk does only one thing — read photo bytes.
+- **Read traffic is 80/20**: 20% of photos — recent uploads and viral content — drive 80% of reads. Serve hot photos from CDN, warm photos from Haystack on SSD, cold photos from Haystack on HDD. This tiering alone reduces SSD capacity requirements by 5×.
+- **Photo variants**: store 4 sizes per photo — thumbnail, small, medium, and original. Each variant is a separate needle in the haystack file, but all four share the same logical `photoId` and are located via `photoId + sizeVariant` key in the index. No separate storage namespace per variant is needed.
+- **Deletes are soft**: mark the needle as deleted in the in-memory index and set a flag byte in the needle header. Compaction runs offline, copying only live needles to a new haystack file and then atomically renaming it into place. Never modify haystack files in-place — append-only semantics guarantee file integrity under concurrent reads.
+</Tldr>
+
+## Why general-purpose storage fails for photos
+
+A POSIX filesystem on a directory containing one million files does not serve those files efficiently at scale. To read a single file, the kernel must: resolve the filename to a directory entry by scanning or hashing directory blocks (one or more disk reads), load the file's inode to find which data blocks it occupies (one disk read), and then read the data block itself (one disk read). That is three disk I/Os in the best case — and on a directory with millions of files, directory block traversal alone can fan out to tens of additional I/Os if the directory is fragmented across many blocks. The OS page cache absorbs many of these metadata reads under normal workloads, but at 1M photo reads per second with a working set that dwarfs available RAM, the page cache cannot hold the full metadata set and every access becomes a cold read against the metadata structures on disk.
+
+Facebook's initial approach was an NFS cluster: a network-attached filesystem where commodity servers mounted photo directories from a central filer. This preserved POSIX semantics but compounded the problem. Each photo read now required the same three-plus I/Os on the NFS filer's disk, plus network round trips to transmit the metadata lookups and data blocks over Ethernet. The filer became the bottleneck — not because of bandwidth, but because of I/O operations per second. The filer's IOPS ceiling, measured in thousands per second for spinning disk, was hit orders of magnitude before its network bandwidth was saturated. Facebook was spending the majority of their storage I/O budget on filesystem metadata that carried zero useful information for the user requesting the photo.
+
+The root cause is a fundamental mismatch between what a POSIX filesystem optimizes for and what photo serving requires. POSIX filesystems are general-purpose: they support arbitrary directory hierarchies, fine-grained permission models, file renaming, in-place modification, hard links, and symbolic links. Photo serving needs exactly one operation efficiently: given an opaque identifier, return bytes. The POSIX overhead — inode tables, directory structures, dentry caches — is friction that pays for flexibility nobody needs in a read-heavy photo serving path. Haystack eliminates that friction by replacing the filesystem's role in metadata management with a purpose-built in-memory index that knows exactly where every photo lives on disk, at byte granularity, without touching the filesystem layer at all.
+
+## Clarifying questions
+
+Lock down these eight questions before sketching any architecture. Each answer gates at least one major design decision.
+
+| Question | Ideal answer | Why it matters |
+|---|---|---|
+| How many photos total, and how many are uploaded per day? | 500 billion stored, 5 million new uploads per day | Determines total storage footprint, index size, and whether the index must be sharded across many machines |
+| Are multiple photo variants (thumbnails, resolutions) required? | Yes — 4 sizes per photo: thumbnail, small, medium, original | Multiplies storage and index size by 4; variants must be co-located logically for efficient retrieval |
+| What is the read:write ratio? | ~1,000:1 reads to writes | Heavily read-optimized system; write path can accept higher latency if it simplifies the read path |
+| What is the maximum acceptable read latency? | p99 < 5ms for hot photos, < 50ms for cold | Drives tiering decisions — which photos must be in SSD vs. HDD vs. archival storage |
+| Is a CDN in front of the storage system? | Yes — CDN absorbs hot photo traffic | CDN hit ratio directly determines the IOPS load the Haystack store must sustain |
+| What are the durability requirements? | 11 nines (99.999999999%) — equivalent to S3 standard | Requires 3× replication across fault zones for every physical volume |
+| How frequent are photo deletions? | Low — < 0.1% of photos deleted per day | Soft delete with async compaction is sufficient; no need for immediate space reclamation |
+| Must EXIF metadata (camera, GPS, timestamp) be stored and queryable? | Store yes, queryable by photoId only — not searchable by location | EXIF goes in a separate metadata DB alongside the photo record; not embedded in the haystack needle |
+
+## Functional requirements
+
+- Upload a photo and automatically generate all 4 size variants; return a `photoId` and per-variant URLs
+- Read any photo variant by `photoId` and size label with low latency
+- Soft delete a photo and all its variants; reclaim disk space during offline compaction
+- Serve hot and warm photos from tiered storage; move cold photos to bulk HDD or archival object storage automatically
+- Integrate with a CDN as the primary read path; Haystack store is the CDN origin
+- Optionally deduplicate identical photo uploads using a content hash check before writing a new needle
+
+## Non-functional requirements
+
+- **Scale**: 500 billion photos stored, 5 million uploads per day (20 million new needles with 4 variants), 10 million photo reads per second across all tiers
+- **Read latency**: p99 < 5ms for hot photos (CDN + SSD Haystack), p99 < 50ms for warm photos, best-effort for cold (HDD or archival)
+- **Durability**: 11 nines — each logical volume is backed by 3 physical replicas across separate fault zones
+- **Cost**: < $0.001 per photo per year stored; tiered storage (SSD → HDD → Glacier Instant) is mandatory to meet cost targets at 400 PB scale
+- **Consistency**: read-after-write consistency for the uploader; eventual consistency for other users within a few seconds is acceptable
+- **Availability**: 99.99% for photo reads; the CDN's ability to serve cached photos independently of the Haystack store provides additional availability headroom during store maintenance
+
+## Capacity estimation
+
+<Capacity title="Storage, index, and IOPS sizing for 500 billion photos">
+
+**Total storage**
+
+$$
+5\text{M uploads/day} \times 4\text{ variants} \times 200\text{ KB avg} = 4\text{ TB/day ingested}
+$$
+
+$$
+500\text{B photos} \times 4\text{ variants} \times 200\text{ KB} = 400\text{ PB total}
+$$
+
+400 PB at $0.02/GB/month on HDD-class storage is $8M/month. Cold tiering to Glacier Instant ($0.004/GB/month) for photos older than 2 years is necessary — assuming 70% of photos qualify, cold tiering reduces cost to roughly $3M/month.
+
+**In-memory index size**
+
+Each index entry maps `{photoId (8 bytes), sizeVariant (1 byte)} → {fileId (4 bytes), offset (8 bytes), size (4 bytes), flags (1 byte)}` = approximately 40 bytes per entry including alignment and hash map overhead.
+
+$$
+500\text{B photos} \times 4\text{ variants} \times 40\text{ bytes} = 80\text{ TB of index data}
+$$
+
+80 TB does not fit in RAM on any single machine. Shard the index across 1,000 Haystack store machines, each holding 80 GB of index — comfortably within a 128 GB RAM server. A warm/cold split reduces this further: only the index for photos from the last 6 months needs to stay hot in RAM.
+
+**Disk I/O comparison**
+
+Traditional filesystem read path: 3+ IOPS per photo.
+
+$$
+10\text{M reads/sec} \times 3\text{ IOPS} = 30\text{M IOPS required}
+$$
+
+Haystack read path: 1 IOPS per photo (direct byte-offset seek, no metadata traversal).
+
+$$
+10\text{M reads/sec} \times 1\text{ IOPS} = 10\text{M IOPS required}
+$$
+
+A single NVMe SSD delivers ~500K IOPS. The Haystack approach reduces the required fleet size from 60 NVMe drives to 20 — a 3× hardware cost reduction on the SSD tier alone.
+
+**Haystack file sizing**
+
+$$
+100\text{ GB per haystack file} \div 200\text{ KB avg needle} = 500{,}000\text{ needles per file}
+$$
+
+At 100 GB per file, a single disk failure or compaction operation affects at most 500K needles — bounded blast radius. Larger files increase compaction time; smaller files increase file handle and metadata overhead at the OS layer.
+
+</Capacity>
+
+## API design
+
+The photo storage system exposes two planes: an **upload and management API** for writes and deletes, and a **read API** that is designed to be placed behind a CDN.
+
+```
+POST /photos
+  Body: multipart/form-data — photo binary
+  Returns: {
+    "photoId": "pid_8f3a2c9d",
+    "variants": [
+      { "size": "thumbnail", "url": "https://cdn.example.com/photos/pid_8f3a2c9d/thumbnail" },
+      { "size": "small",     "url": "https://cdn.example.com/photos/pid_8f3a2c9d/small" },
+      { "size": "medium",    "url": "https://cdn.example.com/photos/pid_8f3a2c9d/medium" },
+      { "size": "original",  "url": "https://cdn.example.com/photos/pid_8f3a2c9d/original" }
+    ]
+  }
+
+GET /photos/{photoId}/{size}
+  Returns: 200 OK — JPEG bytes
+           Cache-Control: public, max-age=31536000, immutable
+           304 Not Modified — on ETag match (for CDN revalidation)
+           404 Not Found — if photoId or size is unknown or deleted
+
+DELETE /photos/{photoId}
+  Returns: 204 No Content — soft delete applied to all 4 variants
+  (Space reclaimed asynchronously during next compaction cycle)
+
+GET /internal/haystack/{fileId}
+  Query: offset=<byte-offset>&size=<bytes>
+  Returns: raw bytes — used by CDN as the byte-range origin fetch
+  Auth: internal service token only — not exposed publicly
+```
+
+The `GET /photos/{photoId}/{size}` endpoint issues a permanent `Cache-Control: immutable` header because photo content never changes once uploaded. A `photoId` is assigned once; edits create a new photo with a new `photoId`. This means the CDN can cache every photo indefinitely with no TTL-based invalidation — the only invalidation path is the soft delete, which the CDN handles via a tag purge keyed on `photoId`.
+
+## Data model
+
+**Haystack file — needle format**
+
+A haystack file is an append-only binary file containing a contiguous stream of needles. Each needle is self-describing:
+
+```
+Needle {
+  magic:       uint32   // 0xDEADBEEF — identifies a valid needle boundary
+  cookie:      uint64   // per-upload random token to prevent URL guessing
+  photoId:     uint64   // globally unique photo identifier
+  sizeVariant: uint8    // 0=thumbnail, 1=small, 2=medium, 3=original
+  flags:       uint8    // bit 0 = deleted; remaining bits reserved
+  dataSize:    uint32   // byte count of the photo data that follows
+  paddedSize:  uint32   // dataSize rounded up to 8-byte alignment
+  checksum:    uint32   // CRC32 over photo data — detect bit rot
+  data:        byte[]   // photo bytes (JPEG)
+  padding:     byte[]   // zero-fill to reach paddedSize
+}
+```
+
+Header is 30 bytes. Needles are 8-byte aligned to simplify memory-mapped reads and reduce false-sharing on concurrent reads. The `magic` field allows the index rebuild scan to detect needle boundaries without a length-prefixed framing protocol — if `magic` is absent at an expected boundary, the file is corrupt.
+
+**In-memory index**
+
+```
+IndexEntry {
+  fileId:   uint32   // which haystack file on this machine
+  offset:   uint64   // byte offset of needle start within the file
+  size:     uint32   // photo data size (not including header)
+}
+
+index: ConcurrentHashMap<Long, IndexEntry>
+  key = (photoId << 8) | sizeVariant
+```
+
+The index is rebuilt on startup by scanning needle headers sequentially from the haystack file. A separate on-disk index file checkpoints the in-memory state periodically, reducing startup from a full O(file size) scan to O(needles written since last checkpoint).
+
+**Logical volume to physical volume mapping** (stored in a central directory service, e.g., ZooKeeper or a dedicated MySQL table):
+
+```
+LogicalVolume {
+  logicalVolumeId: uint32
+  physicalVolumes:  List<PhysicalVolume>  // exactly 3 — one primary, two replicas
+  state:            Enum { WRITABLE, READ_ONLY, COMPACTING }
+}
+
+PhysicalVolume {
+  physicalVolumeId: uint32
+  haystackStoreHost: String
+  haystackFilePath:  String
+  usedBytes:         uint64
+  capacity:          uint64
+}
+```
+
+Each logical volume routes writes to all three physical volumes in parallel. Reads go to any of the three via consistent hashing weighted by disk load. A logical volume transitions to `READ_ONLY` once it reaches 95% capacity; the directory service then allocates a new writable volume.
+
+**Photo metadata DB** (MySQL, sharded by `photoId`):
+
+```sql
+CREATE TABLE photos (
+  photo_id             BIGINT UNSIGNED  NOT NULL,
+  uploader_id          BIGINT UNSIGNED  NOT NULL,
+  uploaded_at          DATETIME         NOT NULL,
+  deleted              TINYINT(1)       NOT NULL DEFAULT 0,
+  logical_volume_id    INT UNSIGNED     NOT NULL,
+  exif_data            JSON,
+  content_hash         CHAR(64),        -- SHA-256 for deduplication
+  PRIMARY KEY (photo_id),
+  KEY idx_uploader     (uploader_id, uploaded_at),
+  KEY idx_content_hash (content_hash)
+);
+```
+
+The `logical_volume_id` is the join between the metadata DB and the directory service. Given a `photoId`, the read path is: metadata DB lookup → logical volume ID → directory service → physical volume host and file path → in-memory index on that host → disk seek.
+
+## High-level architecture
+
+<Mermaid caption="Photo upload path (left) and photo read path (right). The upload service generates all 4 variants, writes them as needles to the Haystack store in parallel, and updates the in-memory index. Reads go CDN-first; only CDN misses hit the Haystack store, which performs a single disk seek using the in-memory offset index." diagram={`graph LR
+  Upload[Upload Service] --> VariantGen[Variant Generator\n4 sizes]
+  VariantGen --> HaystackW[Haystack Store\nAppend needle]
+  HaystackW --> IndexW[In-memory Index\nUpdate offset map]
+  HaystackW --> MetaDB[Photo Metadata DB\nWrite photoId record]
+
+  Client[Client] --> CDN[CDN\nHot photos cached]
+  CDN -->|"cache miss"| Cache[Haystack Cache Tier\nWarm SSD store]
+  Cache -->|"cache miss"| HaystackR[Haystack Store\nSingle disk seek]
+  HaystackR --> IndexR[In-memory Index\nLookup offset]
+  IndexR --> Disk[Disk\nRead photo bytes]`} />
+
+<Mermaid caption="Tiered storage lifecycle. Photos start hot (CDN + SSD Haystack), age into warm (HDD Haystack), then cold (S3 Glacier Instant). The tier migration daemon runs nightly, moving needles based on last-access timestamp recorded in the metadata DB." diagram={`graph TD
+  Upload[New Upload] --> Hot[Hot Tier\nCDN + SSD Haystack\nAge < 1 day]
+  Hot -->|"1 day old"| Warm[Warm Tier\nHDD Haystack\nAge 1 day – 6 months"]
+  Warm -->|"6 months old"| Cold[Cold Tier\nHDD Haystack\nLow-priority hosts\nAge 6 months – 2 years"]
+  Cold -->|"2 years old"| Archive[Archive Tier\nS3 Glacier Instant\nOn-demand index rebuild]`} />
+
+## Deep dives
+
+### The Haystack needle format and append-only semantics
+
+The decision to make haystack files append-only is the most important architectural choice in the design, and it is worth understanding why. In a traditional filesystem, any file can be modified in-place: you seek to a byte offset and overwrite bytes. This flexibility is exactly what creates corruption risk under concurrent access and what makes deletions expensive — a hole in the middle of a file fragments the disk's sequential access patterns, defeating the purpose of packing needles together.
+
+Haystack files accept only one mutation: appending a new needle at the end. The file position of every needle is determined at write time and never changes thereafter. This means that once an `IndexEntry` is written with an offset, that offset is permanently valid for the lifetime of the haystack file — no locking, no version checking, no cache invalidation is needed to read a needle. The in-memory index can be read without any synchronization on the read path because entries are only added to the index (on write) or logically deleted (by setting a flag in memory) — they are never moved.
+
+The append-only constraint also simplifies crash recovery dramatically. If a server crashes mid-write, the partially written needle sits at the end of the file with an incomplete or corrupt header. On startup, the index rebuild scan reads forward from the last known good checkpoint in the on-disk index file. When it encounters a needle with an invalid `magic` field or a checksum mismatch, it stops — the partial write is simply ignored and the file pointer is reset to just before that point. The next write appends after the last valid needle. No write-ahead log, no fsync on every write (only `fsync(data)` to ensure durability without metadata sync overhead), no complex recovery protocol.
+
+### Index rebuild and crash recovery
+
+The in-memory index is the single most critical data structure in the system — lose it and every read requires a full O(file size) scan to locate needles. The on-disk index file provides persistence without sacrificing startup speed.
+
+The on-disk index file is a compacted snapshot of the in-memory index, written synchronously after each batch of appends (e.g., every 1,000 writes or every 5 seconds, whichever comes first). Its format is a flat array of fixed-size records:
+
+```
+IndexRecord {
+  key:    uint64   // (photoId << 8) | sizeVariant
+  fileId: uint32
+  offset: uint64
+  size:   uint32
+}  // 24 bytes per record
+```
+
+On crash recovery, the process is: load the entire on-disk index file into memory (fast — 80 GB of index at 4 GB/s sequential read = 20 seconds), then scan haystack needle headers forward from the offset of the last record in the on-disk index. Any needles written after the last checkpoint but before the crash are re-indexed from the needle headers. This reduces recovery from O(total file size) — potentially hours for a 100 GB file — to O(needles written since last checkpoint) — typically seconds.
+
+The separation between the on-disk index and the haystack file is also what allows the index to be read without taking a lock during the full scan: the scan reads needle headers sequentially, which are at fixed offsets within the haystack file, and the write path only appends beyond the position the scan has already passed.
+
+### Compaction
+
+Deleted needles accumulate over time, wasting disk space. A haystack file with 10% deleted needles wastes 10 GB per 100 GB file. Compaction reclaims this space without blocking reads.
+
+Compaction is always offline — it runs during low-traffic periods on machines that are temporarily marked as read-only for that physical volume. The algorithm is:
+
+1. Mark the physical volume as `COMPACTING` in the directory service. The directory service routes new writes to other physical volumes in the logical volume group; reads continue to be served from the compacting volume.
+2. Open the haystack file for reading. Create a new haystack file on the same disk.
+3. Scan every needle in the old file. For each needle where `flags.deleted == 0` (not deleted), copy the needle to the new file and record the new offset in a staging index.
+4. Once all live needles are copied, atomically rename the new file over the old file (`rename(2)` is atomic on POSIX filesystems). Update the in-memory index in one locked swap with the staging index.
+5. Mark the volume as `WRITABLE` again. Delete the old haystack file (now replaced by the renamed compacted file).
+
+Reads served during compaction steps 2–4 go to the old file, which is still valid. There is a brief moment during step 4 where the in-memory index is being swapped — in practice this is handled by a reader-writer lock held for microseconds during the pointer swap, invisible to the request latency distribution.
+
+The key property: the haystack file is never modified in-place during compaction. The old file is read-only throughout the process; the new file is write-only until the atomic rename. This ensures that a crash during compaction leaves the system in a consistent state — either the old file is still present (if crash happens before rename) or the new file is now in place with a complete set of live needles.
+
+### Hot/warm/cold tiering
+
+Tiering is what makes the economics of photo storage work at 400 PB scale. Without tiering, serving all 400 PB from SSD-class storage would cost hundreds of millions of dollars per year. The 80/20 rule on photo access patterns — 20% of photos drive 80% of reads — means that only a small fraction of the corpus needs to be on fast, expensive storage.
+
+**Hot tier (age < 1 day)**: served by CDN. The CDN absorbs the spike traffic that naturally accompanies new uploads — users share new photos with friends who all view them within hours of upload. CDN cache hit ratio for photos uploaded in the last 24 hours is typically > 95%. CDN misses fall through to the Haystack SSD store. In-memory index for hot photos is always in RAM.
+
+**Warm tier (age 1 day to 6 months)**: served by Haystack on NVMe SSD. The in-memory index for the warm tier fits comfortably in RAM across the shard fleet. CDN handles a fraction of traffic here too — popular photos from last week are still likely to be cached. SSD provides < 1ms disk latency for the CDN misses that do reach the store.
+
+**Cold tier (age 6 months to 2 years)**: served by Haystack on high-density HDD. 80% of photos are cold; they serve roughly 5% of read traffic. Read latency increases to 10–50ms due to HDD seek time, which is acceptable for rarely accessed content. The cold tier uses larger haystack files (500 GB–1 TB) to maximize density, since compaction runs infrequently. Index for cold photos may be partially evicted from RAM and loaded from the on-disk index file on demand — cold reads are rare enough that a 20ms index reload is tolerable.
+
+**Archive tier (age > 2 years)**: migrated to object storage (AWS S3 Glacier Instant Retrieval). The haystack needle format is preserved — the "haystack file" is simply stored as an S3 object, and the byte-range GET API of S3 (`Range: bytes=X-Y`) is used to retrieve individual needles without downloading the entire haystack file. The in-memory index for archived photos is not kept in RAM; a lightweight disk-backed index (RocksDB LSM tree) provides the offset mapping on demand.
+
+## Java integration
+
+### Part A — Haystack append and read
+
+```java
+package dev.pushkar.photostorage;
+
+import java.io.*;
+import java.nio.*;
+import java.nio.channels.*;
+import java.nio.file.*;
+import java.util.concurrent.*;
+import java.util.zip.CRC32;
+
+public final class HaystackStore {
+    private static final int NEEDLE_MAGIC = 0xDEADBEEF;
+    private static final int HEADER_SIZE  = 30; // bytes
+
+    private final FileChannel writeChannel;
+    private final ConcurrentHashMap<Long, NeedleLocation> index = new ConcurrentHashMap<>();
+
+    public HaystackStore(Path haystackPath) throws IOException {
+        this.writeChannel = FileChannel.open(haystackPath,
+            StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.READ);
+        rebuildIndex(haystackPath);
+    }
+
+    public synchronized long appendNeedle(long photoId, byte sizeVariant, byte[] data) throws IOException {
+        long offset = writeChannel.size();
+
+        ByteBuffer header = ByteBuffer.allocate(HEADER_SIZE);
+        header.putInt(NEEDLE_MAGIC);
+        header.putLong(photoId);
+        header.put(sizeVariant);
+        header.put((byte) 0);          // flags — not deleted
+        header.putInt(data.length);
+        header.putInt(paddedSize(data.length));
+        header.putInt(checksum(data));
+        header.flip();
+
+        int padLen = paddedSize(data.length) - data.length;
+        writeChannel.write(new ByteBuffer[]{
+            header,
+            ByteBuffer.wrap(data),
+            ByteBuffer.wrap(new byte[padLen])
+        }, 0, 3);
+        writeChannel.force(false); // fsync data pages, skip metadata — 3× faster than force(true)
+
+        index.put(encodeKey(photoId, sizeVariant), new NeedleLocation(offset, data.length));
+        return offset;
+    }
+
+    public byte[] readNeedle(long photoId, byte sizeVariant) throws IOException {
+        NeedleLocation loc = index.get(encodeKey(photoId, sizeVariant));
+        if (loc == null) return null;
+
+        ByteBuffer buf = ByteBuffer.allocate(HEADER_SIZE + loc.size());
+        writeChannel.read(buf, loc.offset());
+        buf.flip();
+
+        // validate magic
+        int magic = buf.getInt(0);
+        if (magic != NEEDLE_MAGIC) throw new IOException("Corrupt needle at offset " + loc.offset());
+
+        buf.position(HEADER_SIZE);
+        byte[] data = new byte[loc.size()];
+        buf.get(data);
+        return data;
+    }
+
+    public synchronized void softDelete(long photoId, byte sizeVariant) {
+        // Remove from index — reads will return null (404).
+        // The needle header's flag byte is updated lazily during compaction.
+        index.remove(encodeKey(photoId, sizeVariant));
+    }
+
+    private void rebuildIndex(Path path) throws IOException {
+        long fileSize = writeChannel.size();
+        long pos = 0;
+        while (pos < fileSize) {
+            ByteBuffer hdr = ByteBuffer.allocate(HEADER_SIZE);
+            int read = writeChannel.read(hdr, pos);
+            if (read < HEADER_SIZE) break;
+            hdr.flip();
+            if (hdr.getInt() != NEEDLE_MAGIC) break; // stop at first corrupt boundary
+            long pid    = hdr.getLong();
+            byte sv     = hdr.get();
+            byte flags  = hdr.get();
+            int dataLen = hdr.getInt();
+            int padLen  = hdr.getInt();
+            hdr.getInt(); // checksum — skip during index rebuild for speed
+
+            if ((flags & 0x01) == 0) { // not deleted
+                index.put(encodeKey(pid, sv), new NeedleLocation(pos, dataLen));
+            }
+            pos += HEADER_SIZE + padLen;
+        }
+    }
+
+    private static int paddedSize(int size) {
+        return (size + 7) & ~7; // round up to 8-byte boundary
+    }
+
+    private static int checksum(byte[] data) {
+        CRC32 crc = new CRC32();
+        crc.update(data);
+        return (int) crc.getValue();
+    }
+
+    private static long encodeKey(long photoId, byte variant) {
+        return (photoId << 8) | (variant & 0xFF);
+    }
+
+    record NeedleLocation(long offset, int size) {}
+}
+```
+
+The `force(false)` call after each write is a critical production detail. `FileChannel.force(true)` flushes both data and metadata (file length, mtime) to the OS, which causes two writes to the journal on ext4 — one for data, one for metadata. `force(false)` flushes only data pages, roughly tripling write throughput at the cost of metadata durability. Since the index rebuild scan uses the needle `magic` field to detect valid boundaries rather than relying on the OS-reported file length, losing the OS metadata on crash is acceptable — the rebuild scan finds the last valid needle by scanning forward until it hits a corrupt boundary.
+
+### Part B — Spring Boot photo upload service
+
+```java
+package dev.pushkar.photostorage;
+
+import org.springframework.http.*;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+import java.util.*;
+
+@RestController
+@RequestMapping("/photos")
+public class PhotoController {
+
+    private final HaystackStore store;
+    private final ImageResizer resizer;
+    private final PhotoMetadataRepository metadataRepo;
+
+    public PhotoController(HaystackStore store,
+                           ImageResizer resizer,
+                           PhotoMetadataRepository metadataRepo) {
+        this.store        = store;
+        this.resizer      = resizer;
+        this.metadataRepo = metadataRepo;
+    }
+
+    @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<PhotoResponse> upload(
+            @RequestParam MultipartFile file,
+            @RequestParam long uploaderId) throws Exception {
+
+        long photoId   = generatePhotoId();
+        byte[] original = file.getBytes();
+
+        List<VariantUrl> variants = new ArrayList<>();
+        for (PhotoSize size : PhotoSize.values()) {
+            byte[] variant = resizer.resize(original, size.width(), size.height());
+            store.appendNeedle(photoId, size.ordinalByte(), variant);
+            variants.add(new VariantUrl(size.name().toLowerCase(),
+                "/photos/" + photoId + "/" + size.name().toLowerCase()));
+        }
+
+        metadataRepo.save(new PhotoRecord(photoId, uploaderId, contentHash(original)));
+        return ResponseEntity.status(HttpStatus.CREATED)
+            .body(new PhotoResponse(photoId, variants));
+    }
+
+    @GetMapping("/{photoId}/{size}")
+    public ResponseEntity<byte[]> serve(
+            @PathVariable long photoId,
+            @PathVariable String size) throws Exception {
+
+        PhotoSize sizeEnum = PhotoSize.fromLabel(size);
+        byte[] data = store.readNeedle(photoId, sizeEnum.ordinalByte());
+        if (data == null) return ResponseEntity.notFound().build();
+
+        return ResponseEntity.ok()
+            .header(HttpHeaders.CONTENT_TYPE,  MediaType.IMAGE_JPEG_VALUE)
+            .header(HttpHeaders.CACHE_CONTROL, "public, max-age=31536000, immutable")
+            .header("Surrogate-Key", "photo:" + photoId)
+            .body(data);
+    }
+
+    @DeleteMapping("/{photoId}")
+    public ResponseEntity<Void> delete(@PathVariable long photoId) {
+        for (PhotoSize size : PhotoSize.values()) {
+            store.softDelete(photoId, size.ordinalByte());
+        }
+        metadataRepo.markDeleted(photoId);
+        return ResponseEntity.noContent().build();
+    }
+
+    private long generatePhotoId() {
+        // In production: Snowflake-style distributed ID generator
+        return System.currentTimeMillis() << 22 | (Thread.currentThread().getId() & 0x3FF) << 12
+               | (long)(Math.random() * 4096);
+    }
+
+    private String contentHash(byte[] data) {
+        try {
+            var md = java.security.MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(md.digest(data));
+        } catch (Exception e) { throw new RuntimeException(e); }
+    }
+
+    record PhotoResponse(long photoId, List<VariantUrl> variants) {}
+    record VariantUrl(String size, String url) {}
+}
+```
+
+The `Surrogate-Key: photo:{photoId}` response header enables tag-based CDN purge. When a user deletes a photo, the application fires a single CDN purge for tag `photo:{photoId}`, which invalidates all 4 variant URLs simultaneously without enumerating each URL. This is the same pattern used by e-commerce CDNs for product invalidation — one tag purge, O(1) complexity regardless of how many cached URLs carry that tag.
+
+<TradeoffTable title="Photo storage approach comparison">
+
+| Approach | Read I/Os | RAM for index | Deletion | Throughput |
+|---|---|---|---|---|
+| **Standard filesystem (ext4)** | 3+ (dir + inode + data) | OS page cache — uncontrolled eviction | Immediate, expensive — directory block update + inode update | Limited by IOPS; saturates on metadata at ~100K files/sec |
+| **NFS cluster** | 3+ disk I/Os plus network RTT per metadata hop | OS page cache on filer — shared with all clients | Immediate on filer; NFS cache coherence adds latency | Network-bound; single filer IOPS ceiling |
+| **Object storage (S3)** | 1 (direct key → object ID → data) | None — hash-based key requires no separate index | Immediate; versioning available | High and elastic; expensive at high IOPS |
+| **Haystack (needle file)** | 1 (in-memory index → byte offset → disk seek) | 40 bytes/needle — fully controlled, shardable | Soft (compaction offline) — never modify files in-place | Highest for small files; no metadata I/O overhead |
+
+</TradeoffTable>
+
+<Pitfall title="Not soft-deleting — modifying haystack files in-place on delete">
+
+If you attempt to remove a needle from a haystack file immediately upon delete — zeroing out its bytes, punching a hole with `fallocate(FALLOC_FL_PUNCH_HOLE)`, or truncating the file — you create a series of problems that compound at scale. In-place zeroing requires a write I/O to the middle of a file, breaking the sequential access pattern that makes haystack reads fast. Hole punching with `fallocate` creates sparse file extents that fragment the file's block allocation on disk, degrading sequential read throughput over time. Most critically, in-place modification during a concurrent read of an adjacent needle risks a partial read returning corrupt bytes.
+
+The correct design uses a single-bit flag in the needle header to mark logical deletion, and removes the needle from the in-memory index so that subsequent reads return 404. The physical bytes remain on disk, harmlessly, until compaction runs offline. Compaction rewrites the file sequentially, copies only live needles, and atomically replaces the original file — restoring sequential access patterns in one batch operation rather than fragmenting them one deletion at a time. The trade-off is that disk space is not reclaimed immediately; at 0.1% deletion rate per day, a haystack file accumulates roughly 3% dead space per month, which is reclaimed by monthly compaction runs with negligible impact on storage cost.
+
+</Pitfall>
+
+<Pitfall title="Keeping the full index for all photos in RAM on one machine">
+
+At 500 billion photos × 4 variants × 40 bytes per index entry, the total index size is 80 TB. Attempting to hold this on a single machine — or even a small cluster — is not an engineering challenge to be solved with bigger RAM; it is a signal that the index must be sharded by design. A common interview mistake is to propose a central index server with a terabyte of RAM, which is both economically impractical and a single point of failure.
+
+The correct design shards the index by `photoId` range or consistent hash. With 1,000 Haystack store machines, each holds 80 GB of index — well within the capacity of a standard 128 GB server. A routing layer (the directory service) maps each `photoId` to its owning shard using a lookup table stored in ZooKeeper or a similar coordination service. For further reduction, apply a warm/cold split: only index entries for photos uploaded within the last 6 months stay hot in RAM. Photos older than 6 months have their index entries evicted to an on-disk RocksDB store on the same machine. Cold index lookups take 5–20ms (one SST file lookup in RocksDB) rather than microseconds, but cold photos represent < 5% of reads — the p99 of the overall system is dominated by hot and warm reads, not cold lookups.
+
+</Pitfall>
+
+<Curveball question="Facebook stores 4 different photo sizes per photo. Instagram Reels now adds 3 video quality levels per Reel, each consisting of many 2-second video segments of 1–100 MB. How does your Haystack design change when storing 100-MB video segments instead of 200-KB photos?">
+
+The Haystack needle format was designed around photos averaging 200 KB — small enough that thousands of needles fit in a single file, that the in-memory index overhead per needle is acceptable, and that a single disk seek returns the full payload in one I/O. Video segments at 100 MB break every one of these assumptions.
+
+At 100 MB per needle, a 100 GB haystack file contains only 1,000 needles — a packing density 500× worse than for photos. The benefit of packing needles together (amortizing filesystem metadata across many objects) largely disappears when each object is already large enough to warrant its own file. The in-memory index overhead also becomes negligible relative to the data size: 40 bytes of index for 100 MB of data is 0.00004% overhead, not worth the complexity of custom index management.
+
+For video segments, the correct architecture diverges from Haystack: store each segment as a standalone object in a purpose-built object store (S3-compatible) that uses content-addressable storage and a flat key-value namespace. The segment key is the content hash, enabling automatic deduplication — two users uploading the same Reel video get the same segment objects without double-storing. Byte-range GET support in S3 (`Range: bytes=X-Y`) allows adaptive bitrate clients to request partial segments without downloading the full object. The CDN is still essential — videos are even more read-heavy than photos and even more amenable to aggressive CDN caching.
+
+The hybrid architecture for a platform hosting both photos and video: keep Haystack for photos (< 2 MB), use object storage for video segments (> 1 MB). A unified upload API routes to the appropriate backend based on MIME type and payload size. The directory service maps both `photoId` and `segmentId` namespaces, with different resolution paths per type.
+
+</Curveball>
+
+<Curveball question="A popular photo goes viral and receives 50 million views within 1 hour of posting. Your CDN absorbs 40 million of those, but 10 million requests hit your Haystack store directly. What happens to your in-memory index and disk I/O, and how do you protect the Haystack store from being overwhelmed?">
+
+The in-memory index handles 10 million lookups per hour trivially — a `ConcurrentHashMap` lookup is nanoseconds, and the index for a single hot photo is a 40-byte entry in L1 cache after the first access. The index is not the bottleneck. The disk is.
+
+A single NVMe SSD delivers roughly 500K IOPS. 10 million requests per hour = ~2,778 requests per second. If each request results in a disk read (cache miss from the OS page cache), that is 2,778 IOPS for a single photo — manageable for NVMe. But the problem is that 10 million requests hitting the store means the CDN is not doing its job for this photo. In steady state, a CDN with a 99%+ hit ratio should absorb 49.5 million of the 50 million requests, not 40 million. The 10 million store hits suggest either the CDN is misconfigured (TTL too short, `Cache-Control: no-store` accidentally set), or the photo went viral before the CDN had time to cache it (cold start problem).
+
+The cold start scenario — photo uploaded, first million requests all arrive before the CDN has cached the photo — is the real risk. During the CDN warm-up window (the first few seconds after upload), all requests are cache misses. On a viral photo, this window coincides with the peak of the traffic spike. The mitigation is CDN pre-warming: after upload, the Haystack store or an upload service proactively pushes the photo to a set of CDN edge nodes (via a POST to the CDN's cache seeding API) before the upload confirmation is returned to the user. Cloudflare and Fastly both support explicit cache seeding via their APIs.
+
+For direct store protection, apply a request coalescing layer at the store server: if N requests for the same `photoId/variant` arrive simultaneously and all result in a cache miss in the OS page cache, allow only one disk read to proceed and hold the rest in a queue. Once the page cache is warm (after the first disk read), all queued requests are served from memory. This is the same request collapse pattern used by nginx's `proxy_cache_lock` directive. A Caffeine `AsyncLoadingCache` in Java provides this behavior automatically — concurrent requests for the same key share a single `CompletableFuture`, and the disk read happens exactly once regardless of how many callers are waiting.
+
+</Curveball>
+
+<Curveball question="A user invokes their GDPR right to erasure. They have uploaded 50,000 photos over 5 years. How do you efficiently find and hard-delete all needles belonging to this user across potentially hundreds of Haystack files?">
+
+This is the hardest deletion problem in the system, and it exposes a structural weakness in Haystack's data model: needles are indexed by `photoId`, not by `uploaderId`. There is no index that maps a user to all their photos across haystack files on all machines. The answer requires composing multiple systems rather than scanning haystack files directly.
+
+Step 1 is the fast part: query the photo metadata DB with `WHERE uploader_id = ? AND deleted = 0`. This returns all `photoId` values for the user — up to 50,000 rows — in a single indexed query. This gives a complete manifest of photos to delete.
+
+Step 2 is the slow part: for each `photoId` in the manifest (50,000 × 4 variants = 200,000 needles), issue a soft delete via the `softDelete(photoId, variant)` API. This removes the entries from the in-memory index across the relevant shards, making the photos immediately unreachable from any read path. CDN purge is triggered with the tag `user:{userId}` (if the upload controller tagged responses with the uploader's ID) or via 200,000 individual URL purges batched into the CDN purge API. The user's photos are effectively erased from the public read path within seconds of the soft delete completing — this satisfies GDPR's "right to erasure" requirement for most interpretations.
+
+Step 3 is physical deletion from disk: during the next compaction cycle for each affected haystack file, the compaction process skips all needles marked as deleted (including the newly soft-deleted user photos). Since the user has photos spread across potentially 5 years of haystack files on hundreds of machines, the compaction-based physical deletion is gradual — photos are removed from each file the next time that file is compacted. If regulatory requirements mandate a specific timeline for physical deletion (e.g., "data must be physically destroyed within 30 days"), trigger an expedited compaction for all haystack files containing the user's photos, identified by the `logical_volume_id` recorded in the metadata DB. This adds operational complexity but is tractable — 50,000 photos spread across a haystack file fleet typically touch no more than a few hundred files, each of which can be compacted in parallel.
+
+</Curveball>
+
+<RelatedQuestions items={[
+  { slug: "s3-object-storage", title: "Design S3-like Object Storage", difficulty: "staff" },
+  { slug: "dropbox-google-drive", title: "Design Dropbox / Google Drive", difficulty: "senior" },
+  { slug: "cdn-design", title: "Design a CDN", difficulty: "senior" },
+]} />
+
+## Further reading
+
+- [Finding a Needle in Haystack: Facebook's Photo Storage (OSDI 2010)](https://www.usenix.org/legacy/event/osdi10/tech/full_papers/Beaver.pdf) — The original Facebook paper by Beaver et al. describing the complete Haystack design including the needle format, the directory service, the cache tier, and the Haystack store API. Section 3 on the Haystack architecture and Section 4 on the design's evolution from NFS are required reading. The performance evaluation in Section 5 includes real numbers on I/O amplification reduction and the impact on tail latency.
+- [f4: Facebook's Warm BLOB Storage System (OSDI 2014)](https://www.usenix.org/system/files/conference/osdi14/osdi14-paper-muralidhar.pdf) — Facebook's follow-up paper describing the warm storage tier built on top of Haystack for photos older than a few months. f4 introduces erasure coding (14+3 Reed-Solomon) to reduce storage overhead from 3.6× (triple replication) to 2.1× for warm data, at the cost of higher read latency for reconstruction. The paper quantifies the cost savings and the engineering trade-offs of moving from replication to erasure coding for a read-mostly workload.
+- [Instagram Engineering: Storing 3 Billion Images](https://instagram-engineering.com/storing-3-billion-photos-571b16dc6b63) — Instagram's engineering blog post describing how Instagram adapted Facebook's photo storage infrastructure to serve Instagram's specific access patterns, including their use of a modified Haystack for the hot tier and their integration with Amazon S3 for the cold tier. Practical operational insights on monitoring haystack store health, managing volume allocation, and handling compaction at scale.

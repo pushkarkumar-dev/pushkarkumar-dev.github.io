@@ -1,0 +1,105 @@
+---
+export interface QuestionRef {
+  slug: string;
+  title: string;
+  difficulty?: 'mid' | 'senior' | 'staff';
+}
+export interface Props {
+  items: QuestionRef[];
+}
+const { items } = Astro.props;
+
+const base = import.meta.env.BASE_URL;
+
+const diffColor: Record<string, string> = {
+  mid:    'var(--diff-mid)',
+  senior: 'var(--diff-senior)',
+  staff:  'var(--diff-staff)',
+};
+---
+
+<nav class="related" aria-label="Related questions">
+  <p class="related__heading">Related questions</p>
+  <ul class="related__list">
+    {items.map(item => (
+      <li>
+        <a href={`${base}/${item.slug}/`} class="related__link">
+          <span class="related__title">{item.title}</span>
+          {item.difficulty && (
+            <span class="related__diff" style={`color: ${diffColor[item.difficulty] ?? 'var(--ink-3)'}`}>
+              {item.difficulty}
+            </span>
+          )}
+          <svg class="related__arrow" width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+            <path d="M2 6h8M7 3l3 3-3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </a>
+      </li>
+    ))}
+  </ul>
+</nav>
+
+<style>
+  .related {
+    margin: 2.5rem 0 0;
+    padding-top: 2rem;
+    border-top: 1px solid var(--line);
+  }
+  .related__heading {
+    font-family: 'Geist', system-ui, sans-serif;
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-4);
+    margin: 0 0 0.875rem;
+  }
+  .related__list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  .related__link {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.625rem 0.875rem;
+    border: 1px solid var(--line-2);
+    border-radius: var(--r-md);
+    text-decoration: none;
+    background: var(--bg-card);
+    transition: border-color var(--dur-fast), background var(--dur-fast);
+  }
+  .related__link:hover {
+    border-color: var(--accent-line);
+    background: var(--bg-raised);
+  }
+  .related__title {
+    flex: 1;
+    font-size: 0.875rem;
+    color: var(--ink-2);
+    font-weight: 500;
+    transition: color var(--dur-fast);
+  }
+  .related__link:hover .related__title { color: var(--ink); }
+  .related__diff {
+    font-family: 'Geist', system-ui, sans-serif;
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    flex-shrink: 0;
+  }
+  .related__arrow {
+    color: var(--ink-4);
+    flex-shrink: 0;
+    transition: color var(--dur-fast), transform var(--dur-fast);
+  }
+  .related__link:hover .related__arrow {
+    color: var(--accent);
+    transform: translateX(2px);
+  }
+</style>

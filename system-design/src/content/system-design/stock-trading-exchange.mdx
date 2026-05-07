@@ -1,0 +1,605 @@
+---
+title: "Design a Stock Trading Exchange"
+slug: "stock-trading-exchange"
+category: "realtime"
+difficulty: "staff"
+estimatedReadMinutes: 28
+tags: ["order-book", "matching-engine", "fix-protocol", "market-data", "low-latency", "sequencer", "trading"]
+companyFlavors: ["NYSE", "NASDAQ", "Coinbase", "Robinhood"]
+prerequisites: ["distributed-unique-id-generator", "distributed-locking-service", "distributed-kv-store"]
+relatedQuestions: ["live-sports-scores", "online-auction", "distributed-unique-id-generator"]
+publishedAt: "2025-01-15"
+updatedAt: "2025-01-15"
+summary: "Design a stock trading exchange: the order book data structure, price-time priority matching engine, FIX protocol order ingestion, market data fan-out, and the correctness guarantees that prevent phantom fills and duplicate executions at microsecond latency."
+javaPackages:
+  - "org.springframework.boot:spring-boot-starter-web:3.3.0"
+  - "org.springframework.kafka:spring-kafka:3.2.0"
+  - "io.lettuce:lettuce-core:6.3.2.RELEASE"
+  - "org.springframework.data:spring-data-jpa:3.3.0"
+---
+
+import Bookmark from '../../components/content/Bookmark.astro';
+import Tldr from '../../components/content/Tldr.astro';
+import Capacity from '../../components/content/Capacity.astro';
+import Pitfall from '../../components/content/Pitfall.astro';
+import Curveball from '../../components/content/Curveball.astro';
+import TradeoffTable from '../../components/content/TradeoffTable.astro';
+import Mermaid from '../../components/content/Mermaid.astro';
+import RelatedQuestions from '../../components/content/RelatedQuestions.astro';
+
+<Bookmark slug="stock-trading-exchange" title="Design a Stock Trading Exchange" />
+
+<Tldr>
+- **Order book**: two sorted price levels — asks (ascending) and bids (descending); each price level is a FIFO queue of orders; matching is O(1) at the best bid/ask using a `TreeMap` keyed by price, where `bids.lastKey()` gives the highest bid and `asks.firstKey()` gives the lowest ask in constant time.
+- **Matching engine**: intentionally single-threaded per symbol — no locks needed because there is only one thread; processes orders from a sequencer queue in strict arrival order; price-time priority governs fill decisions — best price wins, ties broken by arrival sequence number (earlier sequence number fills first).
+- **Sequencer**: every incoming order is assigned a monotonically increasing sequence number before it enters the matching engine; this assignment is the linearization point of the entire system — no two orders ever share a sequence number, and the sequence number is the canonical "arrival time" for price-time priority purposes.
+- **Market data**: after each match or order book state change, the matching engine broadcasts Level 1 (best bid/ask + quantities) and Level 2 (top-10 price levels on each side) to subscribers via multicast UDP at co-location or WebSocket for internet clients; latency from trade execution to market data delivery is sub-millisecond.
+- **Correctness guarantees**: phantom fills are prevented by writing each trade atomically to an append-only write-ahead log with the sequence number as the primary key before acknowledging the match; duplicate executions are prevented downstream because the sequence number is the idempotency key for all Kafka consumers, PostgreSQL upserts, and risk management systems.
+</Tldr>
+
+## The scale of the problem
+
+A stock exchange is, at its core, a deterministic sorting machine that runs continuously from 9:30 AM to 4:00 PM Eastern Time and must never make a mistake. The New York Stock Exchange processes roughly 20 billion messages per day. NASDAQ handles over 60 billion market data events daily. During the opening and closing auctions — the most compute-intensive periods — order submission rates can spike to 500,000 messages per second on a single exchange. These numbers dwarf what most engineers encounter, but the volume itself is not the hardest part. A Kafka cluster can ingest 500K messages per second without breaking a sweat. The hard part is that every message must be processed in a globally consistent order, every match must produce exactly the right trade at the right price, and any deviation — even a single duplicate fill — is a regulatory violation that can result in fines, trading suspensions, and national news coverage.
+
+This puts the exchange in a categorically different engineering regime from almost every other distributed system. In most systems, eventual consistency is acceptable. In matching, it is not. If two threads match the same buy order against two different sell orders simultaneously, that buyer may end up owing twice what they intended. If a trade is recorded twice because of a retry without idempotency, the buyer's broker will show a duplicate position that does not exist in the market. The central insight that every interviewer is probing: distributed consensus protocols like Paxos and Raft operate at millisecond timescales, while matching latency requirements are measured in microseconds. These two facts are irreconcilable. The correct solution is not to distribute the matching computation — it is to centralize it on a single thread and use a sequencer to serialize all inputs before they reach that thread. Correctness comes from deterministic ordering, not from distributed locking.
+
+The hardware reality of modern electronic exchanges underscores how extreme the latency requirements are. Real exchanges like NYSE and NASDAQ use field-programmable gate arrays (FPGAs) for their matching engines — purpose-built silicon that can match an order in under 100 nanoseconds. Co-location services sell rack space inside the data center so that high-frequency trading firms can place their servers within five meters of the exchange's matching engine, reducing round-trip network latency from 1 millisecond (Manhattan to New Jersey fiber) to under 5 microseconds. Kernel bypass networking (DPDK, RDMA) eliminates the operating system from the network I/O path entirely. This document describes a software exchange — a design that achieves sub-100-microsecond matching latency using the LMAX Disruptor ring buffer pattern — but the architectural principles are identical to what real exchanges run in production.
+
+## Clarifying questions
+
+Lock down these eight questions in the first five minutes. Each one materially changes at least one design decision.
+
+| Question | Ideal Answer | Why It Matters |
+|---|---|---|
+| Which order types must be supported? | Limit and market orders are mandatory; stop orders are optional scope extension | Market orders have no price and must match immediately at the best available price; stop orders require a separate price monitoring trigger system — a third state machine layered on top of the order book |
+| What is the minimum tick size? | $0.01 for most US equities (SEC Rule 612) | Tick size determines the cardinality of the price level map: a $200 stock with $0.01 ticks can have up to 20,000 distinct price levels; this is still small enough to fit comfortably in L3 cache |
+| What are the trading hours? | 9:30 AM – 4:00 PM ET for regular session; 4:00 AM – 9:30 AM and 4:00 PM – 8:00 PM for extended hours | Extended hours have different rules (limit orders only, wider spreads, lower liquidity guarantees) and require a separate session-aware state machine |
+| Is settlement in scope? | No — T+2 settlement is handled by the Depository Trust & Clearing Corporation (DTCC), out of scope | Settlement involves netting, delivery-versus-payment, and nostro/vostro accounting — an entirely separate system from matching |
+| Is short selling supported? | Yes — a seller can sell shares they do not currently own (borrowed from a broker) | Short selling requires an additional validation step: the order gateway must verify that the broker has a valid borrow locate before accepting the sell order; this is a pre-trade risk check |
+| Are circuit breakers required? | Yes — SEC Rule 80B mandates trading halts at 7%, 13%, and 20% market-wide price declines | Circuit breakers require a real-time price monitoring service and a halt/resume state machine that propagates across the order gateway, matching engine, and market data systems |
+| Are options or derivatives in scope? | No — equities only | Options introduce expiry dates, strike prices, put/call type, and the Black-Scholes pricing model; the matching logic is similar but the data model is substantially more complex |
+| What regulatory reporting is required? | Yes — FINRA CAT (Consolidated Audit Trail), OATS, and SEC Rule 606 for best execution reporting | Regulatory reporting requires a complete immutable audit trail of every order event with microsecond timestamps; this drives the WAL and event sourcing pattern described below |
+
+## Functional requirements
+
+- Authenticated broker sessions can submit new orders specifying symbol, side (BUY or SELL), order type (LIMIT or MARKET), quantity, price (required for LIMIT orders), client order ID, and time-in-force (DAY, GTC — Good Till Cancelled, IOC — Immediate or Cancel, FOK — Fill or Kill).
+- Brokers can cancel any open order by exchange order ID; the cancel is processed asynchronously and acknowledged with a cancel confirmation or rejection (if the order was already filled).
+- The exchange maintains a live order book for each listed symbol; brokers can query Level 1 data (best bid price, best ask price, and their respective quantities) and Level 2 data (top 10 price levels on each side).
+- After each trade, both the buy-side broker and sell-side broker receive an execution report containing the trade price, quantity filled, and remaining quantity; partial fills generate intermediate execution reports.
+- Any market participant can view the trade history (time and sales) for a given symbol — a time-ordered log of all executed trades with price and quantity.
+- Brokers receive real-time order status updates (NEW, PARTIALLY_FILLED, FILLED, CANCELLED, REJECTED) as order lifecycle events occur.
+
+## Non-functional requirements
+
+- **Ingest throughput**: 100,000+ orders per second during peak trading; 60 billion market data events per day.
+- **Matching latency**: p99 matching latency below 100 microseconds for a software exchange (measured from sequencer receipt to trade record written); p99 order acknowledgment below 1 millisecond end-to-end from broker to exchange and back.
+- **Correctness**: zero phantom fills (every trade recorded corresponds to exactly one buy order and one sell order); zero duplicate executions (sequence number is the system-wide idempotency key); no two orders receive the same sequence number.
+- **Availability**: 99.999% (five nines) during trading hours — an exchange outage is a national news event and triggers regulatory review; planned maintenance windows are restricted to non-trading hours.
+- **Durability**: every order event and every trade must be persisted to durable storage before the matching engine acknowledges the outcome; no trade can be lost on a process crash.
+- **Regulatory compliance**: complete, immutable, microsecond-timestamped audit trail for every order lifecycle event, retained for seven years per SEC Rule 17a-4.
+
+<Capacity title="Stock Exchange Capacity Estimates">
+**Order ingest bandwidth**: $100{,}000 \text{ orders/s} \times 200 \text{ bytes/order} = 20 \text{ MB/s}$ inbound. This is trivial bandwidth — a single 1 Gbps NIC is 2% utilized. **Latency is the hard problem, not bandwidth.**
+
+**Order book memory footprint**: $3{,}000 \text{ listed stocks} \times 200 \text{ avg price levels} \times 2 \text{ sides} \times 10 \text{ orders/level} \times 100 \text{ bytes/order} \approx 120 \text{ MB}$. The entire order book for all US-listed equities fits in L3 cache on a modern server (typically 32–64 MB L3). This is why in-memory matching is not just acceptable — it is the only correct architecture.
+
+**Trade event volume**: $10{,}000{,}000 \text{ trades/day} \times 500 \text{ bytes/trade} = 5 \text{ GB/day}$ for the trade log. Market data: $60{,}000{,}000{,}000 \text{ events/day} \times 50 \text{ bytes} = 3 \text{ TB/day}$ for the raw market data feed — stored in cold storage (S3/GCS) for regulatory compliance and backtesting.
+
+**Sequence number capacity**: a 64-bit unsigned integer can store $\approx 9.2 \times 10^{18}$ values. At 100,000 orders per second, the sequence counter will exhaust after $\frac{9.2 \times 10^{18}}{100{,}000 \times 3{,}600 \times 24 \times 365} \approx 2.9 \times 10^{6}$ years. Wraparound is not a concern for any practical deployment.
+
+**Market data subscriber connections**: $10{,}000 \text{ registered firms} \times 5 \text{ data feeds/firm} = 50{,}000$ persistent WebSocket or multicast UDP connections. Each L2 update is approximately 200 bytes × 50,000 connections = 10 MB per update event. At 3,000 symbols × 10 updates/second = 30,000 updates/second, total outbound bandwidth is $30{,}000 \times 10 \text{ MB} = 300 \text{ GB/s}$ — this is why multicast (send once, received by all) is mandatory for co-located subscribers. Internet-facing WebSocket delivery is symbol-specific (a subscriber requests only the symbols they care about), reducing per-connection bandwidth to a few KB/s.
+</Capacity>
+
+## API design
+
+The industry standard for order submission is the FIX protocol (Financial Information eXchange) — a text-based, tag-value format dating to 1992 that every broker and exchange in the world supports. A modern exchange exposes REST and WebSocket APIs alongside FIX for retail brokers and algorithmic traders. Both are described here.
+
+**FIX 4.4 New Order Single (35=D)** — the canonical order submission message in production:
+
+```text
+8=FIX.4.4|9=178|35=D|49=BROKER01|56=EXCHANGE|34=1001|52=20240115-14:30:00.123456|
+11=CLIENT-ORDER-001|21=1|55=AAPL|54=1|60=20240115-14:30:00.123456|
+38=100|40=2|44=185.50|59=0|10=072|
+```
+
+Tag 35=D means New Order Single. Tag 54=1 is BUY, 54=2 is SELL. Tag 40=1 is MARKET, 40=2 is LIMIT. Tag 59=0 is DAY, 59=1 is GTC, 59=3 is IOC, 59=4 is FOK.
+
+**REST API for modern clients:**
+
+Order submission:
+
+```http
+POST /api/v1/orders
+Content-Type: application/json
+
+{
+  "symbol": "AAPL",
+  "side": "BUY",
+  "order_type": "LIMIT",
+  "quantity": 100,
+  "price": 185.50,
+  "client_order_id": "CLIENT-ORDER-001",
+  "time_in_force": "DAY"
+}
+```
+
+Response (immediate acknowledgment):
+
+```json
+{
+  "exchange_order_id": "EX-20240115-00001001",
+  "client_order_id": "CLIENT-ORDER-001",
+  "sequence_number": 1000423,
+  "status": "NEW",
+  "timestamp": "2024-01-15T14:30:00.123456Z"
+}
+```
+
+Order management:
+
+```http
+DELETE /api/v1/orders/{exchange_order_id}
+```
+
+Returns `202 Accepted` immediately — cancel is processed asynchronously by the matching engine. The broker receives a CancelConfirmation or CancelReject execution report via WebSocket.
+
+```http
+GET /api/v1/orders/{exchange_order_id}
+```
+
+Returns current order status, quantity filled, average fill price, and a list of individual execution reports.
+
+Market data:
+
+```text
+WebSocket: wss://exchange.example.com/ws/marketdata/{symbol}
+```
+
+Clients subscribe per-symbol and receive a stream of Level 1 and Level 2 update events. Every event contains a sequence number for gap detection — if a client receives sequence 1001 after 999, it knows it missed 1000 and must request a snapshot to resync.
+
+```http
+GET /api/v1/marketdata/{symbol}/snapshot
+```
+
+Returns the current full order book snapshot (all price levels, all orders per level). Used for initial subscription state and gap recovery.
+
+## Data model
+
+**In-memory order book (per symbol, rebuilt from WAL on restart):**
+
+```java
+// One instance per symbol, owned by the matching engine thread
+TreeMap<BigDecimal, Deque<Order>> bids; // descending: highest bid = bids.lastKey()
+TreeMap<BigDecimal, Deque<Order>> asks; // ascending:  lowest ask = asks.firstKey()
+```
+
+Each `Order` object in the deque:
+
+```java
+record Order(
+    String    exchangeOrderId,
+    String    clientOrderId,
+    String    brokerId,
+    String    symbol,
+    Side      side,           // BUY or SELL
+    OrderType type,           // LIMIT or MARKET
+    BigDecimal price,
+    int       totalQty,
+    int       remainingQty,
+    int       filledQty,
+    long      sequenceNumber, // assigned by sequencer; lower = earlier
+    Instant   timestamp
+) {}
+```
+
+**PostgreSQL — orders table (write-ahead log of all order lifecycle events):**
+
+```sql
+CREATE TABLE orders (
+    exchange_order_id  VARCHAR(32)    PRIMARY KEY,
+    broker_id          VARCHAR(16)    NOT NULL,
+    symbol             VARCHAR(8)     NOT NULL,
+    side               CHAR(4)        NOT NULL CHECK (side IN ('BUY', 'SELL')),
+    order_type         VARCHAR(8)     NOT NULL CHECK (order_type IN ('LIMIT', 'MARKET')),
+    quantity           INT            NOT NULL CHECK (quantity > 0),
+    price              NUMERIC(12,4),
+    status             VARCHAR(16)    NOT NULL DEFAULT 'NEW',
+    sequence_number    BIGINT         NOT NULL UNIQUE,
+    created_at         TIMESTAMPTZ    NOT NULL DEFAULT now(),
+    updated_at         TIMESTAMPTZ    NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_orders_symbol_status ON orders (symbol, status);
+CREATE INDEX idx_orders_broker        ON orders (broker_id, created_at DESC);
+```
+
+**PostgreSQL — trades table (immutable trade log; append-only):**
+
+```sql
+CREATE TABLE trades (
+    trade_id        VARCHAR(32)   PRIMARY KEY,
+    buy_order_id    VARCHAR(32)   NOT NULL REFERENCES orders(exchange_order_id),
+    sell_order_id   VARCHAR(32)   NOT NULL REFERENCES orders(exchange_order_id),
+    symbol          VARCHAR(8)    NOT NULL,
+    quantity        INT           NOT NULL,
+    price           NUMERIC(12,4) NOT NULL,
+    sequence_number BIGINT        NOT NULL UNIQUE,  -- idempotency key
+    trade_time      TIMESTAMPTZ   NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_trades_symbol_time ON trades (symbol, trade_time DESC);
+```
+
+The `UNIQUE` constraint on `sequence_number` in the trades table is the database-level guard against duplicate executions. If the matching engine crashes and replays events, the insert on replay will fail with a unique constraint violation — which the consumer treats as "already processed, skip."
+
+**Redis — market data cache:**
+
+```text
+Key:   book:{symbol}:L1        Value: {"bid_price": 185.50, "bid_qty": 300, "ask_price": 185.51, "ask_qty": 150}
+Key:   book:{symbol}:L2        Value: [{"price": 185.50, "qty": 300}, {"price": 185.49, "qty": 1200}, ...]
+Key:   book:{symbol}:seq       Value: 1000423  (last sequence number reflected in the snapshot)
+TTL:   none (keys persist; updated after every order book change)
+```
+
+New WebSocket subscribers fetch the L2 snapshot from Redis first (with its sequence number), then start consuming Kafka events with `offset >= snapshot_seq`. This ensures gap-free delivery without locking the matching engine.
+
+## System architecture
+
+<Mermaid diagram={`flowchart TD
+    B[Broker / FIX Session] -->|FIX 4.4 or REST| GW[Order Gateway]
+    GW -->|pre-trade risk check| RS[Risk Service\\n(buying power, borrow locate)]
+    RS -->|reject| GW
+    GW -->|assign sequence number| SQ[Sequencer\\nAtomicLong.incrementAndGet]
+    SQ -->|enqueue with seqNum| RB[Ring Buffer\\nper-symbol FIFO\\nDisruptor pattern]
+    RB -->|single consumer| ME[Matching Engine\\nsingle-threaded per symbol]
+    ME -->|no match| OB[Update Order Book\\nin-memory TreeMap]
+    ME -->|match found| TR[Write Trade to WAL\\nappend-only FileChannel]
+    TR --> OB
+    OB --> KF[Kafka\\ntrades + order-events topics]
+    KF --> DB[PostgreSQL Writer\\nasync consumer]
+    KF --> MD[Market Data Publisher]
+    MD -->|multicast UDP| COLO[Co-located HFT Firms]
+    MD -->|WebSocket push| RETAIL[Retail Clients]
+    MD -->|snapshot update| RD[Redis L1 + L2 Cache]
+    GW -->|immediate ack| B
+    ME -->|execution report| GW
+    GW -->|fill notification| B
+`} />
+
+The diagram captures the critical ordering guarantee: sequence number assignment (the Sequencer box) happens before the order enters the Ring Buffer, which feeds the single-threaded Matching Engine. Nothing in this hot path touches a distributed system — no Paxos, no ZooKeeper, no Redis in the critical path. Durability comes from the WAL write before Kafka publication. Eventual consistency (PostgreSQL, Redis, market data) lives entirely downstream of the WAL.
+
+## Deep dives
+
+### Order book data structure
+
+The order book is a pair of sorted maps, one for bids and one for asks, where each key is a price level and each value is a FIFO queue of orders at that price. The data structure invariant that enables O(1) best-price access:
+
+- `bids` is a `TreeMap` iterated in descending key order: `bids.lastKey()` returns the highest bid price in O(log n) — but since TreeMap maintains a reference to the last entry, `lastEntry()` is O(1) in practice.
+- `asks` is a `TreeMap` iterated in ascending key order: `asks.firstKey()` returns the lowest ask price, also O(1) via `firstEntry()`.
+
+A match is possible whenever `bids.lastKey() >= asks.firstKey()`. The trade executes at the price of the resting order — the order already sitting in the book before the incoming order arrived. This is the price-time priority rule: the resting order set the price it was willing to transact at, and the incoming aggressive order is accepting that price.
+
+Price-time priority for orders at the same price level: within a single price level's deque, orders are stored in FIFO order by sequence number. The order with the lower sequence number (earlier arrival at the sequencer) is at the front of the deque and fills first. This is why the sequencer is the correct place to establish "arrival time" — not the timestamp on the order message (which can be spoofed or clock-skewed) but the sequence number assigned by the exchange's own sequencer under controlled conditions.
+
+The matching loop:
+
+```java
+private List<Trade> match() {
+    List<Trade> trades = new ArrayList<>();
+    while (canMatch()) {
+        Map.Entry<BigDecimal, Deque<Order>> bestBidEntry = bids.lastEntry();
+        Map.Entry<BigDecimal, Deque<Order>> bestAskEntry = asks.firstEntry();
+
+        Order bid = bestBidEntry.getValue().peekFirst();
+        Order ask = bestAskEntry.getValue().peekFirst();
+
+        BigDecimal tradePrice = ask.price(); // resting order sets the price
+        int tradedQty = Math.min(bid.remainingQty(), ask.remainingQty());
+
+        Trade trade = new Trade(generateTradeId(), bid.exchangeOrderId(),
+                ask.exchangeOrderId(), symbol, tradedQty, tradePrice,
+                Instant.now(), nextSeq.incrementAndGet());
+        trades.add(trade);
+
+        applyFill(bid, tradedQty, bestBidEntry.getValue(), bids, bestBidEntry.getKey());
+        applyFill(ask, tradedQty, bestAskEntry.getValue(), asks, bestAskEntry.getKey());
+    }
+    return trades;
+}
+
+private boolean canMatch() {
+    if (bids.isEmpty() || asks.isEmpty()) return false;
+    return bids.lastKey().compareTo(asks.firstKey()) >= 0;
+}
+
+private void applyFill(Order order, int qty, Deque<Order> level,
+                        TreeMap<BigDecimal, Deque<Order>> book, BigDecimal price) {
+    Order updated = order.withRemainingQty(order.remainingQty() - qty)
+                         .withFilledQty(order.filledQty() + qty);
+    level.pollFirst();
+    if (updated.remainingQty() > 0) {
+        level.addFirst(updated);
+    }
+    if (level.isEmpty()) {
+        book.remove(price);
+    }
+}
+```
+
+MARKET orders are handled by setting the price to `BigDecimal.ZERO` for a market sell (willing to sell at any price) or `new BigDecimal("999999.99")` for a market buy (willing to buy at any price). This makes them naturally aggressive against all resting limit orders without special-casing the match condition.
+
+Time-in-force semantics are enforced after the match loop. IOC (Immediate or Cancel) orders: any remaining quantity after the match loop completes is cancelled. FOK (Fill or Kill) orders: before matching, check whether the full quantity can be filled against existing resting orders; if not, reject without touching the book. DAY orders: any unmatched remainder rests in the book and is cancelled at 4:00 PM market close.
+
+### Sequencer: the linearization point
+
+The sequencer is a deceptively simple component with profound correctness implications. Its entire job is to assign a globally unique, monotonically increasing sequence number to each incoming order and route it to the correct per-symbol ring buffer. But by doing this, it establishes the single linearization point for the entire exchange — the moment an order's sequence number is assigned is the canonical instant it "arrived" at the exchange for all purposes: price-time priority, regulatory audit trail, and replay.
+
+Implementation options span a wide performance spectrum:
+
+**Option 1: Single-process atomic counter (software implementation).** A single Java process running an `AtomicLong.incrementAndGet()` can assign sequence numbers at 10–50 million per second — well above the 100K/s requirement with enormous headroom. This is the correct starting point. The counter is persisted to a WAL entry along with the order, so it survives crashes. The single point of failure concern is mitigated by a hot standby that replays from the WAL on failover (failover takes under 100ms with a warm process waiting, which is acceptable since the exchange halts trading during technical issues).
+
+**Option 2: Primary-backup sequencer with Raft.** Achieves automatic failover without a manual promotion step. The cost is 1–5ms latency per sequence assignment due to the Raft leader-follower round-trip. At 100 microsecond matching latency targets, a 1ms sequencer becomes the bottleneck. This approach is only appropriate for exchanges with relaxed latency requirements.
+
+**Option 3: FPGA-based hardware sequencer.** Real high-frequency exchanges use FPGAs to implement the sequencer in silicon, achieving sub-microsecond sequence number assignment. Out of scope for a software design but important to mention to demonstrate awareness of the production landscape.
+
+The software sequencer design:
+
+```java
+public final class Sequencer {
+    private final AtomicLong counter = new AtomicLong(0);
+    private final Map<String, RingBuffer<OrderEvent>> symbolQueues;
+
+    public long submit(Order order) {
+        long seqNum = counter.incrementAndGet();
+        order = order.withSequenceNumber(seqNum);
+        wal.append(seqNum, order);              // durable before enqueue
+        symbolQueues.get(order.symbol())
+                    .publish(OrderEvent.of(order)); // non-blocking ring buffer write
+        return seqNum;
+    }
+}
+```
+
+The WAL write before ring buffer enqueue is non-negotiable. If the process crashes between `wal.append()` and `symbolQueues.publish()`, the WAL contains the order but the matching engine never saw it — the watchdog process replays the WAL and resubmits. If the crash happens after both, the matching engine processes it and the trade is written to the trade WAL; on replay, the sequence number's idempotency check skips re-processing.
+
+### Matching engine: single-threaded correctness
+
+The matching engine is intentionally single-threaded per symbol. This architectural decision eliminates an entire class of concurrency bugs — no locks, no compare-and-swap on order book state, no ABA problems, no need to reason about visibility across threads. The sequencer ensures all inputs arrive in a total order; the matching engine processes them one at a time in that order. The output is deterministic: given the same input sequence, the matching engine will always produce the same trades.
+
+The Disruptor pattern (from LMAX Exchange's open-source library) is the standard implementation vehicle. A ring buffer of pre-allocated `OrderEvent` objects sits between the sequencer (producer) and the matching engine (consumer). The ring buffer avoids heap allocation in the hot path — `OrderEvent` slots are overwritten in place rather than allocated and garbage-collected. This matters because JVM garbage collection pauses (even G1GC stop-the-world pauses of 1–10ms) would violate the sub-100-microsecond latency budget. Using pre-allocated ring buffer slots means the GC has nothing to collect in the matching engine's hot path.
+
+After a match, the matching engine performs three operations in sequence:
+
+1. Update the in-memory order book (remove filled orders, update partially-filled order quantities).
+2. Write the trade to the trade WAL — a memory-mapped file (`FileChannel` with `force(false)`) that provides OS-level durability on process crash without requiring a full `fsync()` after every trade. The sequence number is written first, making the WAL entry idempotent.
+3. Publish the trade event and updated order book state to the Disruptor output ring buffer, from which downstream consumers (Kafka publisher, market data broadcaster) read asynchronously.
+
+The matching engine never calls a network API, never queries a database, and never acquires a lock. All of these operations happen asynchronously in downstream consumers after the matching engine has already moved on to the next order event. This is what makes sub-100-microsecond matching achievable in software.
+
+Event sourcing and replay: the matching engine's entire state (the order book) is a pure function of its input event log (the WAL). If the process restarts, it replays the WAL from the beginning to rebuild the order book. Because sequence numbers are monotonically increasing and the matching logic is deterministic, the rebuilt order book is bit-for-bit identical to the state before the crash. This is event sourcing applied to a real-time system — the WAL is the source of truth, the in-memory order book is a derived read model.
+
+### Market data distribution
+
+Market data is the exchange's most broadcast-heavy output. A single trade in AAPL generates a Level 1 update (new best bid/ask) and a Level 2 update (changed price level depth) that must be delivered to every subscriber simultaneously. The distribution architecture has two tiers:
+
+**Co-location tier (multicast UDP):** Trading firms that pay for rack space inside the exchange's data center receive market data via IP multicast. A single UDP packet is sent once by the exchange and received by all multicast group subscribers simultaneously — O(1) transmission cost regardless of subscriber count. Multicast latency from matching engine to co-located receiver is under 5 microseconds. UDP is appropriate here because the exchange also publishes a sequenced, TCP-based "recovery feed" — if a multicast packet is dropped, the client requests a retransmit of the specific sequence number via the recovery feed. Gap detection uses the sequence number embedded in every market data message.
+
+**Internet tier (WebSocket):** Retail brokers and non-co-located participants connect via WebSocket. The Market Data Publisher service subscribes to Kafka `market-data` topic and maintains a persistent WebSocket connection per subscriber. Subscribers register for specific symbols (nobody watches all 3,000 symbols simultaneously), so the publisher fans out only relevant updates. Initial connection: the subscriber requests a snapshot from Redis (which the matching engine updates synchronously after every state change), then subscribes to Kafka from the snapshot's sequence number. This provides a consistent starting state without pausing the matching engine.
+
+**Throughput math:** 3,000 symbols × 10 updates/second/symbol × 200 bytes/update = 6 MB/s total market data volume — trivial bandwidth. The co-location multicast handles this with a single 1 Gbps NIC at under 5% utilization. The constraint is latency (sub-millisecond from matching to delivery), not bandwidth.
+
+### Circuit breakers and trading halts
+
+Circuit breakers are a regulatory requirement and a systems design challenge. The SEC's Regulation SCI (Rule 80B) mandates market-wide circuit breakers at three levels: Level 1 (7% decline in S&P 500 from prior-day close → 15-minute halt), Level 2 (13% decline → 15-minute halt), and Level 3 (20% decline → halt for remainder of trading day). Individual stocks also have Limit Up-Limit Down (LULD) bands — trading is paused for five minutes if the price moves more than a band-specific percentage from the reference price.
+
+Implementation requires a Price Monitoring Service that subscribes to the trade event Kafka topic, maintains a rolling price window per symbol (and for the S&P 500 index composite), and publishes halt events when thresholds are breached.
+
+```yaml
+halt-event:
+  type: LULD_HALT
+  symbol: AAPL
+  reason: "Price moved 5.2% outside LULD band"
+  reference_price: 185.50
+  upper_band: 194.78
+  lower_band: 176.23
+  halt_start: "2024-01-15T14:32:00Z"
+  expected_resume: "2024-01-15T14:37:00Z"
+  sequence_number: 1000899
+```
+
+On receiving a halt event, the Order Gateway immediately begins rejecting new orders for the halted symbol with a HALT rejection code. The Matching Engine skips processing any queued orders for that symbol (they remain queued and are processed in order after the halt lifts). The Market Data Publisher broadcasts the halt notice to all subscribers. On resume, the Price Monitoring Service publishes a resume event, the Order Gateway accepts new orders, and the Matching Engine processes the queued orders in sequence number order — exactly as if they had arrived normally, because for the matching engine, they did.
+
+## Java implementation
+
+### Part A — MatchingEngine.java
+
+```java
+package com.exchange.matching;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
+
+public final class MatchingEngine {
+
+    private final String symbol;
+    private final TreeMap<BigDecimal, Deque<Order>> bids =
+            new TreeMap<>(Comparator.reverseOrder());
+    private final TreeMap<BigDecimal, Deque<Order>> asks =
+            new TreeMap<>();
+    private final WriteAheadLog wal;
+    private final AtomicLong tradeSeq = new AtomicLong(0);
+
+    public MatchingEngine(String symbol, WriteAheadLog wal) {
+        this.symbol = symbol;
+        this.wal    = wal;
+    }
+
+    public List<Trade> processOrder(Order incoming) {
+        if (incoming.type() == OrderType.MARKET) {
+            incoming = incoming.side() == Side.BUY
+                    ? incoming.withPrice(new BigDecimal("999999.99"))
+                    : incoming.withPrice(BigDecimal.ZERO);
+        }
+        addToBook(incoming);
+        List<Trade> trades = match();
+        trades.forEach(wal::appendTrade);
+        return trades;
+    }
+
+    private void addToBook(Order order) {
+        TreeMap<BigDecimal, Deque<Order>> book =
+                order.side() == Side.BUY ? bids : asks;
+        book.computeIfAbsent(order.price(), k -> new ArrayDeque<>())
+            .offer(order);
+    }
+
+    private List<Trade> match() {
+        List<Trade> trades = new ArrayList<>();
+        while (canMatch()) {
+            Map.Entry<BigDecimal, Deque<Order>> bidEntry = bids.lastEntry();
+            Map.Entry<BigDecimal, Deque<Order>> askEntry = asks.firstEntry();
+            Order bid = bidEntry.getValue().peekFirst();
+            Order ask = askEntry.getValue().peekFirst();
+            BigDecimal tradePrice = ask.price();
+            int qty = Math.min(bid.remainingQty(), ask.remainingQty());
+            trades.add(new Trade(UUID.randomUUID().toString(),
+                    bid.exchangeOrderId(), ask.exchangeOrderId(),
+                    symbol, qty, tradePrice,
+                    Instant.now(), tradeSeq.incrementAndGet()));
+            fill(bid, qty, bidEntry.getValue(), bids, bidEntry.getKey());
+            fill(ask, qty, askEntry.getValue(), asks, askEntry.getKey());
+        }
+        return trades;
+    }
+
+    private boolean canMatch() {
+        return !bids.isEmpty() && !asks.isEmpty()
+                && bids.lastKey().compareTo(asks.firstKey()) >= 0;
+    }
+
+    private void fill(Order o, int qty, Deque<Order> level,
+                      TreeMap<BigDecimal, Deque<Order>> book, BigDecimal price) {
+        level.pollFirst();
+        int remaining = o.remainingQty() - qty;
+        if (remaining > 0) level.addFirst(o.withRemainingQty(remaining));
+        if (level.isEmpty()) book.remove(price);
+    }
+}
+```
+
+### Part B — OrderGatewayController.java
+
+```java
+package com.exchange.gateway;
+
+import com.exchange.matching.Order;
+import com.exchange.matching.OrderType;
+import com.exchange.matching.Side;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.Instant;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
+
+@RestController
+@RequestMapping("/api/v1/orders")
+public class OrderGatewayController {
+
+    private final AtomicLong sequencer = new AtomicLong(0);
+    private final RiskService riskService;
+    private final SymbolRouter symbolRouter;
+    private final OrderEventPublisher eventPublisher;
+
+    public OrderGatewayController(RiskService riskService,
+                                   SymbolRouter symbolRouter,
+                                   OrderEventPublisher eventPublisher) {
+        this.riskService   = riskService;
+        this.symbolRouter  = symbolRouter;
+        this.eventPublisher = eventPublisher;
+    }
+
+    @PostMapping
+    public ResponseEntity<OrderAck> submitOrder(@RequestBody OrderRequest req) {
+        riskService.validate(req);               // throws on insufficient buying power
+        long seqNum = sequencer.incrementAndGet();
+        String orderId = "EX-" + Instant.now().toEpochMilli() + "-" + seqNum;
+        Order order = Order.builder()
+                .exchangeOrderId(orderId)
+                .clientOrderId(req.clientOrderId())
+                .symbol(req.symbol())
+                .side(Side.valueOf(req.side()))
+                .type(OrderType.valueOf(req.orderType()))
+                .price(req.price())
+                .totalQty(req.quantity())
+                .remainingQty(req.quantity())
+                .sequenceNumber(seqNum)
+                .timestamp(Instant.now())
+                .build();
+        symbolRouter.enqueue(order);             // non-blocking ring buffer write
+        eventPublisher.publishNewOrder(order);   // async Kafka: "order-new" topic
+        return ResponseEntity.ok(new OrderAck(orderId, seqNum, "NEW", Instant.now()));
+    }
+
+    @DeleteMapping("/{exchangeOrderId}")
+    public ResponseEntity<Void> cancelOrder(@PathVariable String exchangeOrderId) {
+        long seqNum = sequencer.incrementAndGet();
+        symbolRouter.enqueueCancel(exchangeOrderId, seqNum);
+        return ResponseEntity.accepted().build();  // 202: cancel processed async
+    }
+}
+```
+
+<TradeoffTable
+  columns={["Approach", "Matching Latency", "Throughput", "Correctness", "Fault Tolerance"]}
+  rows={[
+    ["Distributed matching (multiple nodes, Paxos/Raft consensus)", "5–50 ms (Raft RTT dominates)", "Limited by consensus quorum writes; ~10K orders/s", "Correct if implemented exactly, but consensus bugs are notoriously subtle", "Automatic failover; no single point of failure"],
+    ["Database-backed matching (SQL row locks on order book rows)", "10–100 ms (lock contention, disk I/O)", "Severely limited by lock contention; ~1K orders/s", "Correct in isolation (serializable transactions), but deadlock risk under high concurrency", "PostgreSQL HA provides good fault tolerance; PITR recovery"],
+    ["Single-threaded in-memory matching engine (LMAX Disruptor)", "50–500 μs (software)", "100K–1M orders/s; single thread is rarely the bottleneck", "Correct by construction — no shared mutable state, deterministic replay from WAL", "Single point of failure; mitigated by hot standby + WAL replay (< 100 ms failover)"],
+    ["FPGA hardware matching engine (real exchanges: NYSE, NASDAQ)", "< 1 μs", "10M+ orders/s; limited only by NIC bandwidth", "Correct; deterministic hardware logic with no GC pauses or OS scheduling jitter", "Redundant FPGAs; failover in nanoseconds"],
+  ]}
+/>
+
+<Pitfall>
+**Using a distributed lock or database transaction for matching.** This is the most common architectural mistake candidates propose. A distributed lock (Redis SETNX, ZooKeeper ephemeral node) introduces a network round-trip of 1–10ms in the critical matching path. A database row lock introduces disk I/O, lock manager overhead, and potential deadlock. Both violate the sub-100-microsecond latency budget by two to three orders of magnitude. The correct argument is: you do not need a distributed lock to achieve correctness in the matching engine, because correctness comes from the sequencer establishing a total order on inputs before they reach the matching engine. Once inputs are totally ordered, a single thread processes them deterministically — no locks required. The sequencer is the only coordination point, and it uses a single `AtomicLong.incrementAndGet()` — a lock-free CPU instruction that completes in nanoseconds. Never put a distributed system in the matching hot path.
+</Pitfall>
+
+<Pitfall>
+**Matching at the wrong price — incoming order price vs. resting order price.** Price-time priority dictates that the trade executes at the price of the resting order (the order that was already sitting in the book), not the incoming aggressive order. Consider a market buy order hitting a resting sell limit at $185.50: the trade executes at $185.50, not at "market price" or the buyer's price. If you match at the incoming order's price, a market buy (which has no price, or equivalently `price = MAX_VALUE` in our implementation) would execute at an absurd price. If you match at an average of the two prices, you violate price-time priority and create an artificial price that neither party agreed to. The rule is simple but easy to confuse under interview pressure: **the resting order's price is the trade price**. The incoming order crosses the spread to reach the resting order; it accepts whatever price the resting order was advertising.
+</Pitfall>
+
+<Curveball>
+**"The matching engine process crashes mid-match — a buy order was partially filled, then the crash happened before the sell order status was updated. How do you recover to a consistent state?"**
+
+This is the core durability argument for the write-ahead log. The WAL entry for a trade is written atomically (the WAL append is a sequential write to a memory-mapped file — either the full entry is written or nothing is) before the matching engine updates the in-memory order book or publishes to Kafka. On restart, the watchdog reads the WAL from the last confirmed checkpoint. If the WAL contains a trade entry for the buy order's partial fill but the sell order update hasn't been written yet, it means the crash happened between the two WAL writes — but in our design, both sides of a single match are written to the WAL in a single atomic batch (one `FileChannel.write()` call with the full trade record containing both order IDs and quantities). The sell order status update is derived by downstream Kafka consumers reading the trade record; the matching engine itself doesn't write order statuses — it writes trades. So partial state is impossible: either the trade is in the WAL (both sides are recoverable from a single record) or it is not. On replay, the sequence number uniqueness constraint on the trades table ensures that replayed trade inserts are idempotent — a trade that was already persisted before the crash produces a unique constraint violation that the consumer silently ignores.
+</Curveball>
+
+<Curveball>
+**"A high-frequency trading firm is co-located and submitting 500K orders/second — 5× your design capacity. They have a bug that causes them to submit duplicate cancel messages for the same order. How does your sequencer and order book handle the duplicate cancels safely?"**
+
+Each cancel message, even if duplicated, receives a unique sequence number from the sequencer — because `AtomicLong.incrementAndGet()` is unconditional. The first cancel message arrives at the matching engine, finds the order in the book by exchange order ID, removes it, and marks it CANCELLED in the WAL. The duplicate cancel messages arrive next: the matching engine looks up the exchange order ID in the book, finds nothing (the order was already removed), and returns a CancelReject execution report with reason "Order not found." This is correct behavior — the HFT firm receives one CancelConfirmation followed by N-1 CancelReject messages. No phantom cancels, no double-removal, no corruption of the order book. The design handles this correctly without any special duplicate-detection logic because the order book is a simple lookup-and-remove operation and the matching engine is single-threaded. Concurrency would be the danger: if two threads both found the order and both tried to remove it simultaneously, the result would be unpredictable. Single-threaded processing makes duplicate cancel handling trivially safe. To rate-limit the HFT firm's runaway bot, the Order Gateway maintains per-broker order submission counters and applies back-pressure (TCP window shrink or explicit rate-limit rejection) when a broker exceeds their contracted message rate.
+</Curveball>
+
+<Curveball>
+**"Implement 'iceberg orders' — an order where only a portion (the 'tip') is visible in the order book, and when the tip is filled, the next portion automatically replaces it. How does this change your order book data structure and matching logic?"**
+
+An iceberg order has two quantities: `visibleQty` (the tip, shown in the order book) and `hiddenQty` (the reserve, not visible to other participants). The data structure change is minimal: `Order` gains two new fields — `visibleQty` and `hiddenQty`. The order book's `Deque<Order>` at each price level stores the order with only `visibleQty` as its effective quantity for matching purposes. The matching logic change is in `applyFill()`: after a fill reduces `visibleQty` to zero, instead of removing the order from the deque entirely, check whether `hiddenQty > 0`. If yes, reload: set `visibleQty = min(hiddenQty, tipSize)`, subtract from `hiddenQty`, and re-add the order to the back of the deque at the same price level (not the front — when the tip is refreshed, the order loses its time priority and goes to the back of the queue, which is the industry-standard rule for iceberg refresh). The `visibleQty` check in `canMatch()` is unchanged — it still uses `visibleQty` as the tradeable quantity. The key correctness requirement: the hidden quantity must never appear in Level 2 market data. The Market Data Publisher uses only `visibleQty` when computing depth-of-book updates. This prevents information leakage that would allow other participants to infer the presence of a large iceberg order.
+</Curveball>
+
+## Further reading
+
+- **Martin Thompson et al. — "The LMAX Architecture" (2011):** The original LMAX Disruptor blog post describing the ring buffer, single-threaded event processing, and mechanical sympathy principles that underpin modern low-latency matching engines. Available at lmax-exchange.github.io. Essential reading for anyone building sub-millisecond systems on the JVM.
+
+- **Harris T. — "Trading and Exchanges: Market Microstructure for Practitioners" (Oxford University Press, 2003):** The definitive academic treatment of order books, matching rules, price-time priority, market maker obligations, and the economics of bid-ask spreads. Part I (Trading Procedures) is directly applicable to this system design; the rest provides context for why exchanges are designed the way they are.
+
+- **NYSE Technologies — "Pillar Trading Platform" architecture documentation:** NYSE's public documentation on their migration from the legacy Super Display Book (SDBK) system to the Pillar platform (2017–2019). Covers the sequencer architecture, market data distribution, and co-location infrastructure. Available through NYSE's technology partner portal.
+
+- **Kleppmann M. — "Designing Data-Intensive Applications" (O'Reilly, 2017), Chapter 11 (Stream Processing):** The event sourcing and CQRS patterns described in this chapter map directly to the matching engine's WAL-as-source-of-truth design. The section on total order broadcast and linearizability provides the theoretical foundation for why the sequencer is the linearization point. Chapter 8 (The Trouble with Distributed Systems) explains why distributed consensus is inappropriate in the matching hot path.
+
+<RelatedQuestions items={[
+  { slug: "live-sports-scores", title: "Design Live Sports Scores", difficulty: "mid" },
+  { slug: "online-auction", title: "Design an Online Auction", difficulty: "senior" },
+  { slug: "distributed-unique-id-generator", title: "Design a Distributed Unique ID Generator", difficulty: "mid" },
+]} />

@@ -1,0 +1,257 @@
+---
+import ThemeToggle from '../ui/ThemeToggle.astro';
+
+export interface Props {
+  /** Highlight a specific category in nav — omit on landing page */
+  activeCategory?: string;
+}
+
+const { activeCategory } = Astro.props;
+
+const categories = [
+  { slug: 'foundations',   label: 'Foundations' },
+  { slug: 'social',        label: 'Social' },
+  { slug: 'media',         label: 'Media' },
+  { slug: 'storage',       label: 'Storage' },
+  { slug: 'commerce',      label: 'Commerce' },
+  { slug: 'search-maps',   label: 'Search' },
+  { slug: 'realtime',      label: 'Real-time' },
+  { slug: 'infra',         label: 'Infra' },
+  { slug: 'ai',            label: 'AI' },
+];
+
+const base = import.meta.env.BASE_URL;
+---
+
+<header id="sd-header" class="sd-header">
+  <div class="sd-header__inner">
+
+    <!-- Left: back to portfolio + section title -->
+    <div class="sd-header__left">
+      <a href="/" class="sd-header__back" aria-label="Back to portfolio">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+          <path d="M9 2L4 7l5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span class="sd-header__back-label">pushkar.dev</span>
+      </a>
+
+      <span class="sd-header__divider" aria-hidden="true">/</span>
+
+      <a href={`${base}/`} class="sd-header__title">
+        System Design
+      </a>
+    </div>
+
+    <!-- Centre: category nav (hidden on small screens) -->
+    <nav class="sd-header__nav" aria-label="Categories">
+      {categories.map(cat => (
+        <a
+          href={`${base}/?category=${cat.slug}`}
+          class:list={['sd-header__nav-link', activeCategory === cat.slug && 'active']}
+        >
+          {cat.label}
+        </a>
+      ))}
+    </nav>
+
+    <!-- Right: theme toggle + mobile menu button -->
+    <div class="sd-header__right">
+      <ThemeToggle />
+      <button
+        id="sd-mobile-menu-btn"
+        class="sd-header__menu-btn"
+        aria-label="Open navigation menu"
+        aria-expanded="false"
+        aria-controls="sd-mobile-nav"
+      >
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+          <line x1="2" y1="5"  x2="16" y2="5"  stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          <line x1="2" y1="9"  x2="16" y2="9"  stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          <line x1="2" y1="13" x2="16" y2="13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+      </button>
+    </div>
+
+  </div>
+
+  <!-- Mobile nav drawer -->
+  <div id="sd-mobile-nav" class="sd-mobile-nav" hidden>
+    <nav aria-label="Mobile categories">
+      {categories.map(cat => (
+        <a
+          href={`${base}/?category=${cat.slug}`}
+          class:list={['sd-mobile-nav__link', activeCategory === cat.slug && 'active']}
+        >
+          {cat.label}
+        </a>
+      ))}
+      <a href="/" class="sd-mobile-nav__link sd-mobile-nav__link--back">
+        ← pushkar.dev
+      </a>
+    </nav>
+  </div>
+</header>
+
+<style>
+  .sd-header {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    width: 100%;
+    background: transparent;
+    border-bottom: 1px solid transparent;
+    transition:
+      background var(--dur-base) var(--ease-out),
+      border-color var(--dur-base) var(--ease-out),
+      backdrop-filter var(--dur-base) var(--ease-out);
+  }
+  .sd-header.scrolled {
+    background: rgba(10, 10, 10, 0.85);
+    border-bottom-color: var(--line);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+  }
+  [data-theme='light'] .sd-header.scrolled {
+    background: rgba(250, 250, 248, 0.88);
+  }
+
+  .sd-header__inner {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 clamp(1rem, 3vw, 2rem);
+    height: 56px;
+  }
+
+  /* Left */
+  .sd-header__left {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-shrink: 0;
+  }
+  .sd-header__back {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    color: var(--ink-3);
+    text-decoration: none;
+    font-size: 0.8rem;
+    transition: color var(--dur-fast);
+  }
+  .sd-header__back:hover { color: var(--accent); }
+  .sd-header__back-label { display: none; }
+  @media (min-width: 640px) { .sd-header__back-label { display: inline; } }
+
+  .sd-header__divider {
+    color: var(--ink-4);
+    font-size: 0.875rem;
+    display: none;
+  }
+  @media (min-width: 640px) { .sd-header__divider { display: inline; } }
+
+  .sd-header__title {
+    font-family: 'Geist', system-ui, sans-serif;
+    font-weight: 600;
+    font-size: 0.9375rem;
+    color: var(--ink);
+    text-decoration: none;
+    letter-spacing: -0.01em;
+    transition: color var(--dur-fast);
+  }
+  .sd-header__title:hover { color: var(--accent); }
+
+  /* Centre nav */
+  .sd-header__nav {
+    display: none;
+    align-items: center;
+    gap: 0.125rem;
+    flex: 1;
+    justify-content: center;
+  }
+  @media (min-width: 1024px) { .sd-header__nav { display: flex; } }
+
+  .sd-header__nav-link {
+    font-size: 0.8125rem;
+    color: var(--ink-3);
+    text-decoration: none;
+    padding: 0.3em 0.6em;
+    border-radius: var(--r-sm);
+    transition: color var(--dur-fast), background var(--dur-fast);
+    white-space: nowrap;
+  }
+  .sd-header__nav-link:hover { color: var(--ink); background: var(--bg-raised); }
+  .sd-header__nav-link.active { color: var(--accent); background: var(--accent-soft); }
+
+  /* Right */
+  .sd-header__right {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-left: auto;
+    flex-shrink: 0;
+  }
+
+  .sd-header__menu-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    border: 1px solid var(--line-2);
+    border-radius: var(--r-md);
+    background: transparent;
+    color: var(--ink-3);
+    cursor: pointer;
+    transition: color var(--dur-fast), border-color var(--dur-fast);
+  }
+  .sd-header__menu-btn:hover { color: var(--ink); border-color: var(--line-2); }
+  @media (min-width: 1024px) { .sd-header__menu-btn { display: none; } }
+
+  /* Mobile nav */
+  .sd-mobile-nav {
+    border-top: 1px solid var(--line);
+    background: var(--bg-card);
+    padding: 0.75rem clamp(1rem, 3vw, 2rem);
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+  }
+  .sd-mobile-nav[hidden] { display: none; }
+
+  .sd-mobile-nav__link {
+    display: block;
+    padding: 0.5em 0.75em;
+    border-radius: var(--r-sm);
+    color: var(--ink-2);
+    text-decoration: none;
+    font-size: 0.875rem;
+    transition: color var(--dur-fast), background var(--dur-fast);
+  }
+  .sd-mobile-nav__link:hover { color: var(--ink); background: var(--bg-raised); }
+  .sd-mobile-nav__link.active { color: var(--accent); }
+  .sd-mobile-nav__link--back { color: var(--ink-3); margin-top: 0.5rem; border-top: 1px solid var(--line); padding-top: 0.875em; }
+</style>
+
+<script>
+  // Scroll effect
+  const header = document.getElementById('sd-header');
+  if (header) {
+    const onScroll = () => header.classList.toggle('scrolled', window.scrollY > 40);
+    window.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+  }
+
+  // Mobile menu
+  const menuBtn = document.getElementById('sd-mobile-menu-btn');
+  const mobileNav = document.getElementById('sd-mobile-nav');
+  if (menuBtn && mobileNav) {
+    menuBtn.addEventListener('click', () => {
+      const isOpen = !mobileNav.hidden;
+      mobileNav.hidden = isOpen;
+      menuBtn.setAttribute('aria-expanded', String(!isOpen));
+    });
+  }
+</script>

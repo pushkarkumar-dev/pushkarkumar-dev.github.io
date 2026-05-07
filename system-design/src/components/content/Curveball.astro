@@ -1,0 +1,76 @@
+---
+export interface Props {
+  question: string;
+}
+const { question } = Astro.props;
+---
+
+<div class="curveball">
+  <div class="curveball__question">
+    <span class="curveball__icon" aria-hidden="true">⚡</span>
+    <span class="curveball__label">Follow-up</span>
+    <p class="curveball__q">{question}</p>
+  </div>
+  <div class="curveball__hint">
+    <slot />
+  </div>
+</div>
+
+<style>
+  .curveball {
+    border: 1px solid var(--line-2);
+    border-radius: var(--r-md);
+    margin: 1.75rem 0;
+    overflow: hidden;
+  }
+  .curveball__question {
+    display: grid;
+    grid-template-columns: auto auto 1fr;
+    align-items: baseline;
+    gap: 0.4rem;
+    padding: 0.75rem 1.125rem;
+    background: var(--bg-raised);
+    border-bottom: 1px solid var(--line);
+  }
+  .curveball__icon {
+    font-size: 0.85rem;
+    line-height: 1;
+    align-self: center;
+  }
+  .curveball__label {
+    font-family: 'Geist', system-ui, sans-serif;
+    font-size: 0.67rem;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--accent);
+    white-space: nowrap;
+    align-self: center;
+  }
+  .curveball__q {
+    margin: 0;
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: var(--ink);
+    line-height: 1.45;
+  }
+  .curveball__hint {
+    padding: 0.875rem 1.125rem;
+    font-size: 0.9rem;
+    line-height: 1.7;
+    color: var(--ink-3);
+  }
+  .curveball__hint :global(p) { margin: 0 0 0.5rem; }
+  .curveball__hint :global(p:last-child) { margin-bottom: 0; }
+  .curveball__hint :global(code) {
+    font-size: 0.85em;
+    background: var(--bg-raised);
+    padding: 0.1em 0.35em;
+    border-radius: 4px;
+  }
+  .curveball__hint :global(ul) {
+    margin: 0.375rem 0;
+    padding-left: 1.25rem;
+  }
+  .curveball__hint :global(li) { margin: 0.2rem 0; }
+</style>
