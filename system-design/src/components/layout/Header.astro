@@ -236,22 +236,25 @@ const base = import.meta.env.BASE_URL;
 </style>
 
 <script>
-  // Scroll effect
-  const header = document.getElementById('sd-header');
-  if (header) {
-    const onScroll = () => header.classList.toggle('scrolled', window.scrollY > 40);
-    window.addEventListener('scroll', onScroll, { passive: true });
-    onScroll();
-  }
+  function initHeader() {
+    // Scroll effect
+    const header = document.getElementById('sd-header');
+    if (header) {
+      const onScroll = () => header.classList.toggle('scrolled', window.scrollY > 40);
+      window.addEventListener('scroll', onScroll, { passive: true });
+      onScroll();
+    }
 
-  // Mobile menu
-  const menuBtn = document.getElementById('sd-mobile-menu-btn');
-  const mobileNav = document.getElementById('sd-mobile-nav');
-  if (menuBtn && mobileNav) {
-    menuBtn.addEventListener('click', () => {
-      const isOpen = !mobileNav.hidden;
-      mobileNav.hidden = isOpen;
-      menuBtn.setAttribute('aria-expanded', String(!isOpen));
-    });
+    // Mobile menu
+    const menuBtn = document.getElementById('sd-mobile-menu-btn');
+    const mobileNav = document.getElementById('sd-mobile-nav');
+    if (menuBtn && mobileNav) {
+      menuBtn.addEventListener('click', () => {
+        const isOpen = !mobileNav.hidden;
+        mobileNav.hidden = isOpen;
+        menuBtn.setAttribute('aria-expanded', String(!isOpen));
+      });
+    }
   }
+  document.addEventListener('astro:page-load', initHeader);
 </script>

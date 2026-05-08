@@ -56,11 +56,14 @@
 </style>
 
 <script>
-  const btn = document.getElementById('theme-toggle');
-  if (btn) {
-    btn.addEventListener('click', () => {
-      const next = window.__getTheme() === 'dark' ? 'light' : 'dark';
-      window.__setTheme(next);
-    });
+  function initThemeToggle() {
+    const btn = document.getElementById('theme-toggle');
+    if (btn) {
+      btn.addEventListener('click', () => {
+        const next = window.__getTheme() === 'dark' ? 'light' : 'dark';
+        window.__setTheme(next);
+      });
+    }
   }
+  document.addEventListener('astro:page-load', initThemeToggle);
 </script>
