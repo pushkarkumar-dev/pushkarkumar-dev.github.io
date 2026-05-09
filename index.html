@@ -213,6 +213,58 @@
       text-transform: lowercase;
     }
     .nav-links a:hover { color: var(--accent); }
+
+    /* ── Learn dropdown ── */
+    .nav-dropdown { position: relative; }
+    .nav-dropdown__trigger {
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      color: var(--ink-2);
+      background: none;
+      border: none;
+      cursor: pointer;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      transition: color .2s var(--ease);
+      text-transform: lowercase;
+    }
+    .nav-dropdown__trigger:hover { color: var(--accent); }
+    .nav-dropdown__chevron { font-size: 9px; transition: transform .2s var(--ease); }
+    .nav-dropdown.open .nav-dropdown__chevron { transform: rotate(180deg); }
+    .nav-dropdown__menu {
+      display: none;
+      position: absolute;
+      top: calc(100% + 14px);
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(10,10,10,0.96);
+      backdrop-filter: saturate(180%) blur(14px);
+      -webkit-backdrop-filter: saturate(180%) blur(14px);
+      border: 1px solid var(--line-2);
+      border-radius: var(--r-md);
+      padding: 6px;
+      min-width: 168px;
+      flex-direction: column;
+      gap: 2px;
+      z-index: 100;
+    }
+    .nav-dropdown.open .nav-dropdown__menu { display: flex; }
+    .nav-dropdown__menu a {
+      padding: 8px 12px;
+      border-radius: var(--r-sm);
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      color: var(--ink-2);
+      text-transform: lowercase;
+      transition: color .2s, background .2s;
+      white-space: nowrap;
+    }
+    .nav-dropdown__menu a:hover { color: var(--accent); background: var(--accent-soft); }
+
     .nav-cta {
       font-family: var(--mono);
       font-size: 12px;
@@ -272,6 +324,30 @@
         border-bottom: 1px solid var(--line);
       }
       .nav-links a:last-child { border-bottom: none; }
+      .nav-dropdown { border-bottom: 1px solid var(--line); }
+      .nav-dropdown__trigger {
+        width: 100%;
+        padding: 14px var(--pad);
+        font-size: 14px;
+        justify-content: space-between;
+      }
+      .nav-dropdown__menu {
+        position: static;
+        transform: none;
+        background: none;
+        backdrop-filter: none;
+        -webkit-backdrop-filter: none;
+        border: none;
+        border-radius: 0;
+        padding: 0;
+        min-width: auto;
+      }
+      .nav-dropdown__menu a {
+        padding: 12px var(--pad) 12px calc(var(--pad) + 18px);
+        font-size: 14px;
+        border-radius: 0;
+        border-bottom: 1px solid var(--line);
+      }
       .nav-cta {
         margin: 12px var(--pad) 0;
         border-radius: var(--r-sm);
@@ -1145,8 +1221,16 @@
         <a href="#teaching">teaching</a>
         <a href="#experience">experience</a>
         <a href="blog.html">writing</a>
-        <a href="dsa.html">dsa</a>
-        <a href="system-design/">system design</a>
+        <div class="nav-dropdown" id="learnDropdown">
+          <button class="nav-dropdown__trigger" aria-haspopup="true" aria-expanded="false">
+            learn <span class="nav-dropdown__chevron">▾</span>
+          </button>
+          <div class="nav-dropdown__menu" role="menu">
+            <a href="dsa.html" role="menuitem">dsa</a>
+            <a href="system-design/" role="menuitem">system design</a>
+            <a href="https://pushkarkumar-dev.github.io/system-design-labs/" target="_blank" rel="noopener" role="menuitem">build.labs ↗</a>
+          </div>
+        </div>
         <a href="#contact" class="nav-cta">get in touch &nbsp;→</a>
       </nav>
       <button class="nav-toggle" id="navToggle" aria-label="Toggle navigation" aria-expanded="false">
@@ -1707,6 +1791,20 @@
       navToggle.classList.toggle('open', open);
       navToggle.setAttribute('aria-expanded', String(open));
     });
+
+    // ============================================================
+    // LEARN DROPDOWN
+    // ============================================================
+    const learnDropdown = document.getElementById('learnDropdown');
+    if (learnDropdown) {
+      const trigger = learnDropdown.querySelector('.nav-dropdown__trigger');
+      const toggle = () => {
+        const open = learnDropdown.classList.toggle('open');
+        trigger.setAttribute('aria-expanded', String(open));
+      };
+      trigger.addEventListener('click', (e) => { e.stopPropagation(); toggle(); });
+      document.addEventListener('click', () => learnDropdown.classList.remove('open'));
+    }
 
     // ============================================================
     // STATUS LINE
