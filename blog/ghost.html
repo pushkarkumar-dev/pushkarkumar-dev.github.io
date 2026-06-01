@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Opus 4.8: The Upgrade Nobody's Talking About</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0a0a0f;
+    --accent:#7c6af7;
+    --accent2:#f25c7e;
+    --accent3:#3ddcb0;
+    --white:#f0f0f5;
+    --muted:#6b6b80;
+    --card:#13131c;
+    --line:#23232f;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    background:var(--bg);
+    color:var(--white);
+    font-family:'DM Mono',ui-monospace,monospace;
+    line-height:1.6;
+    overflow-x:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+  /* atmospheric background */
+  body::before{
+    content:"";
+    position:fixed;inset:0;z-index:-1;
+    background:
+      radial-gradient(60% 50% at 15% 5%, rgba(124,106,247,.18), transparent 70%),
+      radial-gradient(50% 40% at 95% 25%, rgba(242,92,126,.13), transparent 70%),
+      radial-gradient(55% 45% at 50% 100%, rgba(61,220,176,.10), transparent 70%);
+  }
+  .wrap{max-width:680px;margin:0 auto;padding:0 22px}
+  h1,h2,h3{font-family:'Syne',sans-serif;line-height:1.08;letter-spacing:-.02em}
+
+  /* hero */
+  .hero{padding:64px 0 40px;position:relative}
+  .eyebrow{
+    font-size:12px;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--accent3);margin-bottom:20px;
+  }
+  .hero h1{font-size:clamp(38px,11vw,60px);font-weight:800}
+  .hero h1 .pink{color:var(--accent2)}
+  .hero h1 .purple{color:var(--accent)}
+  .hero .sub{
+    margin-top:22px;font-size:16px;color:var(--muted);max-width:520px;
+  }
+  .meta-row{
+    display:flex;flex-wrap:wrap;gap:8px;margin-top:28px;
+  }
+  .chip{
+    font-size:12px;border:1px solid var(--line);border-radius:999px;
+    padding:7px 13px;color:var(--white);background:rgba(255,255,255,.02);
+  }
+  .chip b{color:var(--accent3)}
+
+  /* sections */
+  section{padding:38px 0;border-top:1px solid var(--line)}
+  .kicker{
+    font-size:11px;letter-spacing:.2em;text-transform:uppercase;
+    color:var(--accent);margin-bottom:14px;
+  }
+  h2{font-size:clamp(24px,6.5vw,32px);font-weight:700;margin-bottom:16px}
+  p{font-size:15.5px;color:#cfcfdd;margin-bottom:16px}
+  p strong{color:var(--white)}
+  .lead{font-size:17px;color:var(--white)}
+
+  /* stat strip */
+  .stats{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:22px 0}
+  .stat{
+    background:var(--card);border:1px solid var(--line);border-radius:14px;
+    padding:18px 16px;
+  }
+  .stat .num{font-family:'Syne';font-size:30px;font-weight:800;color:var(--accent3)}
+  .stat .num.pink{color:var(--accent2)}
+  .stat .lbl{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.4}
+
+  /* table */
+  .tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:14px;margin:8px 0 18px}
+  table{width:100%;border-collapse:collapse;font-size:13px;min-width:480px}
+  th,td{padding:12px 14px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{color:var(--accent);font-weight:500;background:rgba(124,106,247,.06)}
+  td:first-child{color:var(--white)}
+  td{color:#cfcfdd}
+  .up{color:var(--accent3)}
+  .down{color:var(--accent2)}
+  .win{color:var(--accent2);font-weight:500}
+  caption{caption-side:bottom;font-size:11px;color:var(--muted);padding:10px 14px;text-align:left}
+
+  /* code */
+  pre{
+    background:#0d0d15;border:1px solid var(--line);border-radius:12px;
+    padding:16px;overflow-x:auto;font-size:13px;line-height:1.7;margin:6px 0 14px;
+  }
+  code{font-family:'DM Mono',monospace}
+  .c-com{color:var(--muted)}
+  .c-key{color:var(--accent)}
+  .c-bad{color:var(--accent2)}
+  .c-good{color:var(--accent3)}
+
+  /* checklist */
+  .check{list-style:none;margin:8px 0 6px}
+  .check li{
+    position:relative;padding:11px 0 11px 30px;border-bottom:1px solid var(--line);
+    font-size:14.5px;color:#cfcfdd;
+  }
+  .check li:last-child{border-bottom:none}
+  .check li::before{
+    content:"";position:absolute;left:0;top:16px;width:13px;height:13px;
+    border:2px solid var(--accent3);border-radius:4px;
+  }
+  .check li b{color:var(--white)}
+
+  /* callout */
+  .callout{
+    background:linear-gradient(135deg,rgba(242,92,126,.10),rgba(124,106,247,.06));
+    border:1px solid rgba(242,92,126,.3);border-radius:14px;padding:18px;margin:8px 0 16px;
+    font-size:14.5px;color:var(--white);
+  }
+  .callout b{color:var(--accent2)}
+
+  /* tldr card */
+  .tldr{
+    background:var(--card);border:1px solid var(--accent);border-radius:18px;
+    padding:26px 22px;box-shadow:0 0 40px rgba(124,106,247,.15);
+  }
+  .tldr h2{color:var(--accent)}
+  .tldr ul{list-style:none}
+  .tldr li{padding:9px 0;border-bottom:1px dashed var(--line);font-size:14px;color:#dcdce6}
+  .tldr li:last-child{border-bottom:none}
+  .tldr li span{color:var(--accent3);font-weight:500}
+
+  /* cta */
+  .cta{text-align:center;padding:52px 0 30px}
+  .cta h2{font-size:clamp(26px,7vw,36px)}
+  .cta .key{
+    display:inline-block;margin-top:18px;font-family:'Syne';font-weight:800;
+    font-size:22px;letter-spacing:.04em;
+    background:linear-gradient(90deg,var(--accent),var(--accent2));
+    -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+  }
+  .btn{
+    display:inline-block;margin-top:24px;padding:14px 30px;border-radius:999px;
+    background:var(--accent);color:#0a0a0f;font-family:'Syne';font-weight:700;
+    text-decoration:none;font-size:15px;transition:transform .15s ease;
+  }
+  .btn:active{transform:scale(.97)}
+
+  footer{
+    border-top:1px solid var(--line);padding:30px 0 50px;text-align:center;
+    font-size:12px;color:var(--muted);
+  }
+  footer a{color:var(--accent3);text-decoration:none}
+  .handles{margin-bottom:10px;font-size:13px;color:var(--white)}
+
+  /* entrance animation */
+  .rise{opacity:0;transform:translateY(18px);animation:rise .7s ease forwards}
+  @keyframes rise{to{opacity:1;transform:none}}
+  .d1{animation-delay:.05s}.d2{animation-delay:.15s}.d3{animation-delay:.25s}.d4{animation-delay:.35s}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <!-- HERO -->
+  <header class="hero">
+    <div class="eyebrow rise d1">Claude Opus 4.8 · the GHOST breakdown</div>
+    <h1 class="rise d2">Your AI writes code with <span class="pink">bugs you never see.</span></h1>
+    <h1 class="rise d3" style="font-size:clamp(20px,5.5vw,28px);margin-top:14px;color:var(--muted)">Opus 4.8's real upgrade isn't a <span class="purple">smarter</span> model. It's one that hides fewer of them.</h1>
+    <p class="sub rise d4">Released May 28, 2026. The headline benchmark barely moved. The thing that actually matters for anyone shipping AI-written code did. Here's the receipts and a way to protect yourself.</p>
+    <div class="meta-row rise d4">
+      <span class="chip">Model ID: <b>claude-opus-4-8</b></span>
+      <span class="chip">Context: <b>1M tokens</b></span>
+      <span class="chip">Price: <b>$5 / $25</b> per 1M</span>
+    </div>
+  </header>
+
+  <!-- WHY -->
+  <section>
+    <div class="kicker">Why this matters</div>
+    <h2>Everyone judges a model by the wrong number</h2>
+    <p class="lead">When a new model drops, the timeline argues about one thing: is it smarter? But if you let AI touch real code, the score that decides your weekend is different.</p>
+    <p>It's not "can it solve a hard problem." It's "how often does it hand you code that looks correct, passes a quick glance, and quietly breaks later." That's the ghost bug. Opus 4.8 is Anthropic's attempt to shrink exactly that gap, and it's why a tiny benchmark bump is hiding a real upgrade.</p>
+  </section>
+
+  <!-- SECTION 1: BENCHMARKS -->
+  <section>
+    <div class="kicker">The receipts · 4.7 vs 4.8 vs GPT-5.5</div>
+    <h2>The numbers, straight</h2>
+    <p>These are the figures the skeptics in your comments will check. All are <strong>self-reported by Anthropic</strong> in the launch post and system card, so treat them as the vendor's claims until independent evals land.</p>
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th>Benchmark</th><th>Opus 4.7</th><th>Opus 4.8</th><th>GPT-5.5</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>SWE-bench Verified</td><td>87.6%</td><td class="up">88.6%</td><td>—</td></tr>
+          <tr><td>SWE-bench Pro (agentic)</td><td>64.3%</td><td class="up">69.2%</td><td>—</td></tr>
+          <tr><td>Terminal-Bench 2.1</td><td>~66%</td><td>74.6%</td><td class="win">78.2% ◄ wins</td></tr>
+          <tr><td>GPQA Diamond</td><td>~94.2%</td><td class="down">93.6%</td><td>—</td></tr>
+          <tr><td>GDPval-AA (Elo)</td><td>~1753</td><td class="up">1890</td><td>—</td></tr>
+          <tr><td>AA Intelligence Index</td><td>57.3</td><td class="up">~61</td><td>60.2</td></tr>
+        </tbody>
+        <caption>Source: Anthropic launch announcement + system card, Artificial Analysis, May 28–29, 2026. Self-reported. GPT-5.5 still leads Terminal-Bench; GPQA dipped slightly.</caption>
+      </table>
+    </div>
+    <p>Read it honestly: the flagship coding number (SWE-bench Verified) moved one point. That's the part that looks like a shrug. The interesting jumps are SWE-bench Pro (+4.9) and the overall intelligence index passing GPT-5.5. But none of those is the headline for builders.</p>
+  </section>
+
+  <!-- SECTION 2: THE REAL UPGRADE -->
+  <section>
+    <div class="kicker">The part nobody's posting</div>
+    <h2>~4x fewer ghost bugs</h2>
+    <div class="stats">
+      <div class="stat">
+        <div class="num pink">~4x</div>
+        <div class="lbl">less likely than Opus 4.7 to ship code with <b>unflagged flaws</b> (Anthropic)</div>
+      </div>
+      <div class="stat">
+        <div class="num">"I don't&nbsp;know"</div>
+        <div class="lbl">more calibrated refusals — admits uncertainty instead of confidently guessing</div>
+      </div>
+    </div>
+    <p>This is the trust upgrade. A confidently wrong answer is the most expensive thing an AI can hand you, because you act on it. Anthropic's framing on 4.8 leans hard into the model catching its own mistakes and being more willing to say it isn't sure. For day-to-day coding, that beats a one-point benchmark gain every time.</p>
+    <div class="callout"><b>The catch:</b> "fewer" is not "zero." A model that flags 4x fewer hidden bugs still ships some. The right response isn't to trust it more, it's to verify smarter. That's the next section.</div>
+  </section>
+
+  <!-- SECTION 3: VERIFY FRAMEWORK (non-googleable) -->
+  <section>
+    <div class="kicker">My framework · not on any docs page</div>
+    <h2>How to actually catch AI's mistakes</h2>
+    <p>The mistake most people make: they read AI code the way they read their own, top to bottom, nodding. AI bugs don't live where you look. Here's the order I actually check, fastest payoff first.</p>
+    <ul class="check">
+      <li><b>Boundaries before logic.</b> Empty input, one item, the last item, off-by-one. AI loves a clean middle and a broken edge.</li>
+      <li><b>Silent failure paths.</b> Search for swallowed errors and bare catches. AI hides problems to make output "work."</li>
+      <li><b>Assumptions about types & order.</b> Sorting, equality, truthiness. The classic below bites everyone.</li>
+      <li><b>The thing it didn't ask about.</b> Concurrency, auth, rate limits, money. If you didn't specify it, assume it's wrong.</li>
+      <li><b>Make it grade itself.</b> Paste the code back and ask: "List the 3 most likely bugs and the inputs that trigger them." 4.8 is noticeably better at this than older models.</li>
+    </ul>
+    <p style="margin-top:20px">A real ghost bug an AI will hand you with a straight face:</p>
+    <pre><code><span class="c-com">// "Sort these IDs ascending" — looks done, passes the demo</span>
+<span class="c-key">const</span> ids = [2, 10, 1, 30];
+ids.sort();
+<span class="c-com">// → [1, 10, 2, 30]  </span><span class="c-bad">// WRONG. JS sorts as strings by default.</span>
+
+<span class="c-com">// The fix it should have written:</span>
+ids.sort((a, b) => a - b);
+<span class="c-com">// → [1, 2, 10, 30]  </span><span class="c-good">// correct</span></code></pre>
+    <p>No test catches this if your test data happens to be single-digit. That's a ghost bug: green checkmark, wrong answer in production.</p>
+  </section>
+
+  <!-- SECTION 4: COST MATH -->
+  <section>
+    <div class="kicker">The cost math</div>
+    <h2>Same sticker price, cheaper in practice</h2>
+    <p>The base rate didn't move: <strong>$5 per 1M input, $25 per 1M output</strong>, held since Opus 4.5. Two things quietly changed the real bill:</p>
+    <ul class="check">
+      <li><b>Fast Mode is ~3x cheaper than before.</b> Runs at ~2.5x standard speed for $10 / $50 per 1M. Frontier reasoning is now usable for interactive, latency-sensitive work.</li>
+      <li><b>Prompt caching still ~90% off reads</b> (~$0.50/M). The tokenizer didn't change from 4.7, so existing cache entries should carry over. Validate on your own prompts.</li>
+    </ul>
+    <p>Reality check for your wallet: Opus is still the expensive tier. For most workloads, Sonnet 4.6 or Haiku 4.5 is the right default. Reach for Opus 4.8 when autonomous reasoning or code quality is the whole point.</p>
+  </section>
+
+  <!-- SECTION 5: DYNAMIC WORKFLOWS -->
+  <section>
+    <div class="kicker">The shiny new toy</div>
+    <h2>Hundreds of helper agents at once</h2>
+    <p>Opus 4.8 shipped alongside <strong>Dynamic Workflows</strong> in Claude Code: it can plan a job and fan it out to hundreds of parallel subagents (little helpers that each take one slice of the work). Built for codebase-scale jobs, big migrations, sweeping refactors.</p>
+    <div class="callout"><b>The money move:</b> run the orchestrator on Opus 4.8 and the subagents on a cheaper model (Sonnet tier). Run everything on Opus and your bill jumps 3–5x. The economics make sense when the workflow replaces multiple engineer-days, not for a casual refactor.</div>
+    <p style="font-size:13px;color:var(--muted)">Dynamic Workflows is a research-preview feature on paid Claude Code tiers. Available surfaces for the model: Claude API, Amazon Bedrock, Google Vertex AI, Microsoft Foundry, and GitHub Copilot (generally available day one).</p>
+  </section>
+
+  <!-- SECTION 6: DECISION MATRIX (non-googleable) -->
+  <section>
+    <div class="kicker">My decision matrix · steal this</div>
+    <h2>Should you switch from 4.7?</h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Your situation</th><th>Move</th></tr></thead>
+        <tbody>
+          <tr><td>Already on 4.7 in prod</td><td class="up">Switch. Config-only, same context & tools, fewer hidden bugs.</td></tr>
+          <tr><td>On 4.6 or older</td><td>Test first. The 4.7-era tokenizer change is the thing to measure.</td></tr>
+          <tr><td>Cost-sensitive, simple tasks</td><td>Stay on Sonnet/Haiku. Opus is overkill here.</td></tr>
+          <tr><td>Latency-sensitive chat UX</td><td class="up">Try the cheaper Fast Mode now that it's 3x less.</td></tr>
+          <tr><td>Big migration / refactor</td><td class="up">Dynamic Workflows, orchestrator on Opus, subagents cheap.</td></tr>
+          <tr><td>You picked Opus for the benchmark headline</td><td class="down">Reconsider. The +1 point isn't the reason. Trust is.</td></tr>
+        </tbody>
+        <caption>A rule of thumb, not legal/financial advice. Always measure token-per-task on your own traffic before committing.</caption>
+      </table>
+    </div>
+  </section>
+
+  <!-- TLDR -->
+  <section>
+    <div class="tldr">
+      <h2>TL;DR — screenshot this</h2>
+      <ul>
+        <li><span>What:</span> Claude Opus 4.8, shipped May 28, 2026.</li>
+        <li><span>Smarter?</span> Barely. SWE-bench Verified 87.6% → 88.6%.</li>
+        <li><span>Real win:</span> ~4x fewer hidden/unflagged code bugs vs 4.7.</li>
+        <li><span>Honesty:</span> more willing to say "I'm not sure" than guess.</li>
+        <li><span>Price:</span> unchanged $5/$25; Fast Mode now ~3x cheaper.</li>
+        <li><span>New toy:</span> hundreds of parallel subagents in Claude Code.</li>
+        <li><span>Verify rule:</span> check edges, silent errors, type/order, the unspoken stuff.</li>
+        <li><span>Caveat:</span> all benchmarks self-reported by Anthropic.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="cta">
+    <h2>Read the code. Don't just trust it.</h2>
+    <p style="max-width:440px;margin:14px auto 0">A model that hides fewer bugs is still a model that hides some. The engineers who win the AI era are the ones who verify. Follow along, the next breakdown is already cooking.</p>
+    <div class="key">Comment GHOST 👻</div><br>
+    <a class="btn" href="#" id="followLink">Follow for the next one</a>
+  </section>
+
+</div>
+
+<footer>
+  <div class="handles">@yourhandle · YouTube / Instagram</div>
+  <a href="#" id="backToReel">← Back to the Reel</a>
+  <p style="margin-top:14px;color:var(--muted)">Numbers verified against Anthropic's May 28, 2026 launch announcement, system card, and Artificial Analysis. Self-reported benchmarks noted as such.</p>
+</footer>
+
+</body>
+</html>
