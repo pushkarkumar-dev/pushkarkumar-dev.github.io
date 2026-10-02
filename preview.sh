@@ -14,7 +14,7 @@ mkdir -p _site
 
 # Portfolio static files
 cp index.html blog.html dsa.html headshot.jpg _site/ 2>/dev/null || true
-cp -r blog dsa-assets _site/ 2>/dev/null || true
+cp -r blog dsa-assets public _site/ 2>/dev/null || true
 
 # Astro build output under /system-design/
 mkdir -p _site/system-design
