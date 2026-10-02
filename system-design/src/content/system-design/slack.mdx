@@ -294,7 +294,7 @@ One index per workspace. The `channel_id` field is a keyword — at query time t
   FO -->|SMEMBERS members:channel_id| Redis[(Redis\\nMember Sets)]
   Redis --> FO
   FO -->|Produce per user_id| KafkaUser[Kafka\\nUser Partitions]
-  KafkaUser --> GW2[Gateway Servers\\n(all shards)]
+  KafkaUser --> GW2["Gateway Servers<br/>(all shards)"]
   GW2 -->|WebSocket push| Recipients([Online Recipients])
   FO -->|Async produce| KafkaIdx[Kafka\\nSearch Index Topic]
   KafkaIdx --> ESWorker[Elasticsearch\\nIndex Worker]

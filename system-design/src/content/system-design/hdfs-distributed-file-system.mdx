@@ -266,9 +266,9 @@ DataNodes do not maintain any metadata about which file a block belongs to — t
   autonumber
   participant C as Client
   participant NN as NameNode
-  participant DN1 as DataNode 1\n(Rack A)
-  participant DN2 as DataNode 2\n(Rack B)
-  participant DN3 as DataNode 3\n(Rack B)
+  participant DN1 as DataNode 1<br/>(Rack A)
+  participant DN2 as DataNode 2<br/>(Rack B)
+  participant DN3 as DataNode 3<br/>(Rack B)
 
   C->>NN: create("/data/events.parquet", rep=3)
   NN-->>C: OK — begin writing block 1001

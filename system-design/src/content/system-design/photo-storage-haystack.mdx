@@ -253,9 +253,9 @@ The `logical_volume_id` is the join between the metadata DB and the directory se
   IndexR --> Disk[Disk\nRead photo bytes]`} />
 
 <Mermaid caption="Tiered storage lifecycle. Photos start hot (CDN + SSD Haystack), age into warm (HDD Haystack), then cold (S3 Glacier Instant). The tier migration daemon runs nightly, moving needles based on last-access timestamp recorded in the metadata DB." diagram={`graph TD
-  Upload[New Upload] --> Hot[Hot Tier\nCDN + SSD Haystack\nAge < 1 day]
-  Hot -->|"1 day old"| Warm[Warm Tier\nHDD Haystack\nAge 1 day – 6 months"]
-  Warm -->|"6 months old"| Cold[Cold Tier\nHDD Haystack\nLow-priority hosts\nAge 6 months – 2 years"]
+  Upload[New Upload] --> Hot["Hot Tier<br/>CDN + SSD Haystack<br/>Age < 1 day"]
+  Hot -->|"1 day old"| Warm["Warm Tier<br/>HDD Haystack<br/>Age 1 day – 6 months"]
+  Warm -->|"6 months old"| Cold["Cold Tier<br/>HDD Haystack<br/>Low-priority hosts<br/>Age 6 months – 2 years"]
   Cold -->|"2 years old"| Archive[Archive Tier\nS3 Glacier Instant\nOn-demand index rebuild]`} />
 
 ## Deep dives

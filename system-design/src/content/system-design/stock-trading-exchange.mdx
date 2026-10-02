@@ -247,7 +247,7 @@ New WebSocket subscribers fetch the L2 snapshot from Redis first (with its seque
 
 <Mermaid diagram={`flowchart TD
     B[Broker / FIX Session] -->|FIX 4.4 or REST| GW[Order Gateway]
-    GW -->|pre-trade risk check| RS[Risk Service\\n(buying power, borrow locate)]
+    GW -->|pre-trade risk check| RS["Risk Service<br/>(buying power, borrow locate)"]
     RS -->|reject| GW
     GW -->|assign sequence number| SQ[Sequencer\\nAtomicLong.incrementAndGet]
     SQ -->|enqueue with seqNum| RB[Ring Buffer\\nper-symbol FIFO\\nDisruptor pattern]

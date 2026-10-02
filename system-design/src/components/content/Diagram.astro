@@ -33,6 +33,19 @@ const { caption, alt } = Astro.props;
     height: auto;
     display: block;
   }
+  /* Theme classes for hand-drawn SVGs in MDX (class="dg" on the <svg>) */
+  .diagram__body :global(.dg text) { font-family: var(--mono); font-size: 10px; }
+  .diagram__body :global(.dg .dg-t)  { fill: var(--ink); font-size: 11px; font-weight: 600; }
+  .diagram__body :global(.dg .dg-t2) { fill: var(--ink-2); font-size: 9px; }
+  .diagram__body :global(.dg .dg-label) { fill: var(--ink-2); font-size: 9px; }
+  .diagram__body :global(.dg .dg-box) { fill: var(--paper); stroke: var(--ink); stroke-width: 1.5; }
+  .diagram__body :global(.dg .dg-muted) { stroke: var(--rule-strong); stroke-dasharray: 4 3; }
+  .diagram__body :global(.dg .dg-key) { fill: var(--signal); stroke: var(--ink); stroke-width: 1.5; }
+  .diagram__body :global(.dg .dg-on-key) { fill: var(--on-signal); }
+  .diagram__body :global(.dg .dg-line) { stroke: var(--ink-2); stroke-width: 1.5; }
+  .diagram__body :global(.dg .dg-dash) { stroke-dasharray: 4 3; }
+  .diagram__body :global(.dg .dg-arrowhead) { fill: var(--ink-2); }
+
   .diagram__caption {
     margin: 8px 0 0;
     font-size: 0.875rem;
