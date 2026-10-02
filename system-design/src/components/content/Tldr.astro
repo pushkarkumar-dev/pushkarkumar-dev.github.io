@@ -3,13 +3,7 @@
 ---
 
 <aside class="tldr" role="note" aria-label="Summary">
-  <div class="tldr__header">
-    <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true">
-      <circle cx="6.5" cy="6.5" r="5.5" stroke="currentColor" stroke-width="1.4"/>
-      <path d="M6.5 3.5v3.2l1.8 1.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
-    </svg>
-    TL;DR
-  </div>
+  <p class="tldr__header">TL;DR</p>
   <div class="tldr__body">
     <slot />
   </div>
@@ -17,45 +11,29 @@
 
 <style>
   .tldr {
-    background: var(--accent-soft);
-    border: 1px solid var(--accent-line);
-    border-left: 3px solid var(--accent);
-    border-radius: var(--r-md);
+    border-left: 4px solid var(--signal);
     margin: 2rem 0;
-    overflow: hidden;
+    padding: 2px 0 2px 20px;
   }
   .tldr__header {
-    display: flex;
-    align-items: center;
-    gap: 0.45rem;
-    padding: 0.55rem 1.125rem;
-    color: var(--accent);
-    font-family: 'Geist', system-ui, sans-serif;
-    font-size: 0.68rem;
-    font-weight: 700;
-    letter-spacing: 0.09em;
-    text-transform: uppercase;
-    border-bottom: 1px solid var(--accent-line);
+    font-size: 0.9375rem;
+    font-weight: 800;
+    font-variation-settings: 'wdth' 112;
+    color: var(--ink);
+    margin-bottom: 8px;
   }
   .tldr__body {
-    padding: 0.875rem 1.125rem;
-    font-size: 0.9375rem;
-    line-height: 1.7;
-    color: var(--ink-2);
+    font-size: 1rem;
+    line-height: 1.6;
+    color: var(--ink);
   }
   .tldr__body :global(ul) {
     margin: 0;
     padding-left: 1.2rem;
     display: flex;
     flex-direction: column;
-    gap: 0.3rem;
+    gap: 0.35rem;
   }
   .tldr__body :global(li) { margin: 0; }
   .tldr__body :global(p) { margin: 0; }
-  .tldr__body :global(code) {
-    font-size: 0.85em;
-    background: rgba(232, 184, 122, 0.12);
-    padding: 0.1em 0.35em;
-    border-radius: 4px;
-  }
 </style>

@@ -2,7 +2,7 @@
 import ThemeToggle from '../ui/ThemeToggle.astro';
 
 export interface Props {
-  /** Highlight a specific category in nav — omit on landing page */
+  /** Highlight a specific category in the section bar — omit on landing page */
   activeCategory?: string;
 }
 
@@ -23,238 +23,207 @@ const categories = [
 const base = import.meta.env.BASE_URL;
 ---
 
-<header id="sd-header" class="sd-header">
-  <div class="sd-header__inner">
-
-    <!-- Left: back to portfolio + section title -->
-    <div class="sd-header__left">
-      <a href="/" class="sd-header__back" aria-label="Back to portfolio">
-        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
-          <path d="M9 2L4 7l5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-        <span class="sd-header__back-label">pushkar.dev</span>
-      </a>
-
-      <span class="sd-header__divider" aria-hidden="true">/</span>
-
-      <a href={`${base}/`} class="sd-header__title">
-        System Design
-      </a>
-    </div>
-
-    <!-- Centre: category nav (hidden on small screens) -->
-    <nav class="sd-header__nav" aria-label="Categories">
-      {categories.map(cat => (
-        <a
-          href={`${base}/?category=${cat.slug}`}
-          class:list={['sd-header__nav-link', activeCategory === cat.slug && 'active']}
-        >
-          {cat.label}
-        </a>
-      ))}
-    </nav>
-
-    <!-- Right: theme toggle + mobile menu button -->
-    <div class="sd-header__right">
-      <ThemeToggle />
-      <button
-        id="sd-mobile-menu-btn"
-        class="sd-header__menu-btn"
-        aria-label="Open navigation menu"
-        aria-expanded="false"
-        aria-controls="sd-mobile-nav"
-      >
-        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
-          <line x1="2" y1="5"  x2="16" y2="5"  stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-          <line x1="2" y1="9"  x2="16" y2="9"  stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-          <line x1="2" y1="13" x2="16" y2="13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-        </svg>
-      </button>
-    </div>
-
-  </div>
-
-  <!-- Mobile nav drawer -->
-  <div id="sd-mobile-nav" class="sd-mobile-nav" hidden>
-    <nav aria-label="Mobile categories">
-      {categories.map(cat => (
-        <a
-          href={`${base}/?category=${cat.slug}`}
-          class:list={['sd-mobile-nav__link', activeCategory === cat.slug && 'active']}
-        >
-          {cat.label}
-        </a>
-      ))}
-      <a href="/" class="sd-mobile-nav__link sd-mobile-nav__link--back">
-        ← pushkar.dev
-      </a>
+<!-- Site nav: same as the root pages. Root links are absolute and reload the page
+     (data-astro-reload) because the root pages are not part of this Astro app. -->
+<header id="sd-header" class="nav">
+  <div class="wrap nav-inner">
+    <a href="/index.html" class="brand" data-astro-reload>Pushkar Kumar</a>
+    <button id="sd-nav-toggle" class="nav-toggle" aria-controls="sd-nav-links" aria-expanded="false">Menu</button>
+    <nav id="sd-nav-links" class="nav-links" aria-label="Primary">
+      <a href="/index.html#work" data-astro-reload>Work</a>
+      <a href="/index.html#lab" data-astro-reload>Lab</a>
+      <a href="/index.html#teaching" data-astro-reload>Teaching</a>
+      <a href="/index.html#experience" data-astro-reload>Experience</a>
+      <a href="/blog.html" data-astro-reload>Writing</a>
+      <div class="nav-dropdown" id="sd-learn">
+        <button class="nav-dropdown__trigger" aria-haspopup="true" aria-expanded="false">
+          Learn
+          <svg width="10" height="6" viewBox="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+        </button>
+        <div class="nav-dropdown__menu" role="menu">
+          <a href="/dsa.html" role="menuitem" data-astro-reload>DSA revision</a>
+          <a href={`${base}/`} role="menuitem" aria-current="page">System design</a>
+          <a href="https://pushkarkumar-dev.github.io/system-design-labs/" target="_blank" rel="noopener" role="menuitem">Build labs</a>
+          <a href="https://pushkarkumar-dev.github.io/ComputerConceptVisualization/" target="_blank" rel="noopener" role="menuitem">Concept visualizations</a>
+        </div>
+      </div>
+      <a href="/index.html#contact" data-astro-reload>Contact</a>
     </nav>
   </div>
 </header>
 
+<!-- Section bar: this section's title, its categories, and the theme switch -->
+<div class="section-bar">
+  <div class="wrap section-bar__inner">
+    <a href={`${base}/`} class="section-bar__title">System design</a>
+    <nav class="section-bar__cats" aria-label="Categories">
+      {categories.map(cat => (
+        <a
+          href={`${base}/?category=${cat.slug}`}
+          class:list={['section-bar__cat', activeCategory === cat.slug && 'active']}
+          aria-current={activeCategory === cat.slug ? 'true' : undefined}
+        >
+          {cat.label}
+        </a>
+      ))}
+    </nav>
+    <ThemeToggle />
+  </div>
+</div>
+
 <style>
-  .sd-header {
-    position: sticky;
-    top: 0;
-    z-index: 50;
-    width: 100%;
-    background: transparent;
+  /* ── Site nav (matches index.html) ── */
+  .nav {
+    position: sticky; top: 0; z-index: 50;
+    background: var(--paper);
     border-bottom: 1px solid transparent;
-    transition:
-      background var(--dur-base) var(--ease-out),
-      border-color var(--dur-base) var(--ease-out),
-      backdrop-filter var(--dur-base) var(--ease-out);
+    transition: border-color .2s;
   }
-  .sd-header.scrolled {
-    background: rgba(10, 10, 10, 0.85);
-    border-bottom-color: var(--line);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-  }
-  [data-theme='light'] .sd-header.scrolled {
-    background: rgba(250, 250, 248, 0.88);
+  .nav.scrolled { border-bottom-color: var(--rule); }
+  .nav-inner { display: flex; align-items: center; justify-content: space-between; height: var(--nav-h); }
+
+  .brand {
+    font-weight: 800; font-variation-settings: 'wdth' 125;
+    font-size: 1.0625rem; text-decoration: none; letter-spacing: -0.01em;
+    color: var(--ink);
   }
 
-  .sd-header__inner {
-    display: flex;
-    align-items: center;
-    gap: 1rem;
-    max-width: 1200px;
-    margin: 0 auto;
-    padding: 0 clamp(1rem, 3vw, 2rem);
-    height: 56px;
-  }
+  .nav-links { display: flex; align-items: center; gap: 28px; font-size: 0.9375rem; }
+  .nav-links a, .nav-dropdown__trigger { text-decoration: none; color: var(--ink-2); }
+  .nav-links a:hover, .nav-dropdown__trigger:hover { color: var(--ink); text-decoration: underline; }
 
-  /* Left */
-  .sd-header__left {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    flex-shrink: 0;
+  .nav-dropdown { position: relative; }
+  .nav-dropdown__trigger {
+    font: inherit; background: none; border: 0; padding: 0; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 6px;
   }
-  .sd-header__back {
-    display: flex;
-    align-items: center;
-    gap: 0.3rem;
-    color: var(--ink-3);
-    text-decoration: none;
-    font-size: 0.8rem;
-    transition: color var(--dur-fast);
-  }
-  .sd-header__back:hover { color: var(--accent); }
-  .sd-header__back-label { display: none; }
-  @media (min-width: 640px) { .sd-header__back-label { display: inline; } }
-
-  .sd-header__divider {
-    color: var(--ink-4);
-    font-size: 0.875rem;
+  .nav-dropdown__trigger svg { transition: transform .2s; }
+  .nav-dropdown.open .nav-dropdown__trigger svg { transform: rotate(180deg); }
+  .nav-dropdown__menu {
+    position: absolute; right: 0; top: calc(100% + 14px);
+    min-width: 220px; padding: 8px 0;
+    background: var(--panel); border: 1px solid var(--ink);
     display: none;
   }
-  @media (min-width: 640px) { .sd-header__divider { display: inline; } }
+  .nav-dropdown.open .nav-dropdown__menu { display: block; }
+  .nav-links .nav-dropdown__menu a { display: block; padding: 8px 16px; color: var(--ink); }
+  .nav-links .nav-dropdown__menu a:hover { background: var(--signal); color: var(--on-signal); text-decoration: none; }
+  .nav-links .nav-dropdown__menu a[aria-current="page"] { font-weight: 700; }
 
-  .sd-header__title {
-    font-family: 'Geist', system-ui, sans-serif;
-    font-weight: 600;
-    font-size: 0.9375rem;
+  .nav-toggle {
+    display: none; font: inherit; font-size: 0.9375rem; color: var(--ink);
+    background: none; border: 1px solid var(--ink); padding: 6px 12px; cursor: pointer;
+  }
+
+  @media (max-width: 760px) {
+    .nav-toggle { display: block; }
+    .nav-links {
+      display: none;
+      position: absolute; left: 0; right: 0; top: var(--nav-h);
+      flex-direction: column; align-items: stretch; gap: 0;
+      background: var(--paper); border-bottom: 1px solid var(--ink);
+      padding: 8px var(--gutter) 16px;
+    }
+    .nav-links.open { display: flex; }
+    .nav-links > a, .nav-dropdown__trigger { padding: 10px 0; color: var(--ink); font-size: 1.0625rem; }
+    .nav-dropdown__trigger { display: none; }
+    .nav-dropdown__menu { display: block; position: static; border: 0; background: none; padding: 0; }
+    .nav-links .nav-dropdown__menu a { padding: 10px 0; font-size: 1.0625rem; }
+  }
+
+  /* ── Section bar ── */
+  .section-bar { border-bottom: 1.5px solid var(--ink); }
+  .section-bar__inner {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    min-height: 56px;
+  }
+  .section-bar__title {
+    flex: none;
+    font-weight: 800;
+    font-variation-settings: 'wdth' 112;
+    font-size: 1.0625rem;
     color: var(--ink);
     text-decoration: none;
-    letter-spacing: -0.01em;
-    transition: color var(--dur-fast);
   }
-  .sd-header__title:hover { color: var(--accent); }
+  .section-bar__title:hover { text-decoration: underline; }
 
-  /* Centre nav */
-  .sd-header__nav {
-    display: none;
-    align-items: center;
-    gap: 0.125rem;
+  .section-bar__cats {
     flex: 1;
-    justify-content: center;
-  }
-  @media (min-width: 1024px) { .sd-header__nav { display: flex; } }
-
-  .sd-header__nav-link {
-    font-size: 0.8125rem;
-    color: var(--ink-3);
-    text-decoration: none;
-    padding: 0.3em 0.6em;
-    border-radius: var(--r-sm);
-    transition: color var(--dur-fast), background var(--dur-fast);
-    white-space: nowrap;
-  }
-  .sd-header__nav-link:hover { color: var(--ink); background: var(--bg-raised); }
-  .sd-header__nav-link.active { color: var(--accent); background: var(--accent-soft); }
-
-  /* Right */
-  .sd-header__right {
+    min-width: 0;
     display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    margin-left: auto;
-    flex-shrink: 0;
+    gap: 4px;
+    overflow-x: auto;
+    scrollbar-width: none;
+    padding: 10px 0;
   }
-
-  .sd-header__menu-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 36px;
-    height: 36px;
-    border: 1px solid var(--line-2);
-    border-radius: var(--r-md);
-    background: transparent;
-    color: var(--ink-3);
-    cursor: pointer;
-    transition: color var(--dur-fast), border-color var(--dur-fast);
-  }
-  .sd-header__menu-btn:hover { color: var(--ink); border-color: var(--line-2); }
-  @media (min-width: 1024px) { .sd-header__menu-btn { display: none; } }
-
-  /* Mobile nav */
-  .sd-mobile-nav {
-    border-top: 1px solid var(--line);
-    background: var(--bg-card);
-    padding: 0.75rem clamp(1rem, 3vw, 2rem);
-    display: flex;
-    flex-direction: column;
-    gap: 0.125rem;
-  }
-  .sd-mobile-nav[hidden] { display: none; }
-
-  .sd-mobile-nav__link {
-    display: block;
-    padding: 0.5em 0.75em;
-    border-radius: var(--r-sm);
+  .section-bar__cats::-webkit-scrollbar { display: none; }
+  .section-bar__cat {
+    flex: none;
+    font-size: 0.875rem;
     color: var(--ink-2);
     text-decoration: none;
-    font-size: 0.875rem;
-    transition: color var(--dur-fast), background var(--dur-fast);
+    padding: 4px 8px;
+    border-radius: 2px;
+    white-space: nowrap;
   }
-  .sd-mobile-nav__link:hover { color: var(--ink); background: var(--bg-raised); }
-  .sd-mobile-nav__link.active { color: var(--accent); }
-  .sd-mobile-nav__link--back { color: var(--ink-3); margin-top: 0.5rem; border-top: 1px solid var(--line); padding-top: 0.875em; }
+  .section-bar__cat:hover { color: var(--ink); text-decoration: underline; }
+  .section-bar__cat.active { background: var(--signal); color: var(--on-signal); font-weight: 700; }
+
+  @media (max-width: 640px) {
+    .section-bar__inner { gap: 12px; }
+  }
 </style>
 
 <script>
   function initHeader() {
-    // Scroll effect
-    const header = document.getElementById('sd-header');
-    if (header) {
-      const onScroll = () => header.classList.toggle('scrolled', window.scrollY > 40);
-      window.addEventListener('scroll', onScroll, { passive: true });
-      onScroll();
+    onNavScroll();
+
+    // On narrow screens the category row scrolls sideways; bring the current one into view
+    const cats = document.querySelector<HTMLElement>('.section-bar__cats');
+    const active = cats?.querySelector<HTMLElement>('.section-bar__cat.active');
+    if (cats && active) {
+      cats.scrollLeft = active.offsetLeft - cats.offsetLeft - (cats.clientWidth - active.offsetWidth) / 2;
     }
 
     // Mobile menu
-    const menuBtn = document.getElementById('sd-mobile-menu-btn');
-    const mobileNav = document.getElementById('sd-mobile-nav');
-    if (menuBtn && mobileNav) {
-      menuBtn.addEventListener('click', () => {
-        const isOpen = !mobileNav.hidden;
-        mobileNav.hidden = isOpen;
-        menuBtn.setAttribute('aria-expanded', String(!isOpen));
+    const toggle = document.getElementById('sd-nav-toggle');
+    const links  = document.getElementById('sd-nav-links');
+    if (toggle && links) {
+      toggle.addEventListener('click', () => {
+        const open = links.classList.toggle('open');
+        toggle.setAttribute('aria-expanded', String(open));
+        toggle.textContent = open ? 'Close' : 'Menu';
+      });
+    }
+
+    // Learn dropdown
+    const learn = document.getElementById('sd-learn');
+    const trigger = learn?.querySelector<HTMLButtonElement>('.nav-dropdown__trigger');
+    if (learn && trigger) {
+      trigger.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const open = learn.classList.toggle('open');
+        trigger.setAttribute('aria-expanded', String(open));
       });
     }
   }
+
+  // Rule under the nav once the page scrolls
+  const onNavScroll = () =>
+    document.getElementById('sd-header')?.classList.toggle('scrolled', window.scrollY > 8);
+  window.addEventListener('scroll', onNavScroll, { passive: true });
+
+  // Document-level listeners are added once; they look up the current dropdown each time.
+  const closeLearn = () => {
+    const learn = document.getElementById('sd-learn');
+    if (!learn) return;
+    learn.classList.remove('open');
+    learn.querySelector('.nav-dropdown__trigger')?.setAttribute('aria-expanded', 'false');
+  };
+  document.addEventListener('click', closeLearn);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeLearn(); });
+
   document.addEventListener('astro:page-load', initHeader);
 </script>

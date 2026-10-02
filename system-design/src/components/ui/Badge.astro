@@ -12,6 +12,7 @@ const difficultyLabel: Record<string, string> = {
   senior: 'Senior',
   staff:  'Staff',
 };
+const difficultyLevel: Record<string, number> = { mid: 1, senior: 2, staff: 3 };
 
 const categoryLabel: Record<string, string> = {
   foundations:   'Foundations',
@@ -29,59 +30,37 @@ const label =
   variant === 'difficulty' ? (difficultyLabel[value] ?? value) :
   variant === 'category'   ? (categoryLabel[value] ?? value) :
   value;
+
+const level = difficultyLevel[value] ?? 0;
 ---
 
-<span class:list={['badge', `badge--${variant}`, `badge--${value}`, className]}>
-  {label}
-</span>
+{variant === 'difficulty' ? (
+  <span class:list={['level', 'badge', `badge--${variant}`, `badge--${value}`, className]}>
+    <span class="meter" aria-hidden="true">
+      {[1, 2, 3].map(n => <i class:list={[n <= level && 'on']} />)}
+    </span>
+    {label}
+  </span>
+) : (
+  <span class:list={['badge', `badge--${variant}`, `badge--${value}`, className]}>
+    {label}
+  </span>
+)}
 
 <style>
   .badge {
-    display: inline-flex;
-    align-items: center;
-    font-family: 'Geist', system-ui, sans-serif;
-    font-size: 0.7rem;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    padding: 0.2em 0.6em;
-    border-radius: var(--r-sm);
+    font-size: 0.875rem;
+    line-height: 1.4;
     white-space: nowrap;
-    line-height: 1.5;
+    color: var(--ink);
   }
-
-  /* Difficulty */
-  .badge--difficulty.badge--mid {
-    background: rgba(143, 176, 134, 0.15);
-    color: var(--diff-mid);
-    border: 1px solid rgba(143, 176, 134, 0.3);
-  }
-  .badge--difficulty.badge--senior {
-    background: rgba(224, 169, 109, 0.15);
-    color: var(--diff-senior);
-    border: 1px solid rgba(224, 169, 109, 0.3);
-  }
-  .badge--difficulty.badge--staff {
-    background: rgba(210, 122, 79, 0.15);
-    color: var(--diff-staff);
-    border: 1px solid rgba(210, 122, 79, 0.3);
-  }
-
-  /* Tag */
+  .badge--category { font-weight: 700; }
   .badge--tag {
-    background: var(--bg-raised);
-    color: var(--ink-3);
-    border: 1px solid var(--line-2);
-    text-transform: none;
-    font-weight: 500;
-    font-size: 0.72rem;
-    letter-spacing: 0;
-  }
-
-  /* Category */
-  .badge--category {
-    background: var(--accent-soft);
-    color: var(--accent);
-    border: 1px solid var(--accent-line);
+    display: inline-block;
+    font-size: 0.8125rem;
+    color: var(--ink-2);
+    border: 1px solid var(--rule-strong);
+    border-radius: 2px;
+    padding: 1px 6px;
   }
 </style>

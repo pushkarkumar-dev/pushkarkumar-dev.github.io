@@ -37,52 +37,47 @@ const { slug, title } = Astro.props;
   .bookmark-btn {
     display: inline-flex;
     align-items: center;
-    gap: 0.4rem;
-    font-family: 'Geist', system-ui, sans-serif;
-    font-size: 0.8rem;
-    font-weight: 500;
-    color: var(--ink-3);
+    gap: 8px;
+    font: inherit;
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--ink);
     background: transparent;
-    border: 1px solid var(--line-2);
-    border-radius: var(--r-md);
-    padding: 0.4em 0.75em;
+    border: 1px solid var(--ink);
+    border-radius: 0;
+    padding: 6px 12px;
     cursor: pointer;
-    transition: color var(--dur-fast), border-color var(--dur-fast), background var(--dur-fast);
   }
-  .bookmark-btn:hover {
-    color: var(--accent);
-    border-color: var(--accent-line);
-    background: var(--accent-soft);
-  }
+  .bookmark-btn:hover { background: var(--raised); }
   .bookmark-btn[aria-pressed="true"] {
-    color: var(--accent);
-    border-color: var(--accent-line);
-    background: var(--accent-soft);
+    background: var(--signal);
+    color: var(--on-signal);
+    border-color: var(--ink);
   }
   .bookmark-btn[aria-pressed="true"] .bm-path {
-    fill: var(--accent);
-    stroke: var(--accent);
+    fill: var(--on-signal);
+    stroke: var(--on-signal);
   }
 </style>
 
 <script>
-  const btn = document.getElementById('bookmark-btn') as HTMLButtonElement | null;
-  if (btn) {
-    const STORAGE_KEY = 'sd-bookmarks';
+  // Runs on every astro:page-load so the button works after client-side navigation too
+  const STORAGE_KEY = 'sd-bookmarks';
+
+  function getBookmarks(): { slug: string; title: string; savedAt: number }[] {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); }
+    catch { return []; }
+  }
+
+  function initBookmark() {
+    const btn = document.getElementById('bookmark-btn') as HTMLButtonElement | null;
+    if (!btn || btn.dataset.bound) return;
+    btn.dataset.bound = 'true';
     const slug = btn.dataset.slug!;
     const title = btn.dataset.title!;
 
-    function getBookmarks(): { slug: string; title: string; savedAt: number }[] {
-      try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); }
-      catch { return []; }
-    }
-
-    function isBookmarked() {
-      return getBookmarks().some(b => b.slug === slug);
-    }
-
     function syncUI() {
-      const saved = isBookmarked();
+      const saved = getBookmarks().some(b => b.slug === slug);
       btn!.setAttribute('aria-pressed', String(saved));
       const label = btn!.querySelector('.bm-label');
       if (label) label.textContent = saved ? 'Bookmarked' : 'Bookmark';
@@ -99,4 +94,6 @@ const { slug, title } = Astro.props;
 
     syncUI();
   }
+
+  document.addEventListener('astro:page-load', initBookmark);
 </script>

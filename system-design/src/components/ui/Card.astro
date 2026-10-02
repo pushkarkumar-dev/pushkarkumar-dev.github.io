@@ -19,21 +19,10 @@ const Tag = href ? 'a' : 'div';
 <style>
   .card {
     display: block;
-    background: var(--bg-card);
-    border: 1px solid var(--line-2);
-    border-radius: var(--r-lg);
-    padding: 1.25rem 1.5rem;
+    border-top: 1px solid var(--rule);
+    padding: 1.25rem 0;
     text-decoration: none;
     color: inherit;
-    transition:
-      border-color var(--dur-fast),
-      background var(--dur-fast),
-      transform var(--dur-fast) var(--ease-out);
   }
-
-  .card--hoverable:hover {
-    border-color: var(--accent-line);
-    background: var(--bg-raised);
-    transform: translateY(-1px);
-  }
+  .card--hoverable:hover { background: var(--raised); }
 </style>

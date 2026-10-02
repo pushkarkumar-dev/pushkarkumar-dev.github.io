@@ -18,26 +18,25 @@ export async function getStaticPaths() {
   }));
 }
 
-// Fetch Geist font from Google Fonts at build time (cached per build)
-let _fontBold: ArrayBuffer | null = null;
-let _fontRegular: ArrayBuffer | null = null;
+// Fetch Archivo static instances from Google Fonts at build time (cached per build).
+// Google serves TTF to this user agent, which satori can read (it can't read woff2).
+const _fonts = new Map<string, ArrayBuffer>();
 
-async function getFont(weight: 400 | 700): Promise<ArrayBuffer> {
-  const cache = weight === 700 ? _fontBold : _fontRegular;
-  if (cache) return cache;
+async function getFont(axes: string): Promise<ArrayBuffer> {
+  const cached = _fonts.get(axes);
+  if (cached) return cached;
 
   const css = await fetch(
-    `https://fonts.googleapis.com/css2?family=Geist:wght@${weight}&display=swap`,
+    `https://fonts.googleapis.com/css2?family=Archivo:${axes}&display=swap`,
     { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; OGImageBot/1.0)' } }
   ).then(r => r.text()).catch(() => null);
 
-  // Extract first woff2 URL from the CSS response
+  // Extract first font URL from the CSS response
   const url = css?.match(/url\((https:\/\/fonts\.gstatic\.com[^)]+)\)/)?.[1];
-  if (!url) throw new Error(`Could not extract font URL (weight ${weight})`);
+  if (!url) throw new Error(`Could not extract font URL (Archivo ${axes})`);
 
   const buf = await fetch(url).then(r => r.arrayBuffer());
-  if (weight === 700) _fontBold = buf;
-  else _fontRegular = buf;
+  _fonts.set(axes, buf);
   return buf;
 }
 
@@ -53,11 +52,14 @@ const CATEGORY_LABEL: Record<string, string> = {
   ai:           'AI Systems',
 };
 
-const DIFFICULTY_COLOR: Record<string, string> = {
-  mid:    '#8fb086',
-  senior: '#e0a96d',
-  staff:  '#d27a4f',
-};
+const DIFFICULTY_LEVEL: Record<string, number> = { mid: 1, senior: 2, staff: 3 };
+const DIFFICULTY_LABEL: Record<string, string> = { mid: 'Mid', senior: 'Senior', staff: 'Staff' };
+
+// Site palette (light theme)
+const PAPER  = '#ECEEEF';
+const INK    = '#15202B';
+const INK_2  = '#4A5560';
+const SIGNAL = '#FFC628';
 
 // Build element tree without React using satori's JSX-object format
 function h(type: string, props: Record<string, any> = {}, ...children: any[]) {
@@ -75,10 +77,26 @@ export const GET: APIRoute = async ({ props }) => {
     estimatedReadMinutes: number;
   };
 
-  const [fontBold, fontRegular] = await Promise.all([getFont(700), getFont(400)]);
+  const [fontWide, fontBold, fontRegular] = await Promise.all([
+    getFont('wdth,wght@125,800'),
+    getFont('wght@700'),
+    getFont('wght@400'),
+  ]);
 
-  const diffColor = DIFFICULTY_COLOR[difficulty] ?? '#e8b87a';
-  const catLabel  = CATEGORY_LABEL[category]    ?? category;
+  const level    = DIFFICULTY_LEVEL[difficulty] ?? 0;
+  const levelTxt = DIFFICULTY_LABEL[difficulty] ?? difficulty;
+  const catLabel = CATEGORY_LABEL[category] ?? category;
+
+  // Difficulty meter: 1, 2 or 3 filled squares, as on the site
+  const meter = h('div', { style: { display: 'flex', gap: '6px' } },
+    ...[1, 2, 3].map(n => h('div', {
+      style: {
+        width: '18px', height: '18px',
+        border: `3px solid ${INK}`,
+        background: n <= level ? INK : 'transparent',
+      },
+    })),
+  );
 
   const svg = await satori(
     h('div', {
@@ -88,62 +106,58 @@ export const GET: APIRoute = async ({ props }) => {
         justifyContent: 'space-between',
         width: '100%',
         height: '100%',
-        background: '#0a0a0a',
-        padding: '60px 64px',
-        fontFamily: 'Geist',
+        background: PAPER,
+        borderTop: `24px solid ${SIGNAL}`,
+        padding: '48px 64px 56px',
+        fontFamily: 'Archivo',
         boxSizing: 'border-box',
       },
     },
-      // Top row: site name + category
-      h('div', { style: { display: 'flex', alignItems: 'center', gap: '16px' } },
-        h('span', { style: { fontSize: 18, color: '#e8b87a', fontWeight: 700, letterSpacing: '-0.02em' } }, 'System Design'),
-        h('span', { style: { fontSize: 18, color: 'rgba(237,237,237,0.28)' } }, '/'),
-        h('span', { style: { fontSize: 17, color: 'rgba(237,237,237,0.55)', fontWeight: 400 } }, catLabel),
+      // Top row: section name + category
+      h('div', { style: { display: 'flex', alignItems: 'baseline', gap: '24px' } },
+        h('span', { style: { fontFamily: 'Archivo Expanded', fontSize: 24, color: INK } }, 'System design'),
+        h('span', { style: { fontSize: 22, color: INK_2, fontWeight: 400 } }, catLabel),
       ),
 
       // Title
       h('div', { style: { display: 'flex', flex: 1, alignItems: 'center', paddingTop: '16px', paddingBottom: '16px' } },
         h('h1', {
           style: {
-            fontSize: title.length > 50 ? 42 : 52,
-            fontWeight: 700,
-            color: '#ededed',
-            letterSpacing: '-0.03em',
-            lineHeight: 1.15,
+            fontFamily: 'Archivo Expanded',
+            fontSize: title.length > 50 ? 52 : 64,
+            color: INK,
+            letterSpacing: '-0.025em',
+            lineHeight: 1.04,
             margin: 0,
-            maxWidth: '820px',
+            maxWidth: '1040px',
           },
         }, title),
       ),
 
-      // Bottom row: difficulty badge + read time
-      h('div', { style: { display: 'flex', alignItems: 'center', gap: '16px' } },
-        h('div', {
-          style: {
-            display: 'flex',
-            alignItems: 'center',
-            padding: '6px 14px',
-            background: `${diffColor}22`,
-            border: `1px solid ${diffColor}55`,
-            borderRadius: '8px',
-            fontSize: 15,
-            fontWeight: 600,
-            color: diffColor,
-            textTransform: 'capitalize',
-          },
-        }, difficulty),
-        h('span', { style: { fontSize: 15, color: 'rgba(237,237,237,0.35)', fontWeight: 400 } },
+      // Bottom row: difficulty meter + read time, site
+      h('div', {
+        style: {
+          display: 'flex', alignItems: 'center', gap: '28px',
+          borderTop: `3px solid ${INK}`, paddingTop: '24px',
+        },
+      },
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: '14px' } },
+          meter,
+          h('span', { style: { fontSize: 24, fontWeight: 700, color: INK } }, levelTxt),
+        ),
+        h('span', { style: { fontSize: 24, color: INK_2, fontWeight: 400 } },
           `${estimatedReadMinutes} min read`),
         h('div', { style: { flex: 1 } }),
-        h('span', { style: { fontSize: 15, color: 'rgba(237,237,237,0.22)', fontWeight: 400 } }, 'pushkar.dev/system-design'),
+        h('span', { style: { fontSize: 22, color: INK_2, fontWeight: 400 } }, 'pushkar.dev/system-design'),
       ),
     ),
     {
       width: 1200,
       height: 630,
       fonts: [
-        { name: 'Geist', data: fontRegular, weight: 400, style: 'normal' },
-        { name: 'Geist', data: fontBold,    weight: 700, style: 'normal' },
+        { name: 'Archivo',          data: fontRegular, weight: 400, style: 'normal' },
+        { name: 'Archivo',          data: fontBold,    weight: 700, style: 'normal' },
+        { name: 'Archivo Expanded', data: fontWide,    weight: 800, style: 'normal' },
       ],
     },
   );

@@ -16,13 +16,11 @@ const { caption, alt } = Astro.props;
 </figure>
 
 <style>
-  .diagram {
-    margin: 2.5rem 0;
-  }
+  .diagram { margin: 2.5rem 0; }
   .diagram__body {
-    background: var(--bg-card);
-    border: 1px solid var(--line-2);
-    border-radius: var(--r-lg);
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
     padding: 1.5rem;
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
@@ -30,22 +28,15 @@ const { caption, alt } = Astro.props;
     align-items: center;
     justify-content: center;
   }
-  /* SVG and mermaid output inside diagram */
   .diagram__body :global(svg) {
     max-width: 100%;
     height: auto;
     display: block;
   }
-  .diagram__body :global(.mermaid svg) {
-    max-width: 100%;
-    height: auto;
-  }
   .diagram__caption {
-    margin: 0.625rem 0 0;
-    text-align: center;
-    font-size: 0.8rem;
-    color: var(--ink-4);
-    font-style: italic;
+    margin: 8px 0 0;
+    font-size: 0.875rem;
+    color: var(--ink-2);
     line-height: 1.5;
   }
 </style>

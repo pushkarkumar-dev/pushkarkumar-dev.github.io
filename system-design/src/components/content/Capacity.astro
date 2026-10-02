@@ -21,31 +21,24 @@ const { title = 'Capacity estimation' } = Astro.props;
 
 <style>
   .capacity {
-    background: rgba(100, 160, 120, 0.06);
-    border: 1px solid rgba(100, 160, 120, 0.25);
-    border-left: 3px solid rgba(100, 160, 120, 0.7);
-    border-radius: var(--r-md);
+    border-left: 4px solid var(--ink);
     margin: 2rem 0;
-    overflow: hidden;
+    padding: 2px 0 2px 20px;
   }
   .capacity__header {
     display: flex;
     align-items: center;
-    gap: 0.45rem;
-    padding: 0.55rem 1.125rem;
-    color: #7ab89a;
-    font-family: 'Geist', system-ui, sans-serif;
-    font-size: 0.68rem;
-    font-weight: 700;
-    letter-spacing: 0.09em;
-    text-transform: uppercase;
-    border-bottom: 1px solid rgba(100, 160, 120, 0.2);
+    gap: 8px;
+    font-size: 0.9375rem;
+    font-weight: 800;
+    font-variation-settings: 'wdth' 112;
+    color: var(--ink);
+    margin-bottom: 8px;
   }
   .capacity__body {
-    padding: 1rem 1.125rem;
-    font-size: 0.9125rem;
-    line-height: 1.75;
-    color: var(--ink-2);
+    font-size: 1rem;
+    line-height: 1.65;
+    color: var(--ink);
   }
   .capacity__body :global(p) { margin: 0 0 0.5rem; }
   .capacity__body :global(p:last-child) { margin-bottom: 0; }
@@ -58,5 +51,5 @@ const { title = 'Capacity estimation' } = Astro.props;
     padding-left: 1.25rem;
   }
   .capacity__body :global(li) { margin: 0.2rem 0; }
-  .capacity__body :global(strong) { color: #7ab89a; }
+  .capacity__body :global(strong) { font-weight: 700; font-variant-numeric: tabular-nums; }
 </style>

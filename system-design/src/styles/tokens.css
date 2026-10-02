@@ -1,50 +1,42 @@
-/* ── Design tokens — aligned to existing portfolio amber-dark aesthetic ── */
-:root {
-  /* Accent — exact match with existing portfolio #e8b87a */
-  --accent:       #e8b87a;
-  --accent-soft:  rgba(232, 184, 122, 0.10);
-  --accent-line:  rgba(232, 184, 122, 0.28);
-  --accent-dark:  #c9963e;
+/* ── Design tokens — shared with the root pages (index.html, blog, dsa) ──
+   Light is the default; [data-theme='dark'] is a dark version of the same palette.
+   Yellow (--signal) marks real state only: active filter, current TOC item,
+   pressed button, key callout. Text on yellow is always --on-signal. */
+:root,
+[data-theme='light'] {
+  --paper:       #ECEEEF;
+  --panel:       #F7F8F8;   /* code, diagrams, menus */
+  --raised:      #E1E5E8;   /* hover rows, inline code */
+  --ink:         #15202B;
+  --ink-2:       #4A5560;
+  --rule:        #C5CBD0;
+  --rule-strong: #7D8994;
+  --signal:      #FFC628;
+  --signal-deep: #F2B300;
+  --on-signal:   #15202B;
 
-  /* Dark theme (default) — matches existing portfolio */
-  --bg:           #0a0a0a;
-  --bg-card:      #111111;
-  --bg-raised:    #161616;
-  --ink:          #ededed;
-  --ink-2:        rgba(237, 237, 237, 0.72);
-  --ink-3:        rgba(237, 237, 237, 0.45);
-  --ink-4:        rgba(237, 237, 237, 0.22);
-  --line:         rgba(237, 237, 237, 0.08);
-  --line-2:       rgba(237, 237, 237, 0.14);
-  --code-bg:      #0f0f0f;
+  --font: 'Archivo', system-ui, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
 
-  /* Difficulty */
-  --diff-mid:     #8fb086;
-  --diff-senior:  #e0a96d;
-  --diff-staff:   #d27a4f;
-
-  /* Radius — matches existing portfolio */
-  --r-sm: 6px;
-  --r-md: 12px;
-  --r-lg: 20px;
+  --wrap:   1120px;
+  --gutter: 24px;
+  --nav-h:  64px;
 
   /* Motion */
   --ease-out:  cubic-bezier(0.22, 1, 0.36, 1);
   --dur-fast:  150ms;
   --dur-base:  250ms;
-  --dur-slow:  600ms;
 }
 
-/* Light theme — warm paper feel, still amber-accented */
-[data-theme='light'] {
-  --bg:           #fafaf8;
-  --bg-card:      #ffffff;
-  --bg-raised:    #f3f0ea;
-  --ink:          #1a1614;
-  --ink-2:        rgba(26, 22, 20, 0.70);
-  --ink-3:        rgba(26, 22, 20, 0.45);
-  --ink-4:        rgba(26, 22, 20, 0.20);
-  --line:         rgba(26, 22, 20, 0.08);
-  --line-2:       rgba(26, 22, 20, 0.14);
-  --code-bg:      #f0ece4;
+[data-theme='dark'] {
+  --paper:       #121A22;
+  --panel:       #18222C;
+  --raised:      #202B36;
+  --ink:         #E6EAED;
+  --ink-2:       #9AA6B1;
+  --rule:        #2C3742;
+  --rule-strong: #5A6773;
+  --signal:      #FFC628;
+  --signal-deep: #F2B300;
+  --on-signal:   #15202B;
 }

@@ -1,9 +1,24 @@
 ---
 export interface Props {
-  diagram: string;
+  diagram?: string;
   caption?: string;
 }
-const { diagram, caption } = Astro.props;
+const { diagram: diagramProp, caption } = Astro.props;
+
+// Some content passes the diagram as a ```mermaid code block between the tags
+// instead of the `diagram` prop. That block arrives as Shiki-highlighted HTML,
+// so recover the plain source text from it.
+let diagram = diagramProp;
+if (!diagram && Astro.slots.has('default')) {
+  const html = await Astro.slots.render('default');
+  diagram = html
+    .replace(/<[^>]+>/g, '')
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(+d))
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+    .trim();
+}
 ---
 
 <figure class="mermaid-figure" role="figure" aria-label={caption ?? 'Architecture diagram'}>
@@ -14,13 +29,11 @@ const { diagram, caption } = Astro.props;
 </figure>
 
 <style>
-  .mermaid-figure {
-    margin: 2.5rem 0;
-  }
+  .mermaid-figure { margin: 2.5rem 0; }
   .mermaid-wrap {
-    background: var(--bg-card);
-    border: 1px solid var(--line-2);
-    border-radius: var(--r-lg);
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
     padding: 1.5rem;
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
@@ -29,16 +42,18 @@ const { diagram, caption } = Astro.props;
     justify-content: center;
     min-height: 80px;
   }
+  /* The diagram div must span the panel; as a shrink-wrapped flex item its
+     width:100% SVG collapses to a thumbnail */
+  .mermaid { width: 100%; }
   .mermaid-wrap :global(svg) {
     max-width: 100%;
     height: auto;
     display: block;
+    margin: 0 auto;
   }
   .mermaid-caption {
-    margin: 0.625rem 0 0;
-    text-align: center;
-    font-size: 0.8rem;
-    color: var(--ink-4);
-    font-style: italic;
+    margin: 8px 0 0;
+    font-size: 0.875rem;
+    color: var(--ink-2);
   }
 </style>
