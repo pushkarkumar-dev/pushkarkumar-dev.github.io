@@ -1,229 +1,226 @@
-/* DSA Revision App — all selectors scoped under .dsa-app */
+/* DSA Revision — shares the home page design system (see index.html).
+   Page-level tokens and the nav live at the top; app selectors are scoped under .dsa-app */
 
-.dsa-app {
-  /* Palette */
-  --bg:        #0e0b08;
-  --bg-2:      #15110c;
-  --surface:   #1c1812;
-  --surface-2: #221d16;
-  --line:      #2c2620;
-  --line-2:    #3a3329;
-  --ink:       #f3ebdf;
-  --ink-2:     #c7bdac;
-  --ink-3:     #8a7f6e;
-  --ink-4:     #5e5448;
-  --amber:     #e0a96d;
-  --amber-b:   #f0bc7d;
-  --rust:      #d27a4f;
-  --sage:      #8fb086;
-  --sky:       #7aa6c2;
-  --plum:      #b58cb0;
+:root {
+  --paper:       #ECEEEF;
+  --panel:       #F7F8F8;
+  --ink:         #15202B;
+  --ink-2:       #4A5560;
+  --rule:        #C5CBD0;
+  --rule-strong: #7D8994;
+  --signal:      #FFC628;   /* yellow marks real state: active filter, open problem, current step */
+  --signal-deep: #F2B300;
 
-  /* Typography */
-  --serif: 'Fraunces', Georgia, serif;
-  --sans:  'Manrope', system-ui, sans-serif;
-  --mono:  'JetBrains Mono', monospace;
+  --font: 'Archivo', system-ui, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
 
-  min-height: 100vh;
-  background: var(--bg);
+  --wrap: 1120px;
+  --gutter: 24px;
+  --nav-h: 64px;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--paper);
   color: var(--ink);
-  font-family: var(--sans);
-  font-size: 15px;
-  line-height: 1.6;
+  font-family: var(--font);
+  font-size: 1rem;
+  line-height: 1.55;
+  font-variation-settings: 'wdth' 100;
   -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  position: relative;
-  overflow-x: hidden;
+  text-rendering: optimizeLegibility;
 }
 
-/* Noise overlay */
-.dsa-app::before {
-  content: '';
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: 0;
-  opacity: 0.055;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23n)' opacity='1'/%3E%3C/svg%3E");
+a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: 0.2em; }
+a:hover { text-decoration-thickness: 2px; }
+:focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; border-radius: 2px; }
+::selection { background: var(--signal); color: var(--ink); }
+
+.wrap { max-width: var(--wrap); margin: 0 auto; padding: 0 var(--gutter); }
+
+/* ============================================================
+   NAV (same as index.html)
+============================================================ */
+.nav {
+  position: sticky; top: 0; z-index: 50;
+  background: var(--paper);
+  border-bottom: 1px solid transparent;
+  transition: border-color .2s;
+}
+.nav.scrolled { border-bottom-color: var(--rule); }
+.nav-inner { display: flex; align-items: center; justify-content: space-between; height: var(--nav-h); }
+
+.brand {
+  font-weight: 800; font-variation-settings: 'wdth' 125;
+  font-size: 1.0625rem; text-decoration: none; letter-spacing: -0.01em;
 }
 
-/* Radial warmth gradients */
-.dsa-app::after {
-  content: '';
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: 0;
-  background:
-    radial-gradient(ellipse 60% 40% at 0% 0%, rgba(224,169,109,0.07) 0%, transparent 60%),
-    radial-gradient(ellipse 50% 35% at 100% 100%, rgba(210,122,79,0.06) 0%, transparent 60%);
+.nav-links { display: flex; align-items: center; gap: 28px; font-size: 0.9375rem; }
+.nav-links a, .nav-dropdown__trigger { text-decoration: none; color: var(--ink-2); }
+.nav-links a:hover, .nav-dropdown__trigger:hover { color: var(--ink); text-decoration: underline; }
+.nav-links a[aria-current="page"] { color: var(--ink); }
+
+.nav-dropdown { position: relative; }
+.nav-dropdown__trigger {
+  font: inherit; background: none; border: 0; padding: 0; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.nav-dropdown__trigger svg { transition: transform .2s; }
+.nav-dropdown.open .nav-dropdown__trigger svg { transform: rotate(180deg); }
+.nav-dropdown__menu {
+  position: absolute; right: 0; top: calc(100% + 14px);
+  min-width: 220px; padding: 8px 0;
+  background: var(--panel); border: 1px solid var(--ink);
+  display: none;
+}
+.nav-dropdown.open .nav-dropdown__menu { display: block; }
+.nav-dropdown__menu a { display: block; padding: 8px 16px; color: var(--ink); }
+.nav-dropdown__menu a:hover { background: var(--signal); text-decoration: none; }
+
+.nav-toggle {
+  display: none; font: inherit; font-size: 0.9375rem; color: var(--ink);
+  background: none; border: 1px solid var(--ink); padding: 6px 12px; cursor: pointer;
 }
 
-.dsa-app * {
-  box-sizing: border-box;
+@media (max-width: 760px) {
+  .nav-toggle { display: block; }
+  .nav-links {
+    display: none;
+    position: absolute; left: 0; right: 0; top: var(--nav-h);
+    flex-direction: column; align-items: stretch; gap: 0;
+    background: var(--paper); border-bottom: 1px solid var(--ink);
+    padding: 8px var(--gutter) 16px;
+  }
+  .nav-links.open { display: flex; }
+  .nav-links > a, .nav-dropdown__trigger { padding: 10px 0; color: var(--ink); font-size: 1.0625rem; }
+  .nav-dropdown__trigger { display: none; }
+  .nav-dropdown__menu { display: block; position: static; border: 0; background: none; padding: 0; }
+  .nav-dropdown__menu a { padding: 10px 0; font-size: 1.0625rem; }
 }
 
 /* ============================================================
-   LAYOUT WRAPPER
+   APP
 ============================================================ */
+.dsa-app {
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
 .dsa-app .dsa-inner {
-  position: relative;
-  z-index: 1;
-  max-width: 1180px;
+  max-width: var(--wrap);
   margin: 0 auto;
-  padding: 0 clamp(16px, 4vw, 48px);
+  padding: 0 var(--gutter);
 }
 
 /* ============================================================
    HEADER
 ============================================================ */
-.dsa-app .dsa-header {
-  padding: 56px 0 32px;
-  border-bottom: 1px solid var(--line);
-  margin-bottom: 20px;
-}
+.dsa-app .dsa-header { padding: 48px 0 28px; }
 
 .dsa-app .dsa-header-top {
   display: flex;
-  align-items: flex-start;
+  align-items: flex-end;
   justify-content: space-between;
   gap: 28px;
   flex-wrap: wrap;
-  margin-bottom: 28px;
+  margin-bottom: 32px;
 }
-
-.dsa-app .dsa-back {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--ink-4);
-  text-decoration: none;
-  letter-spacing: 0.06em;
-  margin-bottom: 14px;
-  transition: color 0.2s;
-}
-.dsa-app .dsa-back:hover { color: var(--amber); }
 
 .dsa-app .dsa-title {
-  font-family: var(--serif);
-  font-size: clamp(36px, 5vw, 56px);
-  font-weight: 700;
-  line-height: 1.05;
-  color: var(--ink);
-  margin: 0 0 10px;
+  font-size: clamp(2.5rem, 6vw, 4.5rem);
+  font-weight: 800;
+  font-variation-settings: 'wdth' 125;
+  line-height: 0.95;
   letter-spacing: -0.025em;
+  margin: 0 0 16px;
 }
 
-.dsa-app .dsa-title span { color: var(--amber); }
-
 .dsa-app .dsa-tagline {
-  font-size: 13px;
-  color: var(--ink-4);
   margin: 0;
-  font-family: var(--mono);
-  letter-spacing: 0.03em;
+  max-width: 34em;
+  font-size: 1.125rem;
+  color: var(--ink-2);
 }
 
 /* Search */
 .dsa-app .dsa-search-wrap {
   position: relative;
   width: 100%;
-  max-width: 460px;
-  align-self: flex-end;
+  max-width: 420px;
 }
 
 .dsa-app .dsa-search {
   width: 100%;
-  background: var(--surface);
-  border: 1px solid var(--line-2);
-  border-radius: 8px;
-  padding: 10px 42px 10px 14px;
+  background: #fff;
+  border: 1.5px solid var(--ink);
+  border-radius: 4px;
+  padding: 11px 44px 11px 14px;
   color: var(--ink);
-  font-family: var(--sans);
-  font-size: 14px;
-  outline: none;
-  transition: border-color 0.2s, box-shadow 0.2s;
+  font: inherit;
+  font-size: 1rem;
   -webkit-appearance: none;
   appearance: none;
 }
-
-.dsa-app .dsa-search::placeholder { color: var(--ink-4); }
-
-.dsa-app .dsa-search:focus {
-  border-color: var(--amber);
-  box-shadow: 0 0 0 3px rgba(224,169,109,0.12);
-}
+.dsa-app .dsa-search::placeholder { color: var(--ink-2); }
+.dsa-app .dsa-search:focus { outline: 3px solid var(--signal); outline-offset: 0; }
 
 .dsa-app .dsa-search-kbd {
   position: absolute;
-  right: 10px;
+  right: 12px;
   top: 50%;
   transform: translateY(-50%);
-  font-family: var(--mono);
-  font-size: 10px;
-  color: var(--ink-4);
-  background: var(--surface-2);
-  border: 1px solid var(--line-2);
-  border-radius: 4px;
-  padding: 1px 5px;
+  font-family: var(--font);
+  font-size: 0.8125rem;
+  color: var(--ink-2);
+  border: 1px solid var(--rule-strong);
+  border-radius: 3px;
+  padding: 0 6px;
   pointer-events: none;
   transition: opacity 0.15s;
 }
-
 .dsa-app .dsa-search:focus ~ .dsa-search-kbd { opacity: 0; }
 
 /* ============================================================
-   PATTERN CHIPS
+   PATTERN FILTERS
 ============================================================ */
 .dsa-app .dsa-chips {
   display: flex;
   flex-wrap: wrap;
-  gap: 7px;
+  gap: 8px;
 }
 
 .dsa-app .dsa-chip {
   display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 5px 11px;
-  border-radius: 20px;
-  border: 1px solid var(--line-2);
-  background: var(--surface);
-  color: var(--ink-3);
-  font-size: 11px;
-  font-family: var(--mono);
+  align-items: baseline;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 4px;
+  border: 1px solid var(--rule-strong);
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.875rem;
+  line-height: 1.2;
   cursor: pointer;
-  transition: all 0.18s;
   white-space: nowrap;
-  letter-spacing: 0.03em;
-  line-height: 1;
 }
-
-.dsa-app .dsa-chip:hover {
-  border-color: var(--amber);
-  color: var(--amber);
-}
+.dsa-app .dsa-chip:hover { border-color: var(--ink); }
 
 .dsa-app .dsa-chip.active {
-  background: rgba(224,169,109,0.1);
-  border-color: var(--amber);
-  color: var(--amber-b);
+  background: var(--signal);
+  border-color: var(--ink);
+  font-weight: 700;
 }
 
 .dsa-app .chip-count {
-  background: var(--surface-2);
-  border-radius: 8px;
-  padding: 1px 5px;
-  font-size: 9px;
-  color: var(--ink-4);
+  font-size: 0.8125rem;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+  font-weight: 400;
 }
-
-.dsa-app .dsa-chip.active .chip-count {
-  background: rgba(224,169,109,0.18);
-  color: var(--amber);
-}
+.dsa-app .dsa-chip.active .chip-count { color: var(--ink); }
 
 /* ============================================================
    TOOLBAR
@@ -232,380 +229,241 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 11px 0;
-  border-top: 1px solid var(--line);
-  border-bottom: 1px solid var(--line);
-  margin-bottom: 14px;
+  gap: 16px;
+  padding: 14px 0;
+  border-top: 1.5px solid var(--ink);
 }
 
-.dsa-app .dsa-count {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--ink-4);
-  letter-spacing: 0.04em;
-}
+.dsa-app .dsa-count { font-size: 0.9375rem; color: var(--ink-2); }
+.dsa-app .dsa-count strong { color: var(--ink); font-weight: 700; font-variant-numeric: tabular-nums; }
 
-.dsa-app .dsa-count strong { color: var(--amber); font-weight: 600; }
+.dsa-app .dsa-toolbar-btns { display: flex; gap: 8px; }
 
-.dsa-app .dsa-toolbar-btns {
-  display: flex;
-  gap: 7px;
-}
-
-.dsa-app .dsa-btn {
+.dsa-app .dsa-btn,
+.dsa-app .anim-btn {
   background: none;
-  border: 1px solid var(--line-2);
-  border-radius: 6px;
-  padding: 4px 11px;
-  font-family: var(--mono);
-  font-size: 10px;
-  color: var(--ink-4);
+  border: 1px solid var(--ink);
+  border-radius: 4px;
+  padding: 5px 12px;
+  font: inherit;
+  font-size: 0.875rem;
+  color: var(--ink);
   cursor: pointer;
-  letter-spacing: 0.05em;
-  transition: all 0.18s;
 }
-
-.dsa-app .dsa-btn:hover {
-  border-color: var(--amber);
-  color: var(--amber);
-}
+.dsa-app .dsa-btn:hover,
+.dsa-app .anim-btn:hover:not(:disabled) { background: var(--ink); color: var(--paper); }
 
 /* ============================================================
-   CARDS CONTAINER
+   PROBLEM LIST
 ============================================================ */
 .dsa-app .dsa-cards {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  padding-bottom: 80px;
+  border-top: 1px solid var(--rule);
+  padding-bottom: 96px;
 }
 
-/* ============================================================
-   CARD
-============================================================ */
 .dsa-app .card {
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-left: 3px solid var(--pat-color, #5e5448);
-  border-radius: 10px;
-  overflow: hidden;
-  transition: background 0.18s, border-color 0.18s;
+  border-bottom: 1px solid var(--rule);
   cursor: pointer;
 }
-
-.dsa-app .card:hover {
-  background: var(--surface-2);
-  border-color: var(--line-2);
-  border-left-color: var(--pat-color, #5e5448);
-}
+.dsa-app .card:hover .card-name { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 0.2em; }
 
 .dsa-app .card.open {
-  border-color: rgba(224,169,109,0.30);
-  border-left-color: var(--pat-color, var(--amber));
-  background: var(--bg-2);
+  background: var(--panel);
+  border-bottom-color: var(--ink);
   cursor: default;
 }
+.dsa-app .card.open:hover .card-name { text-decoration: none; }
 
-/* Card header (always visible) */
+/* Row (always visible) */
 .dsa-app .card-head {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 14px 18px;
+  gap: 16px;
+  padding: 14px 12px;
   user-select: none;
 }
-
 .dsa-app .card.open .card-head {
   cursor: pointer;
+  box-shadow: inset 4px 0 0 var(--signal);
 }
 
 .dsa-app .card-num {
-  font-family: var(--mono);
-  font-size: 10px;
-  color: var(--ink-4);
-  min-width: 32px;
-  letter-spacing: 0.07em;
+  font-size: 0.875rem;
+  color: var(--ink-2);
+  min-width: 44px;
+  font-variant-numeric: tabular-nums;
   flex-shrink: 0;
 }
 
 .dsa-app .card-name {
-  font-family: var(--serif);
-  font-size: 17px;
+  font-size: 1.0625rem;
   font-weight: 600;
-  color: var(--ink);
   flex: 1;
-  line-height: 1.2;
-  letter-spacing: -0.015em;
+  line-height: 1.3;
 }
+.dsa-app .card.open .card-name { font-weight: 800; font-variation-settings: 'wdth' 106; }
 
 .dsa-app .card-tags {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 16px;
   flex-shrink: 0;
 }
 
-.dsa-app .card-pattern {
-  font-family: var(--mono);
-  font-size: 10px;
-  color: var(--ink-4);
-  letter-spacing: 0.05em;
-}
+.dsa-app .card-pattern { font-size: 0.875rem; color: var(--ink-2); }
 
 .dsa-app .diff {
-  font-family: var(--mono);
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.07em;
-  padding: 2px 8px;
-  border-radius: 4px;
-  text-transform: uppercase;
+  font-size: 0.8125rem;
+  min-width: 4.5em;
+  text-align: center;
+  padding: 1px 8px;
+  border-radius: 3px;
+  border: 1px solid var(--rule-strong);
+  color: var(--ink-2);
   flex-shrink: 0;
 }
-
-.dsa-app .diff-easy   { color: var(--sage);  background: rgba(143,176,134,0.14); }
-.dsa-app .diff-medium { color: var(--amber); background: rgba(224,169,109,0.14); }
-.dsa-app .diff-hard   { color: var(--rust);  background: rgba(210,122,79,0.14);  }
+.dsa-app .diff-medium { color: var(--ink); }
+.dsa-app .diff-hard   { color: var(--ink); border-color: var(--ink); font-weight: 700; }
 
 .dsa-app .card-chevron {
-  color: var(--ink-4);
-  transition: transform 0.28s cubic-bezier(.2,.7,.2,1);
+  color: var(--ink-2);
+  transition: transform 0.25s cubic-bezier(.2,.7,.2,1);
   flex-shrink: 0;
 }
+.dsa-app .card.open .card-chevron { transform: rotate(90deg); color: var(--ink); }
 
-.dsa-app .card.open .card-chevron {
-  transform: rotate(90deg);
-  color: var(--amber);
-}
-
-/* Card body */
+/* Body */
 .dsa-app .card-body {
   display: none;
-  padding: 0 18px 18px;
-  border-top: 1px solid var(--line);
+  padding: 4px 12px 28px 72px;
 }
+.dsa-app .card.open .card-body { display: block; }
 
-.dsa-app .card.open .card-body {
-  display: block;
-}
-
-/* Problem summary */
 .dsa-app .problem-summary {
-  margin: 14px 0 0;
-  font-size: 0.85rem;
-  line-height: 1.65;
+  margin: 0;
+  max-width: 44em;
   color: var(--ink-2);
-  font-style: italic;
 }
 
 /* ============================================================
-   CARD BODY SECTIONS
+   BODY SECTIONS
 ============================================================ */
-.dsa-app .card-section {
-  margin-top: 16px;
-}
+.dsa-app .card-section { margin-top: 20px; }
 
 .dsa-app .section-label {
-  font-family: var(--mono);
-  font-size: 9px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--ink-4);
-  margin-bottom: 7px;
-}
-
-/* Trigger chips */
-.dsa-app .trigger-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.dsa-app .trigger-tag {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--amber);
-  background: rgba(224,169,109,0.09);
-  border: 1px solid rgba(224,169,109,0.22);
-  border-radius: 4px;
-  padding: 3px 9px;
-}
-
-/* Core idea */
-.dsa-app .core-en {
-  font-size: 14px;
-  color: var(--ink);
-  line-height: 1.5;
-  margin: 0 0 5px;
-}
-
-.dsa-app .core-hi {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--ink-3);
-  line-height: 1.55;
-  margin: 0;
-  font-style: italic;
-}
-
-/* Approach */
-.dsa-app .approach-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  counter-reset: step;
-}
-
-.dsa-app .approach-list li {
-  counter-increment: step;
-  display: flex;
-  gap: 10px;
-  font-size: 12.5px;
-  color: var(--ink-2);
-  line-height: 1.55;
-  padding: 3px 0;
-  font-family: var(--mono);
-}
-
-.dsa-app .approach-list li::before {
-  content: counter(step);
-  color: var(--amber);
-  font-size: 9px;
+  font-size: 0.875rem;
   font-weight: 700;
-  min-width: 14px;
-  padding-top: 4px;
-  flex-shrink: 0;
+  margin-bottom: 6px;
 }
 
-/* Complexity */
-.dsa-app .complexity-row {
-  display: flex;
-  gap: 22px;
-  flex-wrap: wrap;
-}
-
-.dsa-app .complexity-item {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  font-family: var(--mono);
-  font-size: 12px;
-}
-
-.dsa-app .complexity-label { color: var(--ink-4); }
-.dsa-app .complexity-val { color: var(--sage); font-weight: 600; }
-
-/* Code block */
-.dsa-app .code-block {
-  background: var(--bg);
-  border: 1px solid var(--line-2);
-  border-radius: 6px;
-  padding: 12px 14px;
-  font-family: var(--mono);
-  font-size: 12px;
-  line-height: 1.75;
-  color: var(--ink-2);
-  overflow-x: auto;
-  white-space: pre;
-  margin: 0;
-  tab-size: 4;
-}
-
-/* Pitfalls */
-.dsa-app .pitfall-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-
-.dsa-app .pitfall-list li {
-  font-size: 13px;
-  color: var(--ink-2);
-  line-height: 1.55;
-  padding: 3px 0 3px 18px;
-  position: relative;
-}
-
-.dsa-app .pitfall-list li::before {
-  content: '⚠';
-  position: absolute;
-  left: 0;
-  font-size: 10px;
-  top: 5px;
-  color: var(--rust);
-}
-
-/* Variants */
+/* "When to use" and "Variants" */
+.dsa-app .trigger-list,
 .dsa-app .variant-list {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
 }
 
+.dsa-app .trigger-tag,
 .dsa-app .variant-tag {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--sky);
-  background: rgba(122,166,194,0.09);
-  border: 1px solid rgba(122,166,194,0.2);
-  border-radius: 4px;
-  padding: 3px 9px;
+  font-size: 0.875rem;
+  background: #fff;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  padding: 2px 8px;
 }
 
-/* Two-column grid for large cards */
+/* Core idea */
+.dsa-app .core-en { margin: 0 0 6px; max-width: 40em; }
+.dsa-app .core-hi { margin: 0; max-width: 40em; font-size: 0.9375rem; color: var(--ink-2); }
+
+/* Approach: a real sequence, so numbered */
+.dsa-app .approach-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  counter-reset: step;
+}
+.dsa-app .approach-list li {
+  counter-increment: step;
+  display: flex;
+  gap: 10px;
+  font-size: 0.9375rem;
+  padding: 3px 0;
+}
+.dsa-app .approach-list li::before {
+  content: counter(step) '.';
+  color: var(--ink-2);
+  min-width: 1.4em;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Complexity */
+.dsa-app .complexity-row { display: flex; gap: 28px; flex-wrap: wrap; }
+.dsa-app .complexity-item { display: flex; align-items: baseline; gap: 6px; }
+.dsa-app .complexity-label { color: var(--ink-2); font-size: 0.9375rem; }
+.dsa-app .complexity-val { font-family: var(--mono); font-size: 0.875rem; font-weight: 600; }
+
+/* Code */
+.dsa-app .code-block {
+  background: #fff;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 12px 14px;
+  font-family: var(--mono);
+  font-size: 0.8125rem;
+  line-height: 1.7;
+  color: var(--ink);
+  overflow-x: auto;
+  white-space: pre;
+  margin: 0;
+  tab-size: 4;
+}
+
+/* Pitfalls: caution-yellow square marker */
+.dsa-app .pitfall-list { list-style: none; margin: 0; padding: 0; }
+.dsa-app .pitfall-list li {
+  position: relative;
+  font-size: 0.9375rem;
+  padding: 3px 0 3px 20px;
+  max-width: 44em;
+}
+.dsa-app .pitfall-list li::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0.62em;
+  width: 9px;
+  height: 9px;
+  background: var(--signal);
+  border: 1px solid var(--ink);
+}
+
 .dsa-app .card-body-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 0 28px;
-}
-
-@media (max-width: 700px) {
-  .dsa-app .card-body-grid {
-    grid-template-columns: 1fr;
-  }
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 0 32px;
 }
 
 /* ============================================================
-   ANIMATION BLOCK
+   ANIMATION
 ============================================================ */
 .dsa-app .anim-block {
-  background: var(--bg);
-  border: 1px solid var(--line-2);
-  border-radius: 8px;
-  padding: 16px;
-  margin-top: 16px;
+  background: var(--panel);
+  border: 1.5px solid var(--ink);
+  border-radius: 4px;
+  padding: 40px 16px 16px;
+  margin-top: 24px;
   position: relative;
 }
 
 .dsa-app .anim-badge {
   position: absolute;
   top: 10px;
-  right: 12px;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-family: var(--mono);
-  font-size: 9px;
-  color: var(--amber);
-  letter-spacing: 0.08em;
-  background: rgba(224,169,109,0.07);
-  border: 1px solid rgba(224,169,109,0.18);
-  border-radius: 10px;
-  padding: 2px 8px 2px 5px;
-}
-
-.dsa-app .anim-badge-dot {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--amber);
-  animation: dsa-pulse 1.6s ease-in-out infinite;
-  flex-shrink: 0;
-}
-
-@keyframes dsa-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.3; }
+  left: 14px;
+  font-size: 0.875rem;
+  font-weight: 700;
 }
 
 .dsa-app .anim-svg {
@@ -620,64 +478,50 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-top: 10px;
+  margin-top: 12px;
   justify-content: center;
   flex-wrap: wrap;
 }
 
-.dsa-app .anim-btn {
-  background: var(--surface);
-  border: 1px solid var(--line-2);
-  border-radius: 5px;
-  padding: 5px 16px;
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--ink-3);
-  cursor: pointer;
-  letter-spacing: 0.05em;
-  transition: all 0.18s;
-}
-
-.dsa-app .anim-btn:hover:not(:disabled) {
-  border-color: var(--amber);
-  color: var(--amber);
-}
-
-.dsa-app .anim-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
+.dsa-app .anim-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .dsa-app .anim-status {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--ink-4);
+  font-size: 0.875rem;
+  color: var(--ink-2);
   min-width: 100px;
   text-align: center;
+  font-variant-numeric: tabular-nums;
 }
 
 /* ============================================================
    EMPTY STATE
 ============================================================ */
 .dsa-app .dsa-empty {
-  text-align: center;
   padding: 64px 0;
-  font-family: var(--mono);
-  font-size: 13px;
-  color: var(--ink-4);
-  letter-spacing: 0.03em;
+  color: var(--ink-2);
 }
 
 /* ============================================================
    RESPONSIVE
 ============================================================ */
+@media (max-width: 760px) {
+  .dsa-app .card-body { padding: 4px 12px 24px; }
+  .dsa-app .card-body-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
 @media (max-width: 640px) {
-  .dsa-app .dsa-header { padding: 36px 0 24px; }
-  .dsa-app .dsa-title { font-size: clamp(28px, 8vw, 44px); }
-  .dsa-app .card-head { gap: 8px; padding: 12px 14px; }
-  .dsa-app .card-pattern { display: none; }
-  .dsa-app .card-name { font-size: 15px; }
-  .dsa-app .card-body { padding: 0 14px 14px; }
-  .dsa-app .dsa-header-top { flex-direction: column; gap: 18px; }
+  :root { --gutter: 16px; }
+  .dsa-app .dsa-header { padding: 32px 0 24px; }
+  .dsa-app .dsa-header-top { flex-direction: column; align-items: stretch; gap: 20px; }
   .dsa-app .dsa-search-wrap { max-width: 100%; }
+  .dsa-app .card-head { gap: 10px; padding: 12px 8px; }
+  .dsa-app .card-num { min-width: 36px; }
+  .dsa-app .card-pattern { display: none; }
+  .dsa-app .card-name { font-size: 1rem; }
+  .dsa-app .card-body { padding: 4px 8px 20px; }
+  .dsa-app .dsa-toolbar { flex-wrap: wrap; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dsa-app .card-chevron, .nav-dropdown__trigger svg { transition: none; }
 }

@@ -2,24 +2,48 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>DSA Revision · Pushkar</title>
-  <meta name="description" content="Last-minute FAANG DSA revision — 150 problems, warm dark cards. Pattern chips, search, algorithm animations." />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#ECEEEF" />
+  <meta name="color-scheme" content="light" />
+  <title>DSA revision, Pushkar Kumar</title>
+  <meta name="description" content="About 150 interview problems grouped by pattern, with search, filters and step-by-step algorithm animations, for last-minute recall." />
 
-  <!-- Fonts -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='10' fill='%23FFC628'/%3E%3Ctext x='50' y='70' font-family='Arial,sans-serif' font-size='62' font-weight='800' text-anchor='middle' fill='%2315202B'%3EP%3C/text%3E%3C/svg%3E" />
+
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..800;1,9..144,400..800&family=Manrope:wght@300..700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&display=swap" rel="stylesheet" />
 
   <link rel="stylesheet" href="dsa-assets/styles.css" />
-
-  <!-- Reset only the outer document — .dsa-app handles its own interior -->
-  <style>
-    *, *::before, *::after { box-sizing: border-box; }
-    html, body { margin: 0; padding: 0; background: #0e0b08; }
-  </style>
 </head>
 <body>
+
+  <header class="nav" id="nav">
+    <div class="wrap nav-inner">
+      <a href="index.html" class="brand">Pushkar Kumar</a>
+      <button class="nav-toggle" id="navToggle" aria-controls="navLinks" aria-expanded="false">Menu</button>
+      <nav class="nav-links" id="navLinks" aria-label="Primary">
+        <a href="index.html#work">Work</a>
+        <a href="index.html#lab">Lab</a>
+        <a href="index.html#teaching">Teaching</a>
+        <a href="index.html#experience">Experience</a>
+        <a href="blog.html">Writing</a>
+        <div class="nav-dropdown" id="learnDropdown">
+          <button class="nav-dropdown__trigger" aria-haspopup="true" aria-expanded="false">
+            Learn
+            <svg width="10" height="6" viewBox="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+          </button>
+          <div class="nav-dropdown__menu" role="menu">
+            <a href="dsa.html" role="menuitem" aria-current="page">DSA revision</a>
+            <a href="system-design/" role="menuitem">System design</a>
+            <a href="https://pushkarkumar-dev.github.io/system-design-labs/" target="_blank" rel="noopener" role="menuitem">Build labs</a>
+            <a href="https://pushkarkumar-dev.github.io/ComputerConceptVisualization/" target="_blank" rel="noopener" role="menuitem">Concept visualizations</a>
+          </div>
+        </div>
+        <a href="index.html#contact">Contact</a>
+      </nav>
+    </div>
+  </header>
 
   <div class="dsa-app">
     <div class="dsa-inner">
@@ -29,9 +53,8 @@
 
         <div class="dsa-header-top">
           <div>
-            <a href="index.html" class="dsa-back">← pushkar.dev</a>
-            <h1 class="dsa-title">DSA&nbsp;<span>Revision</span></h1>
-            <p class="dsa-tagline">~150 FAANG problems &middot; last-minute recall &middot; warm dark editorial</p>
+            <h1 class="dsa-title">DSA revision</h1>
+            <p class="dsa-tagline">About 150 interview problems grouped by pattern, for last-minute recall. Open a problem for the idea, the approach, a code skeleton and common pitfalls.</p>
           </div>
 
           <div class="dsa-search-wrap">
@@ -89,5 +112,31 @@
   <script src="dsa-assets/data/problems-bit-manipulation.js"></script>
   <script src="dsa-assets/src/animations.js"></script>
   <script src="dsa-assets/src/main.js"></script>
+  <script>
+    (function () {
+      var nav = document.getElementById('nav');
+      var navToggle = document.getElementById('navToggle');
+      var navLinks = document.getElementById('navLinks');
+      navToggle.addEventListener('click', function () {
+        var open = navLinks.classList.toggle('open');
+        navToggle.setAttribute('aria-expanded', String(open));
+        navToggle.textContent = open ? 'Close' : 'Menu';
+      });
+
+      var dd = document.getElementById('learnDropdown');
+      var trigger = dd.querySelector('.nav-dropdown__trigger');
+      var setOpen = function (open) {
+        dd.classList.toggle('open', open);
+        trigger.setAttribute('aria-expanded', String(open));
+      };
+      trigger.addEventListener('click', function (e) { e.stopPropagation(); setOpen(!dd.classList.contains('open')); });
+      document.addEventListener('click', function () { setOpen(false); });
+      document.addEventListener('keydown', function (e) { if (e.key === 'Escape') setOpen(false); });
+
+      var onScroll = function () { nav.classList.toggle('scrolled', window.scrollY > 8); };
+      window.addEventListener('scroll', onScroll, { passive: true });
+      onScroll();
+    })();
+  </script>
 </body>
 </html>

@@ -1,28 +1,6 @@
 (function () {
   'use strict';
 
-  /* ── Pattern accent colors ─────────────────────────────────── */
-  const PAT_COLORS = {
-    'Sliding Window':        '#e0a96d',
-    'Two Pointers':          '#7aa6c2',
-    'Stack':                 '#d27a4f',
-    'Binary Search':         '#8fb086',
-    'Linked List':           '#b58cb0',
-    'Trees':                 '#8fb086',
-    'Tries':                 '#b58cb0',
-    'Heap / Priority Queue': '#e0a96d',
-    'Backtracking':          '#d27a4f',
-    'Graphs':                '#7aa6c2',
-    'Advanced Graphs':       '#7aa6c2',
-    '1-D DP':                '#b58cb0',
-    '2-D DP':                '#b58cb0',
-    'Intervals':             '#e0a96d',
-    'Greedy':                '#d27a4f',
-    'Math & Geometry':       '#7aa6c2',
-    'Bit Manipulation':      '#8fb086',
-    'Arrays & Hashing':      '#f0bc7d',
-  };
-
   /* ── State ─────────────────────────────────────────────────── */
   let activePattern = null;
   let searchQuery   = '';
@@ -67,12 +45,10 @@
 
   /* ── Card builder ──────────────────────────────────────────── */
   function buildCard(p) {
-    var color  = PAT_COLORS[p.pattern] || '#5e5448';
     var isOpen = openIds.has(p.id);
 
     var card = document.createElement('div');
     card.className = 'card' + (isOpen ? ' open' : '');
-    card.style.setProperty('--pat-color', color);
     card.dataset.id = p.id;
     card.setAttribute('role', 'button');
     card.setAttribute('tabindex', '0');
@@ -108,7 +84,7 @@
       var animBlock = document.createElement('div');
       animBlock.className = 'anim-block';
       animBlock.innerHTML =
-        '<div class="anim-badge"><div class="anim-badge-dot"></div>LIVE DEMO</div>';
+        '<div class="anim-badge">Animation</div>';
       var animContainer = document.createElement('div');
       animBlock.appendChild(animContainer);
       body.appendChild(animBlock);
@@ -204,16 +180,19 @@
     var total    = (window.PROBLEMS || []).length;
 
     cardsEl.innerHTML = '';
+    animInited.clear();   /* cards are rebuilt, so open ones need their animation again */
 
     if (problems.length === 0) {
-      cardsEl.innerHTML = '<div class="dsa-empty">No problems match — try a different search or pattern.</div>';
+      cardsEl.innerHTML = '<div class="dsa-empty">No problems match. Try another search or pattern.</div>';
     } else {
       problems.forEach(function (p) {
-        cardsEl.appendChild(buildCard(p));
+        var card = buildCard(p);
+        cardsEl.appendChild(card);
+        if (openIds.has(p.id)) maybeInitAnim(card);
       });
     }
 
-    countEl.innerHTML = 'showing <strong>' + problems.length + '</strong> of ' + total + ' problems';
+    countEl.innerHTML = 'Showing <strong>' + problems.length + '</strong> of ' + total + ' problems';
   }
 
   /* ── Chips ─────────────────────────────────────────────────── */
